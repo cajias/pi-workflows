@@ -12,7 +12,7 @@ status: proposed
 The built-in `autoimplement` workflow gains two inputs.
 
 - `forge` (`auto`, `github`, or `gitlab`) chooses the code forge. The default is `auto`. It reads the
-  host of the work repository's Git remote, including self-hosted GitLab hosts such as
+  host of the work repository's Git remote, including self-managed GitLab hosts such as
   `code.aws.dev` that are configured for `glab`. GitLab support covers the whole flow through
   `glab`: create or update one merge request (MR), inspect and watch its pipeline with an
   allowlisted MR-bound `glab ci status` command, read, reply to, and resolve MR discussions, merge
@@ -43,7 +43,7 @@ Abbreviations: `AI` is `src/builtins/autoimplement.workflow.ts`, `CB` is
 
 ## Goals
 
-- Detect GitHub, GitLab.com, and self-hosted GitLab from the work repository's remote, and allow an
+- Detect GitHub, GitLab.com, and self-managed GitLab from the work repository's remote, and allow an
   explicit override.
 - Run the complete Autoimplement flow on GitLab through `glab`, with the same safety model as GitHub:
   program-bound tracking commands, no shell wrappers, and no Git or forge CLI in verification checks.
@@ -207,7 +207,7 @@ listed under [Open issues](#open-issues).
      now reads `settings.prTiming`. `src/workflows/settings.ts:185-193` and
      `engine.ts:560-675` define how such a route reruns before it settles.
 7. **Tests.** The plan must cover:
-   - forge detection, including the self-hosted `glab` case;
+   - forge detection, including the self-managed `glab` case;
    - config defaults, precedence, and an invalid file;
    - the settings change rules;
    - the CI allowlist for both forges;
@@ -1560,7 +1560,7 @@ elsewhere in this plan.
   - SSH aliases from `~/.ssh/config` are not resolved.
   - In both cases detection falls back to `github`, and the run records the reason. The workaround
     is an explicit `forge`, or one in the config file.
-- **GitHub is not inferred from a missing `gh`.** If a self-hosted GitHub host is missing from gh
+- **GitHub is not inferred from a missing `gh`.** If a self-managed GitHub host is missing from gh
   hosts and absent from glab hosts, the result is still `github`, which is correct.
 - **What pi-reviewer sees is unverified.** Whether `pi-reviewer --base` reads uncommitted changes is
   unknown, because it is an external tool. `commitLocal` requires every task change to be committed,
