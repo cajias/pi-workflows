@@ -834,7 +834,7 @@ P2 work follows where the reviewed candidate lives. After `addressP2`, the compu
 
 A later fix, for example after a review comment or a failed CI run, repeats the cycle: repair, verification, `commitLocal`, review, and one push to the same pull request or merge request after the fixed head is reviewed clean. Under `end`, the `implement`, `fix`, and `addressP2` prompts say not to push, and the decide prompt states the timing.
 
-Under `early`, every route list, prompt, and step stays upstream. `commitLocal` and `verifyP2Local` never run, and `routeAddressedP2` always chooses `push`. The only additions on that path are the `routeAddressedP2` step and the settings-route flag on `routeVerifiedWorkspace`.
+Under `early`, every route list, prompt, and step stays upstream. `commitLocal` and `verifyP2Local` never run, and `routeAddressedP2` always chooses `push`. Besides `resolveForge`, the only additions on that path are the `routeAddressedP2` step and the settings-route flag on `routeVerifiedWorkspace`. The decide ledger leaves `resolveForge` and `routeAddressedP2` out before it takes its window of recent steps, so every decide prompt lists the upstream steps.
 
 A `human` settings actor can move `prTiming` from `end` to `early` during a run. After a clean review of a local commit, that reviewed head still gets its single push. Before that review, the next publication pushes before review, as `early` does. P2 work still follows where the reviewed candidate lives. Settings changes from a Pi session are recorded as `session` changes today, so this change cannot yet be made through the server.
 

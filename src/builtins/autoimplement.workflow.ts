@@ -684,14 +684,17 @@ const AUTOIMPLEMENT_EVIDENCE_VIEWS: EvidenceViews = new Map([
  * Nodes whose step output the decide ledger leaves out.
  *
  * The observation node produces the `Observation:` line, and the dispatch node returns the decision
- * that the `decide` step already recorded. The forge resolution is setup that runs once before the
- * first observation, not a control attempt, so the ledger leaves it out as well.
+ * that the `decide` step already recorded.
  */
-const CONTROL_LEDGER_SKIPPED_NODES: ReadonlySet<string> = new Set([
-  "observe",
-  "dispatch",
-  "resolveForge",
-]);
+const CONTROL_LEDGER_SKIPPED_NODES: ReadonlySet<string> = new Set(["observe", "dispatch"]);
+
+/**
+ * Steps outside the upstream graph that the decide ledger never counts: the forge resolution, which
+ * is setup before the first observation, and the P2 routing switch, whose choice the next step
+ * already shows. The ledger drops them before it takes its window, so on the upstream `early` path a
+ * decide prompt lists exactly the upstream steps.
+ */
+const LEDGER_INVISIBLE_NODES: ReadonlySet<string> = new Set(["resolveForge", "routeAddressedP2"]);
 
 /**
  * Step results a decide prompt lists, newest last.
@@ -704,7 +707,8 @@ const CONTROL_LEDGER_SKIPPED_NODES: ReadonlySet<string> = new Set([
 function controlEvidenceLedger(context: WorkflowNodeContext): EvidenceLedgerEntry[] {
   const latest = latestControlAttempt(context);
   const entries: EvidenceLedgerEntry[] = [];
-  for (const step of context.state.steps.slice(-12)) {
+  const counted = context.state.steps.filter((step) => !LEDGER_INVISIBLE_NODES.has(step.nodeId));
+  for (const step of counted.slice(-12)) {
     if (step.attemptId === latest?.attemptId) continue;
     if (CONTROL_LEDGER_SKIPPED_NODES.has(step.nodeId) || isIncludedReturnStep(step.nodeId)) {
       continue;

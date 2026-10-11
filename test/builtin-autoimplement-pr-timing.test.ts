@@ -479,6 +479,32 @@ function expectNoPullRequestWording(prompt: string): void {
 }
 
 describe("autoimplement end-timing prompts", () => {
+  it("keeps the steps outside the upstream graph out of the decide ledger window", async () => {
+    const golden = syntheticAutoimplementContext();
+    const [prepare, ...rest] = golden.state.steps;
+    const later = [
+      edit("addressP2"),
+      verifyP2("h2"),
+      result("verifyP2", { passed: true }, "p2Result"),
+      step("commentsResult", { sourceNode: "inspectComments", outcome: "ok", result: {} }),
+    ];
+    const upstream = [prepare!, ...rest, ...later];
+    const added = [
+      prepare!,
+      step("resolveForge", { forge: "github" }),
+      ...rest,
+      later[0]!,
+      step("routeAddressedP2", { route: "push" }),
+      ...later.slice(1),
+    ];
+    expect(upstream.length).toBeGreaterThan(12);
+    const render = async (steps: WorkflowStepRecord[]) =>
+      await renderPrompt("decide", { ...golden, state: { ...golden.state, steps } });
+    const prompt = await render(added);
+    expect(prompt).toBe(await render(upstream));
+    expect(prompt).not.toContain("routeAddressedP2");
+    expect(prompt).not.toContain("resolveForge");
+  });
   it("adds the timing line to decide only under end, after the merge and forge lines", async () => {
     const github = (await renderPrompt("decide", endPromptContext("github"))).split("\n");
     const merge = github.indexOf("Merge allowed now: false");
