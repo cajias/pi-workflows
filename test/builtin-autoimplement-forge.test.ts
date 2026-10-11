@@ -284,7 +284,13 @@ const GITHUB_GOLDEN_PROMPTS: Record<string, readonly string[]> = {
   ],
 };
 
-/** The static `statusDetail` and `expectedOutput` of every upstream node. */
+/**
+ * The static `statusDetail` and `expectedOutput` of every upstream node.
+ *
+ * Owner decision O2 (2026-10-11) made the strings that named a forge read correctly on GitHub and
+ * GitLab: the `inspectComments` and `finalizeDelivery` status lines, the `inspectCi` tracking command
+ * example, and the `finalizeDelivery` top-level `pr` example. Every other literal is upstream text.
+ */
 const GITHUB_GOLDEN_STATIC: Record<string, { statusDetail?: string; expectedOutput?: unknown }> = {
   prepare: {},
   observe: {},
@@ -354,7 +360,7 @@ const GITHUB_GOLDEN_STATIC: Record<string, { statusDetail?: string; expectedOutp
   },
   p2Result: {},
   inspectComments: {
-    statusDetail: "checking PR comments",
+    statusDetail: "checking PR/MR comments",
     expectedOutput:
       '{ "route": "redesign" | "fix" | "ci" | "blocked", "summary": "comment status", "evidence": ["comment or response"] }',
   },
@@ -362,7 +368,7 @@ const GITHUB_GOLDEN_STATIC: Record<string, { statusDetail?: string; expectedOutp
   inspectCi: {
     statusDetail: "checking CI",
     expectedOutput:
-      '{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "gh", "args": ["pr", "checks", "PR URL", "--watch"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }',
+      '{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "gh" | "glab", "args": ["pr", "checks", "PR URL", "--watch"] | ["ci", "status", "--live", "--branch", "source branch", "--repo", "project URL"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }',
   },
   routeInspectCiResult: {},
   trackCi: { statusDetail: "tracking pending CI commands" },
@@ -383,9 +389,9 @@ const GITHUB_GOLDEN_STATIC: Record<string, { statusDetail?: string; expectedOutp
   },
   ciResult: {},
   finalizeDelivery: {
-    statusDetail: "finalizing PRs",
+    statusDetail: "finalizing PRs/MRs",
     expectedOutput:
-      '{ "status": "completed" | "blocked", "merged": true | false, "pr": "first PR URL", "reportComment": "first report URL or summary", "reason": "aggregate result", "repositories": [{ "repository": "/absolute/repository", "pr": "URL", "merged": true | false, "reportComment": "URL or summary", "reason": "result" }] }',
+      '{ "status": "completed" | "blocked", "merged": true | false, "pr": "first PR or MR URL", "reportComment": "first report URL or summary", "reason": "aggregate result", "repositories": [{ "repository": "/absolute/repository", "pr": "URL", "merged": true | false, "reportComment": "URL or summary", "reason": "result" }] }',
   },
   deliveryResult: {},
   prepareBlocked: {},

@@ -2095,7 +2095,7 @@ export const autoimplementWorkflow = defineWorkflow({
     }),
     inspectComments: agent({
       timeoutMs: 20 * 60_000,
-      statusDetail: "checking PR comments",
+      statusDetail: "checking PR/MR comments",
       prompt: (context) =>
         [
           "Inspect current inline review comments and PR issue comments for every published pull request.",
@@ -2122,7 +2122,7 @@ export const autoimplementWorkflow = defineWorkflow({
           "Separate failures caused by this change from unrelated failures. Do not invent an ETA.",
           `Published repositories: ${JSON.stringify(currentPublishedRepositories(context))}`,
         ].join("\n"),
-      expectedOutput: `{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "gh", "args": ["pr", "checks", "PR URL", "--watch"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }`,
+      expectedOutput: `{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "gh" | "glab", "args": ["pr", "checks", "PR URL", "--watch"] | ["ci", "status", "--live", "--branch", "source branch", "--repo", "project URL"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }`,
       validate: parseCiInspectionForPublished,
     }),
     routeInspectCiResult: compute({
@@ -2209,7 +2209,7 @@ export const autoimplementWorkflow = defineWorkflow({
     }),
     finalizeDelivery: agent({
       timeoutMs: 30 * 60_000,
-      statusDetail: "finalizing PRs",
+      statusDetail: "finalizing PRs/MRs",
       prompt: (context) => {
         return [
           autoimplementSettings(context).merge === false
@@ -2223,7 +2223,7 @@ export const autoimplementWorkflow = defineWorkflow({
           `Published repositories: ${JSON.stringify(currentPublishedRepositories(context))}`,
         ].join("\n");
       },
-      expectedOutput: `{ "status": "completed" | "blocked", "merged": true | false, "pr": "first PR URL", "reportComment": "first report URL or summary", "reason": "aggregate result", "repositories": [{ "repository": "/absolute/repository", "pr": "URL", "merged": true | false, "reportComment": "URL or summary", "reason": "result" }] }`,
+      expectedOutput: `{ "status": "completed" | "blocked", "merged": true | false, "pr": "first PR or MR URL", "reportComment": "first report URL or summary", "reason": "aggregate result", "repositories": [{ "repository": "/absolute/repository", "pr": "URL", "merged": true | false, "reportComment": "URL or summary", "reason": "result" }] }`,
       validate: parseDeliveryResult,
     }),
     deliveryResult: compute({
