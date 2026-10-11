@@ -387,7 +387,7 @@ describe("built-in autoimplement", () => {
     await expect(
       applyWorkflowSettingsPatch(
         definition,
-        { merge: true, addedInstructions: [] },
+        { merge: true, addedInstructions: [], forge: "auto", prTiming: "early" },
         [{ op: "replace", path: "/merge", value: false }],
         { type: "session" },
         "workflow-tool",
@@ -396,7 +396,7 @@ describe("built-in autoimplement", () => {
     await expect(
       applyWorkflowSettingsPatch(
         definition,
-        { merge: false, addedInstructions: [] },
+        { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
         [{ op: "replace", path: "/merge", value: true }],
         { type: "session" },
         "workflow-tool",
@@ -1102,7 +1102,7 @@ describe("built-in autoimplement", () => {
       outputs: { observe: { decisionNumber: 1, availableRoutes: ["implementation"] } },
       results: {},
       state: { steps: [] } as never,
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     });
     expect(prompt).toContain("You are the decider for this turn");
@@ -1196,7 +1196,7 @@ describe("built-in autoimplement", () => {
           },
         ],
       },
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     };
 
@@ -1268,7 +1268,7 @@ describe("built-in autoimplement", () => {
       },
       results: {},
       state: { steps: [] },
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     } as never);
 
@@ -1286,7 +1286,7 @@ describe("built-in autoimplement", () => {
       outputs: { observe: { decisionNumber: 1, availableRoutes: ["implementation"] } },
       results: {},
       state: { steps: [] },
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     } as never;
     await expect(Promise.resolve().then(() => decide.prompt(context))).rejects.toThrow(
@@ -1318,7 +1318,7 @@ describe("built-in autoimplement", () => {
       },
       results: {},
       state: { steps },
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     } as never;
     await expect(Promise.resolve().then(() => decide.prompt(context))).rejects.toThrow(
@@ -1397,7 +1397,7 @@ describe("built-in autoimplement", () => {
       },
       results: {},
       state: { steps },
-      settings: { merge: false, addedInstructions: [] },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
       signal: new AbortController().signal,
     } as never);
 
@@ -1469,7 +1469,7 @@ describe("built-in autoimplement", () => {
           state: {
             steps: [{ nodeId: "prepare", outcome: "ok", output: { task: "demo", repository } }],
           },
-          settings: { merge: false, addedInstructions: [] },
+          settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
           signal: new AbortController().signal,
         } as never),
       ),
@@ -1510,7 +1510,7 @@ describe("built-in autoimplement", () => {
               { nodeId: "implement", outcome: "timed_out", output: null, error: "deadline" },
             ],
           },
-          settings: { merge: false, addedInstructions: [] },
+          settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
           signal: new AbortController().signal,
         } as never),
       ),

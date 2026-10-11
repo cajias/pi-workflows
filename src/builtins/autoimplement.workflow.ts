@@ -11,6 +11,7 @@ import {
   assistantMessage,
   compute,
   defineWorkflow,
+  idempotentEffect,
   includeWorkflow,
   includedResult,
   manualEffect,
@@ -36,15 +37,26 @@ import type {
 import { IMPLEMENTATION_TIMEOUT_MS } from "./agent-timeouts.js";
 import autodocWorkflow, { type AutodocInput } from "./autodoc.workflow.js";
 import {
+  GITHUB_CI_BINDING,
   parseAutoimplementConcurrency,
   parseCiInspectionBatch,
   parsePublishedRepositories,
   reviewerCommand,
   type AutoimplementConcurrency,
+  type CiForgeBinding,
   type CiInspectionBatch,
   type PublishedRepositories,
   type PublishedRepository,
 } from "./autoimplement-command-batches.js";
+import { loadAutoimplementDefaults, parsePrTiming, type PrTiming } from "./autoimplement-config.js";
+import {
+  parseForgeRequest,
+  parseForgeResolution,
+  resolveForge,
+  type Forge,
+  type ForgeRequest,
+  type ForgeResolution,
+} from "./autoimplement-forge.js";
 import changeVerificationWorkflow, {
   CHANGE_VERIFICATION_SCHEMA,
   changeVerificationEvidence,
@@ -64,6 +76,10 @@ import workspacePreparationWorkflow, {
 export type AutoimplementSettings = {
   merge: boolean;
   addedInstructions: string[];
+  /** The requested forge. It cannot change during a run. */
+  forge: ForgeRequest;
+  /** The requested publication timing. It can move only from `end` to `early` during a run. */
+  prTiming: PrTiming;
 };
 
 export type AutoimplementInput = {
@@ -87,6 +103,10 @@ export type AutoimplementInput = {
   preparedWorkspace?: PreparedWorkspace;
   verificationChecks?: VerificationCheck[];
   verificationUntested?: string[];
+  /** Always present after input parsing: the input, else the defaults file, else `auto`. */
+  forge?: ForgeRequest;
+  /** Always present after input parsing: the input, else the defaults file, else `early`. */
+  prTiming?: PrTiming;
 };
 
 export type ExistingPlanDiscovery = {
@@ -345,6 +365,10 @@ function parseInput(value: unknown): AutoimplementInput {
       "autoimplement verificationUntested",
     ).map((item, index) => requireString(item, `autoimplement verificationUntested[${index}]`));
   }
+  const forge = parseForgeRequest(input.forge, "autoimplement forge");
+  const prTiming = parsePrTiming(input.prTiming, "autoimplement prTiming");
+  // A fully explicit input never reads the defaults file, so parsing a parsed input is idempotent.
+  const defaults = forge === undefined || prTiming === undefined ? loadAutoimplementDefaults() : {};
   return {
     task: requireString(input.task, "autoimplement task"),
     ...(input.plan !== undefined ? { plan: input.plan } : {}),
@@ -368,7 +392,14 @@ function parseInput(value: unknown): AutoimplementInput {
       ? {}
       : { verificationChecks: input.verificationChecks as VerificationCheck[] }),
     ...(verificationUntested === undefined ? {} : { verificationUntested }),
+    forge: forge ?? defaults.forge ?? "auto",
+    prTiming: prTiming ?? defaults.prTiming ?? "early",
   };
+}
+
+function requiredSetting<T>(value: T | undefined, message: string): T {
+  if (value === undefined) throw new Error(message);
+  return value;
 }
 
 function parseAutoimplementSettings(value: unknown): AutoimplementSettings {
@@ -385,6 +416,14 @@ function parseAutoimplementSettings(value: unknown): AutoimplementSettings {
   return {
     merge: settings.merge,
     addedInstructions: [...settings.addedInstructions] as string[],
+    forge: requiredSetting(
+      parseForgeRequest(settings.forge, "autoimplement settings forge"),
+      "autoimplement settings forge is required",
+    ),
+    prTiming: requiredSetting(
+      parsePrTiming(settings.prTiming, "autoimplement settings prTiming"),
+      "autoimplement settings prTiming is required",
+    ),
   };
 }
 
@@ -538,6 +577,26 @@ function preparedWorkspace(context: WorkflowNodeContext): PreparedWorkspace {
 }
 
 /**
+ * The recorded `resolveForge` result. It is absent only in synthetic contexts that never ran the
+ * node, because the real graph resolves the forge before its first observation.
+ */
+function forgeResolution(context: WorkflowNodeContext): ForgeResolution | undefined {
+  const recorded = context.outputs.resolveForge;
+  return recorded === undefined ? undefined : parseForgeResolution(recorded);
+}
+
+/** The resolved forge, or GitHub (upstream behavior) when no resolution is recorded. */
+function forgeFor(context: WorkflowNodeContext): Forge {
+  return forgeResolution(context)?.forge ?? "github";
+}
+
+/** The directory whose Git remote names the forge. Linked worktrees share their remotes. */
+function forgeDirectory(request: AutoimplementInput): string {
+  const workspace = request.preparedWorkspace;
+  return workspace?.worktreePath ?? workspace?.repository ?? request.repository;
+}
+
+/**
  * Evidence views for results that reach an Autoimplement prompt.
  *
  * The schema key is the assertion: a view runs only for a value whose recorded `schema` matches it,
@@ -552,12 +611,17 @@ const AUTOIMPLEMENT_EVIDENCE_VIEWS: EvidenceViews = new Map([
 ]);
 
 /**
- * Nodes whose step output the decide prompt shows somewhere else.
+ * Nodes whose step output the decide ledger leaves out.
  *
  * The observation node produces the `Observation:` line, and the dispatch node returns the decision
- * that the `decide` step already recorded.
+ * that the `decide` step already recorded. The forge resolution is setup that runs once before the
+ * first observation, not a control attempt, so the ledger leaves it out as well.
  */
-const PROMPT_ECHO_STEP_NODES: ReadonlySet<string> = new Set(["observe", "dispatch"]);
+const CONTROL_LEDGER_SKIPPED_NODES: ReadonlySet<string> = new Set([
+  "observe",
+  "dispatch",
+  "resolveForge",
+]);
 
 /**
  * Step results a decide prompt lists, newest last.
@@ -572,7 +636,9 @@ function controlEvidenceLedger(context: WorkflowNodeContext): EvidenceLedgerEntr
   const entries: EvidenceLedgerEntry[] = [];
   for (const step of context.state.steps.slice(-12)) {
     if (step.attemptId === latest?.attemptId) continue;
-    if (PROMPT_ECHO_STEP_NODES.has(step.nodeId) || isIncludedReturnStep(step.nodeId)) continue;
+    if (CONTROL_LEDGER_SKIPPED_NODES.has(step.nodeId) || isIncludedReturnStep(step.nodeId)) {
+      continue;
+    }
     entries.push(evidenceEntry(step));
   }
   return entries;
@@ -1333,11 +1399,30 @@ function parseP2Verification(
   return { ...result, repositories: refreshed.repositories };
 }
 
+/** Binds each GitLab CI target to the source branch of its published repository. */
+function gitlabCiBinding(published: PublishedRepositories): (id: string) => CiForgeBinding {
+  const branches = new Map(
+    published.repositories.map((repository) => [repository.id, repository.branch] as const),
+  );
+  return (id) => {
+    const branch = branches.get(id);
+    if (branch === undefined) {
+      throw new Error(`CI target does not match the published repository and head: ${id}`);
+    }
+    return { forge: "gitlab", branch };
+  };
+}
+
 function parseCiInspectionForPublished(
   value: unknown,
   context: WorkflowNodeContext,
 ): CiInspectionBatch {
-  const inspected = parseCiInspectionBatch(value);
+  const inspected = parseCiInspectionBatch(
+    value,
+    forgeFor(context) === "github"
+      ? () => GITHUB_CI_BINDING
+      : gitlabCiBinding(currentPublishedRepositories(context)),
+  );
   const published = currentPublishedRepositories(context);
   const expected = new Map(
     published.repositories.map((repository) => [repository.id, repository] as const),
@@ -1598,9 +1683,16 @@ export const autoimplementWorkflow = defineWorkflow({
   name: "autoimplement",
   input: parseInput,
   settings: workflowSettings<AutoimplementSettings, AutoimplementInput>({
-    initial: (input) => ({ merge: input.merge === true, addedInstructions: [] }),
+    // The fallbacks serve callers that pass raw input. The engine always passes parsed input.
+    initial: (input) => ({
+      merge: input.merge === true,
+      addedInstructions: [],
+      forge: input.forge ?? "auto",
+      prTiming: input.prTiming ?? "early",
+    }),
     parse: parseAutoimplementSettings,
-    description: "Future merge behavior and instructions added during this run.",
+    description:
+      "Future merge behavior, publication timing, the requested forge, and instructions added during this run.",
     paths: [
       allowSettingsPath("/merge", {
         read: ["session", "human"],
@@ -1612,10 +1704,19 @@ export const autoimplementWorkflow = defineWorkflow({
         remove: ["session", "human"],
         replace: ["session", "human"],
       }),
+      allowSettingsPath("/forge", { read: ["session", "human"] }),
+      // Model steps never change publication timing. A human can move it from end to early.
+      allowSettingsPath("/prTiming", { read: ["session", "human"], replace: ["human"] }),
     ],
     validateChange: ({ before, after, actor }) => {
       if (actor.type === "session" && before.merge === false && after.merge === true) {
         throw new Error("A model workflow step cannot grant merge authority");
+      }
+      if (before.forge !== after.forge) {
+        throw new Error("The requested forge cannot change during a run");
+      }
+      if (before.prTiming === "early" && after.prTiming === "end") {
+        throw new Error("Publication timing cannot move from early to end during a run");
       }
     },
   }),
@@ -1728,6 +1829,15 @@ export const autoimplementWorkflow = defineWorkflow({
       run: ({ input }) => {
         const request = input as AutoimplementInput;
         return { task: request.task, repository: request.repository };
+      },
+    }),
+    // Read-only detection is safe to repeat, so a runner crash before commit reruns it.
+    resolveForge: action({
+      effect: idempotentEffect("pi-workflows.autoimplement.resolve-forge"),
+      statusDetail: "resolving the code forge",
+      run: async ({ input }) => {
+        const request = input as AutoimplementInput;
+        return await resolveForge(request.forge ?? "auto", forgeDirectory(request));
       },
     }),
     observe: compute({
@@ -2169,7 +2279,8 @@ export const autoimplementWorkflow = defineWorkflow({
     { from: "completedSummary", to: "finalize" },
     { from: "prepareBlocked", to: "blockedSummary" },
     { from: "blockedSummary", to: "blocked" },
-    { from: "prepare", to: "observe" },
+    { from: "prepare", to: "resolveForge" },
+    { from: "resolveForge", to: "observe" },
     { from: "observe", to: "decide" },
     {
       from: "decide",

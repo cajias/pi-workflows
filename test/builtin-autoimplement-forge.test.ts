@@ -1,8 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { repositoryId } from "../src/builtins/autoimplement-command-batches.js";
+import { FORGE_RESOLUTION_SCHEMA } from "../src/builtins/autoimplement-forge.js";
 import autoimplementWorkflow from "../src/builtins/autoimplement.workflow.js";
+import { compileWorkflowDefinition } from "../src/workflows/composition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
-import { makeStateDatabasePath } from "./helpers.js";
+import { makeStateDatabasePath, makeTempDir } from "./helpers.js";
 import {
+  git,
   p1PathScenario,
   p2PathScenario,
   pendingCiScenario,
@@ -732,5 +738,228 @@ describe("autoimplement GitHub early node sequences", () => {
         ],
       },
     });
+  });
+});
+
+function resolution(forge: "github" | "gitlab", requested = "auto") {
+  return {
+    schema: FORGE_RESOLUTION_SCHEMA,
+    requested,
+    forge,
+    host: null,
+    remoteUrl: null,
+    reason: "explicit input",
+  };
+}
+
+async function runResolveForge(input: Record<string, unknown>): Promise<unknown> {
+  const node = autoimplementWorkflow.nodes.resolveForge;
+  if (node?.nodeType !== "action" || !("run" in node)) {
+    throw new Error("resolveForge must be a function action");
+  }
+  return await node.run({
+    ...syntheticAutoimplementContext(),
+    input,
+    publishUpdate: async () => {},
+  } as never);
+}
+
+describe("autoimplement forge graph shape", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("resolves the forge between prepare and the first observation", () => {
+    const compiled = compileWorkflowDefinition(autoimplementWorkflow);
+    expect(compiled.edges.filter((edge) => edge.from === "prepare")).toEqual([
+      { from: "prepare", to: "resolveForge" },
+    ]);
+    expect(compiled.edges.filter((edge) => edge.from === "resolveForge")).toEqual([
+      { from: "resolveForge", to: "observe" },
+    ]);
+    const node = autoimplementWorkflow.nodes.resolveForge;
+    expect(node).toMatchObject({
+      nodeType: "action",
+      statusDetail: "resolving the code forge",
+      effect: { type: "pi-workflows.autoimplement.resolve-forge", recovery: "idempotent" },
+    });
+  });
+
+  it("records the resolution once and keeps it out of control attempts and the ledger", async () => {
+    const scenario = pendingCiScenario(fixture.repository);
+    const { state } = await runScenario("resolve-forge-ledger", scenario);
+    expect(state.status, state.error).toBe("completed");
+    expect(state.steps.slice(0, 3).map((step) => step.nodeId)).toEqual([
+      "prepare",
+      "resolveForge",
+      "observe",
+    ]);
+    expect(state.steps.filter((step) => step.nodeId === "resolveForge")).toHaveLength(1);
+    expect(state.outputs.resolveForge).toEqual({
+      schema: FORGE_RESOLUTION_SCHEMA,
+      requested: "auto",
+      forge: "github",
+      host: null,
+      remoteUrl: null,
+      reason: "no Git remote; using GitHub (upstream default)",
+    });
+    const firstObservation = state.steps.find((step) => step.nodeId === "observe")?.output;
+    expect(firstObservation).toMatchObject({ latestAttempt: { nodeId: "prepare" } });
+    const decides = scenario.executor.requests.filter(
+      (request) => request.contract.nodeId === "decide",
+    );
+    expect(decides.length).toBeGreaterThan(1);
+    for (const request of decides) expect(request.prompt).not.toContain("resolveForge");
+  });
+
+  it("records gitlab for a self-managed remote matched through a glab ssh_host", async () => {
+    const glabDir = await makeTempDir("autoimplement-glab-config");
+    await fs.writeFile(
+      path.join(glabDir, "config.yml"),
+      "hosts:\n    code.example.test:\n        api_host: code.example.test\n        ssh_host: ssh.code.example.test\n        token: SECRET\n",
+    );
+    vi.stubEnv("GLAB_CONFIG_DIR", glabDir);
+    await git(fixture.repository, [
+      "remote",
+      "add",
+      "origin",
+      "git@ssh.code.example.test:team/project.git",
+    ]);
+    const plain = await makeTempDir("autoimplement-plain-repository");
+    await git(plain, ["init", "-b", "main"]);
+    const expected = {
+      schema: FORGE_RESOLUTION_SCHEMA,
+      requested: "auto",
+      forge: "gitlab",
+      host: "code.example.test",
+      remoteUrl: "git@ssh.code.example.test:team/project.git",
+      reason: "glab ssh_host ssh.code.example.test of code.example.test",
+    };
+    const workspace = { repository: plain, worktreePath: fixture.repository };
+    expect(
+      await runResolveForge({ repository: plain, forge: "auto", preparedWorkspace: workspace }),
+    ).toEqual(expected);
+    expect(
+      await runResolveForge({
+        repository: plain,
+        forge: "auto",
+        preparedWorkspace: { repository: fixture.repository },
+      }),
+    ).toEqual(expected);
+    expect(await runResolveForge({ repository: fixture.repository })).toEqual(expected);
+    expect(await runResolveForge({ repository: fixture.repository, forge: "github" })).toEqual(
+      resolution("github", "github"),
+    );
+  });
+
+  it("binds CI watches to the recorded forge and to GitHub without a record", async () => {
+    const node = autoimplementWorkflow.nodes.inspectCi;
+    if (node?.nodeType !== "agent" || node.validate === undefined) {
+      throw new Error("inspectCi must be a validated agent node");
+    }
+    const nodeValidate = node.validate;
+    const validate = (value: unknown, context: never) =>
+      Promise.resolve().then(() => nodeValidate(value, context));
+    const mr = "https://gitlab.example.test/group/project/-/merge_requests/7";
+    const id = repositoryId(fixture.repository);
+    const publication = (pr: string) => ({
+      repositories: [
+        {
+          id,
+          repository: fixture.repository,
+          branch: "feat/demo",
+          baseBranch: "main",
+          headRevision: "abc123",
+          pr,
+        },
+      ],
+    });
+    const inspection = (
+      pr: string,
+      command: string,
+      args: string[],
+      repository = fixture.repository,
+    ) => ({
+      targets: [
+        {
+          repository,
+          headRevision: "abc123",
+          pr,
+          route: "pending",
+          reason: "running",
+          trackingCommand: {
+            id: repositoryId(repository),
+            command,
+            args,
+            cwd: repository,
+            timeoutMs: 300_000,
+            maxOutputChars: 1_000_000,
+          },
+        },
+      ],
+    });
+    const context = (outputs: Record<string, unknown>) =>
+      ({ ...syntheticAutoimplementContext(), outputs, state: { steps: [] } }) as never;
+    const githubPr = "https://example.test/pr/1";
+    await expect(
+      validate(
+        inspection(githubPr, "gh", ["pr", "checks", "--watch"]),
+        context({ publish: publication(githubPr) }),
+      ),
+    ).resolves.toMatchObject({
+      targets: [
+        { trackingCommand: { command: "gh", args: ["pr", "checks", githubPr, "--watch"] } },
+      ],
+    });
+    await expect(
+      validate(
+        inspection(githubPr, "glab", ["ci", "status", "--live"]),
+        context({ publish: publication(githubPr), resolveForge: resolution("github") }),
+      ),
+    ).rejects.toThrow("CI tracking command.command must be gh");
+    await expect(
+      validate(
+        inspection(mr, "glab", ["ci", "status", "--wait", "-b", "feat/demo"]),
+        context({ publish: publication(mr), resolveForge: resolution("gitlab") }),
+      ),
+    ).resolves.toMatchObject({
+      targets: [
+        {
+          trackingCommand: {
+            command: "glab",
+            args: [
+              "ci",
+              "status",
+              "--live",
+              "--branch",
+              "feat/demo",
+              "--repo",
+              "https://gitlab.example.test/group/project",
+            ],
+          },
+        },
+      ],
+    });
+    await expect(
+      validate(
+        inspection(mr, "glab", ["ci", "status", "--live", "--branch", "main"]),
+        context({ publish: publication(mr), resolveForge: resolution("gitlab") }),
+      ),
+    ).rejects.toThrow("published source branch");
+    const other = path.join(fixture.repository, "other");
+    await expect(
+      validate(
+        inspection(mr, "glab", ["ci", "status", "--live"], other),
+        context({ publish: publication(mr), resolveForge: resolution("gitlab") }),
+      ),
+    ).rejects.toThrow(
+      `CI target does not match the published repository and head: ${repositoryId(other)}`,
+    );
+    await expect(
+      validate(
+        inspection(mr, "glab", ["ci", "status", "--live"]),
+        context({ publish: publication(mr), resolveForge: { forge: "gitlab" } }),
+      ),
+    ).rejects.toThrow("forge resolution schema must be");
   });
 });

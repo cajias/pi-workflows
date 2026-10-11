@@ -18,6 +18,8 @@ export {
   type ExistingPlanDiscovery,
 } from "./autoimplement.workflow.js";
 export type { AutoimplementConcurrency } from "./autoimplement-command-batches.js";
+export type { PrTiming as AutoimplementPrTiming } from "./autoimplement-config.js";
+export type { ForgeRequest as AutoimplementForgeRequest } from "./autoimplement-forge.js";
 export {
   default as monitorWorkflow,
   type MonitorInput,
