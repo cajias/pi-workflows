@@ -1480,6 +1480,28 @@ model.
 
 ## Risks and open issues
 
+### Owner decisions (2026-10-11)
+
+The owner resolved the open issues as follows. These decisions override any conflicting text
+elsewhere in this plan.
+
+- **`glab api` is approved.** Use `glab api` REST calls, with glab's own auth, to list, reply to,
+  and resolve MR discussions and to look up MRs. Use plain `glab` subcommands (`mr create`,
+  `mr merge`, `mr list`, `mr view`, `ci status`) where they exist on the old local build.
+- **O1: accept and track F2.** Implement the `end` to `early` rule for a `human` actor, and unit-test
+  it. Do not change the server, resolver, or extension settings plumbing in this work.
+- **O2: use forge-neutral static text.** Rewrite the static `statusDetail` and `expectedOutput`
+  strings that name a forge so they read correctly on both forges. For example, use "checking PR/MR
+  comments", and give an `inspectCi` example that allows `gh` or `glab`. This is a cosmetic change
+  to GitHub's static text only. GitHub prompt bodies stay byte-identical. Routing and behavior stay
+  unchanged. Package B makes this change and regenerates the layout fixture, which updates B's
+  acceptance criterion "layout fixture unchanged". F6 is no longer needed for wording.
+- **O3: forbid `glab` everywhere.** This is the accepted safety tightening.
+- **Live validation.** Drop step 2 of [Validation](#validation): a disposable GitLab or GitHub
+  run that pushes or opens an MR or PR. The goal forbids live MR or PR creation. The real-model
+  `test:e2e:live` run in step 1 is optional and needs owner approval for its cost. The required
+  live check is read-only: `glab mr list` against a code.aws.dev repository.
+
 ### Open issues
 
 - **O1: settings actor plumbing (decision 2).**
