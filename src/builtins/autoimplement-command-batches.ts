@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { MAX_COMMAND_BATCH_ITEMS, type CommandBatchItem } from "../workflows/command-batch.js";
+import { parseGitLabMergeRequestUrl } from "./autoimplement-forge.js";
 
 export const REVIEW_TIMEOUT_MS = 10 * 60_000;
 export const CI_WATCH_TIMEOUT_MS = 5 * 60_000;
@@ -46,6 +47,10 @@ export type CiInspectionBatch = {
   unrelatedFailures: string[];
   targets: CiTargetInspection[];
 };
+
+/** How a pending CI watch is bound to its target. GitLab watches also bind the published branch. */
+export type CiForgeBinding = { forge: "github" } | { forge: "gitlab"; branch: string };
+export const GITHUB_CI_BINDING: CiForgeBinding = { forge: "github" };
 
 export function parseAutoimplementConcurrency(value: unknown): AutoimplementConcurrency {
   if (value === undefined) return { reviewer: 4, ciWatch: 4, verification: 2 };
@@ -116,7 +121,10 @@ export function reviewerCommand(repository: PublishedRepository): CommandBatchIt
   };
 }
 
-export function parseCiInspectionBatch(value: unknown): CiInspectionBatch {
+export function parseCiInspectionBatch(
+  value: unknown,
+  bindingFor: (id: string) => CiForgeBinding = () => GITHUB_CI_BINDING,
+): CiInspectionBatch {
   const result = requireRecord(value, "CI inspection");
   if (!Array.isArray(result.targets) || result.targets.length === 0) {
     throw new Error("CI inspection targets must be a non-empty array");
@@ -159,7 +167,13 @@ export function parseCiInspectionBatch(value: unknown): CiInspectionBatch {
       ),
     };
     if (raw.route === "pending") {
-      target.trackingCommand = parseCiCommand(raw.trackingCommand, id, repository, pr);
+      target.trackingCommand = parseCiCommand(
+        raw.trackingCommand,
+        id,
+        repository,
+        pr,
+        bindingFor(id),
+      );
     }
     return target;
   });
@@ -184,9 +198,22 @@ export function parseCiCommand(
   id: string,
   repository: string,
   pr: string,
+  binding: CiForgeBinding = GITHUB_CI_BINDING,
 ): CommandBatchItem {
   const raw = requireRecord(value, "CI tracking command");
   if (raw.id !== id) throw new Error("CI tracking command id must match the target repository");
+  return binding.forge === "gitlab"
+    ? parseGitLabCiCommand(raw, id, repository, pr, binding.branch)
+    : parseGitHubCiCommand(raw, id, repository, pr);
+}
+
+/** Accepts `gh pr checks [<pr>] --watch` or `gh run watch <id>` and binds it to the target PR. */
+function parseGitHubCiCommand(
+  raw: Record<string, unknown>,
+  id: string,
+  repository: string,
+  pr: string,
+): CommandBatchItem {
   const command = parseCommandItem(raw, "CI tracking command", {
     id,
     command: "gh",
@@ -210,6 +237,100 @@ export function parseCiCommand(
     throw new Error("CI tracking command args are not allowed for the target PR");
   }
   return { ...command, args: ["pr", "checks", pr, "--watch"] };
+}
+
+const GLAB_WATCH_FLAGS = new Set(["--live", "-l", "--wait"]);
+const GLAB_VALUE_OPTIONS: ReadonlyMap<string, "branch" | "repo"> = new Map([
+  ["--branch", "branch"],
+  ["-b", "branch"],
+  ["--repo", "repo"],
+  ["-R", "repo"],
+]);
+
+type GlabCiStatusOptions = { watch?: string; branch?: string; repo?: string };
+type GlabOption = { name: "branch" | "repo"; value: string | undefined };
+
+/** A `--branch`/`-b` or `--repo`/`-R` option with a separate or `=` value, or undefined. */
+function glabValueOption(token: string, tokens: Iterator<string>): GlabOption | undefined {
+  const separate = GLAB_VALUE_OPTIONS.get(token);
+  if (separate !== undefined) return { name: separate, value: tokens.next().value };
+  const inline = /^--(branch|repo)=(.*)$/.exec(token);
+  if (inline === null) return undefined;
+  return { name: inline[1] as GlabOption["name"], value: inline[2] };
+}
+
+function readGlabToken(
+  token: string,
+  tokens: Iterator<string>,
+  options: GlabCiStatusOptions,
+): void {
+  if (GLAB_WATCH_FLAGS.has(token)) {
+    if (options.watch !== undefined) throw new Error("CI tracking command repeats the watch flag");
+    options.watch = token;
+    return;
+  }
+  const option = glabValueOption(token, tokens);
+  if (option === undefined) throw new Error(`CI tracking command option is not allowed: ${token}`);
+  if (options[option.name] !== undefined) {
+    throw new Error(`CI tracking command repeats the ${option.name} option`);
+  }
+  if (option.value === undefined || option.value.length === 0) {
+    throw new Error(`CI tracking command ${option.name} option needs a value`);
+  }
+  options[option.name] = option.value;
+}
+
+/** The options after `ci status`. Each option appears at most once and nothing else is allowed. */
+function parseGlabCiStatusOptions(args: readonly string[]): GlabCiStatusOptions {
+  if (args[0] !== "ci" || args[1] !== "status") {
+    throw new Error("CI tracking command args must start with ci status");
+  }
+  const options: GlabCiStatusOptions = {};
+  const tokens = args.slice(2)[Symbol.iterator]();
+  for (let next = tokens.next(); next.done !== true; next = tokens.next()) {
+    readGlabToken(next.value, tokens, options);
+  }
+  return options;
+}
+
+/**
+ * Accepts only `glab ci status` with one watch flag and optional branch and repository options
+ * bound to the published branch and the merge request's project. Normalizes to the live watch with
+ * both values explicit, so glab never resolves a remote or prompts.
+ */
+function parseGitLabCiCommand(
+  raw: Record<string, unknown>,
+  id: string,
+  repository: string,
+  pr: string,
+  branch: string,
+): CommandBatchItem {
+  const command = parseCommandItem(raw, "CI tracking command", {
+    id,
+    command: "glab",
+    cwd: repository,
+    maxTimeoutMs: CI_WATCH_TIMEOUT_MS,
+  });
+  const mergeRequest = parseGitLabMergeRequestUrl(pr, "CI target pr");
+  const options = parseGlabCiStatusOptions(command.args);
+  if (options.watch === undefined) {
+    throw new Error("CI tracking command must watch with --live, -l, or --wait");
+  }
+  if (options.branch !== undefined && options.branch !== branch) {
+    throw new Error("CI tracking command branch must be the published source branch");
+  }
+  const projects = [
+    mergeRequest.projectUrl,
+    `${mergeRequest.host}/${mergeRequest.projectPath}`,
+    mergeRequest.projectPath,
+  ];
+  if (options.repo !== undefined && !projects.includes(options.repo)) {
+    throw new Error("CI tracking command repository must be the merge request project");
+  }
+  return {
+    ...command,
+    args: ["ci", "status", "--live", "--branch", branch, "--repo", mergeRequest.projectUrl],
+  };
 }
 
 export function repositoryId(repository: string): string {
