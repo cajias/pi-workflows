@@ -51,6 +51,18 @@ describe("bundled workflow skills", () => {
     expect(markdown).toContain("`glab mr merge <iid> --sha <head> --auto-merge=false --yes`");
   });
 
+  it("guides autoimplement to publish once after review with prTiming end", () => {
+    const markdown = skill("autoimplement");
+    expect(markdown).toContain(
+      "With `end`, the workflow commits locally, runs pi-reviewer on the local commits, and pushes once to open or update the single pull request or merge request only after review passes.",
+    );
+    expect(markdown).toContain("Direct `defaultBranch` work ignores this field.");
+    expect(markdown).toContain(
+      "With `prTiming: end`, keep commits local until pi-reviewer passes for the current local head, then push once",
+    );
+    expect(markdown).not.toContain("does not change publication order");
+  });
+
   it("keeps initial planning out of autoimplement and autodoc", () => {
     expect(skill("autoimplement")).toContain("Do not devise an initial plan");
     expect(skill("autodoc")).toContain("It does not choose, devise, improve, or revise");

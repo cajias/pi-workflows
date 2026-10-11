@@ -404,7 +404,9 @@ workflow examples. Copy any of them into `.pi/workflows/` to use them:
   is verified without another reviewer round. A five-minute CI wait routes to
   additional useful local testing, and new evidence can route through autoplan
   and autodoc before implementation resumes. It works with GitHub pull requests
-  through `gh` and with GitLab merge requests through `glab`.
+  through `gh` and with GitLab merge requests through `glab`. With
+  `prTiming: end`, it keeps commits local until review passes and then
+  publishes once.
 - `human-decision` shows a reusable verified-human gate with a structured
   machine subject, a separate readable operator presentation, plain choices,
   and exact replan text.

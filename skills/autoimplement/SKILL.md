@@ -27,7 +27,7 @@ Build the input as follows:
 - `directDefaultBranchAuthorized`: Set `true` only when direct work on the actual default branch is explicit. It does not grant commit, push, merge, or release authority.
 - `merge`: Set `true` only when the user explicitly requested merge or an applicable standing instruction authorizes it. Otherwise set `false`.
 - `forge`: Omit it unless the user names a forge. Then use `github` or `gitlab`. The safe default is the user's Autoimplement defaults file, else `auto`, which detects GitHub or GitLab from the repository's Git remote and falls back to GitHub. Use an explicit value when the user says detection chose the wrong forge.
-- `prTiming`: Omit it unless the user asks to publish only after review passes. Then use `end`. The safe default is the user's Autoimplement defaults file, else `early`, which pushes and opens the pull request before review. The workflow records `end` but does not change publication order for it yet.
+- `prTiming`: Omit it unless the user asks to publish only after review passes. Then use `end`. The safe default is the user's Autoimplement defaults file, else `early`, which pushes and opens the pull request before review. With `end`, the workflow commits locally, runs pi-reviewer on the local commits, and pushes once to open or update the single pull request or merge request only after review passes. Direct `defaultBranch` work ignores this field.
 - `documents`: Include known canonical plan or specification paths. Use an empty array when none are known.
 - `documentation`: Include a trusted current-document receipt only when it names the matching plan digest and canonical documents. Omit it when documentation still needs inspection.
 - `approval`: Omit it for the default behavior: ask on each new plan and continue after 10 minutes without an answer. Use `{ "mode": "required" }` when the user says to block on plan changes. Use `{ "mode": "skip" }` when the user says to continue without asking about plan changes.
@@ -115,6 +115,7 @@ Outside Pi, or when the workflow is unavailable, do the following in the order t
    - Do not put mutation testing on the critical path unless repository policy explicitly requires it; keep the mutation test scripts available.
 
 3. Push your latest commits before running review so the review is always against the current PR head.
+   - With `prTiming: end`, keep commits local until pi-reviewer passes for the current local head, then push once to open or update the single PR or MR. Push later fixes only after pi-reviewer passes for them too.
    - On GitLab, look up an open MR for the source and target branch with `glab api` before you create one with `glab mr create`, and never open a second MR for the same branch pair.
    - Run pi-reviewer with its configured defaults against the base branch: `pi-reviewer --base <branch_name>`. The model and thinking level come from the reviewer's own config, not from this skill.
    - Run reviewer commands for independent repositories in one bounded batch. Keep each result tied to its repository, base branch, pushed head, and relevant dependency fingerprint.

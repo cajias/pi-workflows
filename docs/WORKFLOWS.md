@@ -755,7 +755,7 @@ A failed or timed-out semantic repair enters `reconcileRepair`, not terminal fai
 
 The extension aborts only the cancelled workflow-owned Pi turn through public `ctx.abort()`. The server retains that turn until Pi confirms settlement or an idle branch observation proves it lost. The next prompt cannot run before that boundary. Aborting Pi does not prove that third-party detached commands stopped: reconciliation must inspect those commands through their existing owner tools. There is no hidden model retry or new process-control protocol.
 
-Autoimplement uses batches for pi-reviewer and pending CI watches. It keeps model turns, fixes, pushes, comment changes, merges, and releases in their existing order. Reviewer commands are tied to the repository, base branch, pushed head, and relevant dependency fingerprint. A later review round includes only repositories whose head or dependency fingerprint changed. P0 or P1 work still requires another review. P2-only work can be addressed and verified without another reviewer run only because of that P2 work.
+Autoimplement uses batches for pi-reviewer and pending CI watches. It keeps model turns, fixes, pushes, comment changes, merges, and releases in their existing order. Reviewer commands are tied to the repository, base branch, reviewed head, and relevant dependency fingerprint. The reviewed head is the pushed head under `prTiming: early` and the local commit under `prTiming: end`, as [Autoimplement publication timing](#autoimplement-publication-timing) describes. A later review round includes only repositories whose head or dependency fingerprint changed. P0 or P1 work still requires another review. P2-only work can be addressed and verified without another reviewer run only because of that P2 work.
 
 Autoimplement inspects every pull request or merge request before it waits for CI. On GitHub, it accepts only supported pending `gh pr checks --watch` or `gh run watch` descriptors and binds each one to the validated pull request as `gh pr checks <PR URL> --watch`. On GitLab, it accepts only `glab ci status` watches and binds each one to the published source branch and the merge request's project, as [Autoimplement forge selection](#autoimplement-forge-selection) describes. Repository and pull-request overrides are rejected. One watch lasts at most five minutes. A failed or timed-out watch affects only its own pull request or merge request. When checks remain pending, the model runs more useful local tests before checking CI again. Autoimplement does not invent an ETA.
 
@@ -793,7 +793,7 @@ The JSON key `pr` holds the merge request URL on GitLab. Publication validation 
 
 The `statusDetail` and `expectedOutput` strings are static parts of the workflow definition, so they cannot change per run. The ones that named a forge now read correctly on both forges. For example, the comment step's status is "checking PR/MR comments", and the `inspectCi` example shows both the `gh` and the `glab` tracking command forms. The GitLab prompt tells the model to use only the `glab` form.
 
-The `prTiming` input accepts `early` or `end`. It is validated and stored in the input and in the run settings, but it does not change routing yet: every run publishes before review, as `early` does.
+The `prTiming` input accepts `early` or `end` and chooses when a run publishes. See [Autoimplement publication timing](#autoimplement-publication-timing).
 
 The run settings include the requested `forge` and `prTiming`. Neither model steps nor people can change `forge` during a run. Only a `human` settings actor can change `prTiming`, and only from `end` to `early`. A change from `early` to `end` is rejected for every actor. Settings changes made from a Pi session are recorded as `session` changes today, so this rule cannot yet be used through the server.
 
@@ -812,6 +812,31 @@ Persistent defaults live in `${PI_WORKFLOWS_CONFIG_DIR:-~/.config/pi-workflows}/
 `schema` is required. `forge` and `prTiming` are optional, and no other key is allowed. A workflow input value wins over the file, and the file wins over the built-in defaults `auto` and `early`. A missing file means the built-in defaults apply. An unreadable file, invalid JSON, an unknown key, a wrong schema, or an invalid value fails the start with an error that names the file.
 
 Input parsing reads the file only when the input omits `forge` or `prTiming`, then stores both values in the normalized input. Parsing a normalized input again therefore never reads the file. A resume uses the stored input and does not read the file. A restart parses the original raw input again, so a changed file takes effect when that input omitted a field. An included Autoimplement, such as a Monitor repair, parses its input in the runner and inherits the same defaults. The file is read in the workflow server runner's environment, not in the Pi session's environment.
+
+#### Autoimplement publication timing
+
+The `prTiming` input chooses when Autoimplement publishes. `early`, the default, commits, pushes, and opens or updates the pull request or merge request before review, exactly as upstream does. `end` keeps every implementation, verification, review, and fix round local. It pushes only after the review gate passes for the exact head it pushes, so no pull request or merge request exists before the first clean review.
+
+The `publication` route runs `routeVerifiedWorkspace`, a settings route that chooses one of four branches:
+
+- `defaultBranch` for direct default-branch work. That work has no pull request or merge request, so it ignores `prTiming`.
+- `publishReviewed` when the newest local work passed the review gate and is not pushed yet.
+- `commitLocal` under `end` otherwise.
+- `pullRequest`, the upstream `publish`, under `early`.
+
+`commitLocal` commits the verified work on the prepared task branch. It never pushes, never opens or updates a pull request or merge request, and never rewrites a pushed commit. The program checks the reported commit against the work tree: the head must be the checked-out `HEAD` of the prepared task branch, and only paths that were already changed before the run may stay uncommitted. Review then runs `pi-reviewer --base <base>` against that local head.
+
+The review gate passes when the newest work event records a head and every head it records passes. A head passes when its newest successful review found no P0, P1, or P2 findings, or when a passed P2 verification produced it after a P2-only review of its parent. An `implement`, `fix`, or `addressP2` step counts as new work with any outcome, because a failed or timed-out edit may be partial. While a reviewed head is not pushed, a clean review, a reused clean review, or a passed P2 verification offers `publication`, `review`, or `blocked` instead of comments. A reused review of a head that is not pushed and did not pass offers `repair`, `redesign`, or `blocked`.
+
+That publication runs `publish` with the reviewed-head prompt. The model pushes exactly that head without force and creates no commits. It reuses the one pull request or merge request for the branch and base, or opens it when none exists, and never creates a second one. Validation requires the published head, branch, base branch, and dependency fingerprint to equal the reviewed head. A publish that reports another head fails the step and returns to the controller, which offers `publication` again. After the push, comment handling, CI, and delivery run on that single pull request or merge request.
+
+P2 work follows where the reviewed candidate lives. After `addressP2`, the compute step `routeAddressedP2` sends work on a pushed candidate to `verifyP2`, which verifies and pushes as upstream does. It sends work on a local commit to `verifyP2Local`, which verifies and commits locally and is checked against the work tree like `commitLocal`. A passed local P2 verification is pushed without another review. This is the same P2 exception that upstream makes.
+
+A later fix, for example after a review comment or a failed CI run, repeats the cycle: repair, verification, `commitLocal`, review, and one push to the same pull request or merge request after the fixed head is reviewed clean. Under `end`, the `implement`, `fix`, and `addressP2` prompts say not to push, and the decide prompt states the timing.
+
+Under `early`, every route list, prompt, and step stays upstream. `commitLocal` and `verifyP2Local` never run, and `routeAddressedP2` always chooses `push`. The only additions on that path are the `routeAddressedP2` step and the settings-route flag on `routeVerifiedWorkspace`.
+
+A `human` settings actor can move `prTiming` from `end` to `early` during a run. After a clean review of a local commit, that reviewed head still gets its single push. Before that review, the next publication pushes before review, as `early` does. P2 work still follows where the reviewed candidate lives. Settings changes from a Pi session are recorded as `session` changes today, so this change cannot yet be made through the server.
 
 ### Built-in sanity check
 
