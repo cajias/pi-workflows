@@ -380,6 +380,7 @@ export const FORBIDDEN_VERIFICATION_EXECUTABLES = [
   "fish",
   "gh",
   "git",
+  "glab",
   "ksh",
   "powershell",
   "powershell.exe",
@@ -406,6 +407,7 @@ export function formatVerificationCommandSafetyRules(): string[] {
   return [
     `Executable basenames must not be any of: ${FORBIDDEN_VERIFICATION_EXECUTABLES.join(", ")}.`,
     "All Git and GitHub CLI commands are forbidden, including read-only commands.",
+    "All GitLab CLI (glab) commands are forbidden, including read-only commands.",
     "Shell executables and shell wrappers are forbidden.",
     `Arguments must not contain these standalone action words: ${FORBIDDEN_VERIFICATION_ACTION_WORDS.join(", ")}.`,
   ];

@@ -2,6 +2,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   GITHUB_CI_BINDING,
+  formatVerificationCommandSafetyRules,
   parseAutoimplementConcurrency,
   parseCiCommand,
   parseCiInspectionBatch,
@@ -123,6 +124,23 @@ describe("autoimplement command batch contracts", () => {
       /mutation or publication/,
     );
     expect(() => validateVerificationCommandSafety("npm", ["test"], "check")).not.toThrow();
+  });
+
+  it("forbids the GitLab CLI in verification commands on every forge", () => {
+    for (const executable of ["glab", "/usr/local/bin/glab", "GLAB"]) {
+      expect(() => validateVerificationCommandSafety(executable, [], "check")).toThrow(
+        "check.command is not allowed",
+      );
+    }
+    const rules = formatVerificationCommandSafetyRules();
+    expect(rules).toContain(
+      "All Git and GitHub CLI commands are forbidden, including read-only commands.",
+    );
+    expect(rules).toContain(
+      "All GitLab CLI (glab) commands are forbidden, including read-only commands.",
+    );
+    expect(rules[0]).toContain(", gh, git, glab, ksh,");
+    expect(rules).toHaveLength(5);
   });
 
   it("normalizes per-PR CI state and validates pending watch commands", async () => {
