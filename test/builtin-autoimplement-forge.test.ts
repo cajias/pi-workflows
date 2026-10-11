@@ -969,3 +969,219 @@ describe("autoimplement forge graph shape", () => {
     ).rejects.toThrow("forge resolution schema must be");
   });
 });
+
+const GITLAB_MR = "https://gitlab.example.test/group/sub/project/-/merge_requests/7";
+const GITLAB_PROJECT_URL = "https://gitlab.example.test/group/sub/project";
+const GOLDEN_ID = repositoryId("/golden/repository");
+
+/** A detected GitLab resolution, as `resolveForge` records it for a glab hosts key match. */
+const DETECTED_GITLAB = {
+  ...resolution("gitlab"),
+  host: "gitlab.example.test",
+  remoteUrl: "git@gitlab.example.test:group/sub/project.git",
+  reason: "glab host gitlab.example.test",
+};
+
+/** The golden context on GitLab, with a scope that uses the GitLab request name. */
+function gitlabPromptContext(merge = false) {
+  const context = syntheticAutoimplementContext({
+    merge,
+    pr: GITLAB_MR,
+    outputs: { resolveForge: DETECTED_GITLAB },
+  });
+  return {
+    ...context,
+    input: {
+      ...(context.input as Record<string, unknown>),
+      scope: "Only /golden/repository. May edit, test, commit, push, and open a merge request.",
+    },
+  };
+}
+
+async function renderGitLabPrompt(nodeId: string, merge = false): Promise<string> {
+  const node = autoimplementWorkflow.nodes[nodeId];
+  if (node?.nodeType !== "agent") throw new Error(`${nodeId} must be an agent node`);
+  return await node.prompt(gitlabPromptContext(merge));
+}
+
+const GITLAB_COORDINATES = `GitLab API coordinates: ${JSON.stringify([
+  {
+    id: GOLDEN_ID,
+    repository: "/golden/repository",
+    pr: GITLAB_MR,
+    hostname: "gitlab.example.test",
+    apiProject: "group%2Fsub%2Fproject",
+    iid: 7,
+    projectUrl: GITLAB_PROJECT_URL,
+  },
+])}`;
+
+function promptLines(prompt: string): string[] {
+  return prompt.split("\n");
+}
+
+describe("autoimplement GitLab prompts", () => {
+  it("renders the same GitHub golden prompts when a GitHub resolution is recorded", async () => {
+    for (const testCase of PROMPT_CASES) {
+      const node = autoimplementWorkflow.nodes[testCase.nodeId];
+      if (node?.nodeType !== "agent") throw new Error(`${testCase.nodeId} must be an agent node`);
+      const context = syntheticAutoimplementContext({
+        merge: testCase.merge,
+        outputs: { resolveForge: resolution("github") },
+      });
+      expect(await node.prompt(context), testCase.name).toBe(
+        GITHUB_GOLDEN_PROMPTS[testCase.name]?.join("\n"),
+      );
+    }
+  });
+
+  it.each(PROMPT_CASES)(
+    "renders the GitLab $name prompt without pull request wording",
+    async (testCase) => {
+      const prompt = await renderGitLabPrompt(testCase.nodeId, testCase.merge);
+      expect(prompt).not.toContain("pull request");
+      expect(prompt).not.toContain("pr-description");
+      expect(prompt).not.toMatch(/\bPRs?\b/u);
+      expect(prompt).not.toContain("gh pr");
+    },
+  );
+
+  it("adds the forge line to the GitLab decide prompt after the merge setting", async () => {
+    const lines = promptLines(await renderGitLabPrompt("decide"));
+    const merge = lines.indexOf("Merge allowed now: false");
+    expect(lines[merge + 1]).toBe(
+      "Forge: gitlab. Publication uses one GitLab merge request through glab.",
+    );
+  });
+
+  it("asks implement and default-branch finalization about merge requests", async () => {
+    expect(await renderGitLabPrompt("implement")).toContain(
+      "branch, remote state, and matching merge request.",
+    );
+    expect(promptLines(await renderGitLabPrompt("finalizeDefaultBranch"))[1]).toBe(
+      "Never open a merge request from the default branch to itself.",
+    );
+  });
+
+  it("publishes one merge request per source and target branch through glab", async () => {
+    const lines = promptLines(await renderGitLabPrompt("publish"));
+    const prompt = lines.join("\n");
+    expect(prompt).toContain(
+      'glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>"',
+    );
+    expect(prompt).toContain(
+      "glab mr create --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes",
+    );
+    expect(prompt).toContain("glab mr update <iid> --description <description> --yes");
+    expect(prompt).toContain("create a second merge request for the same source and target branch");
+    expect(prompt).toContain(
+      "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
+    );
+    expect(prompt).toContain("https://<hostname>/<project path>/-/merge_requests/<iid> as pr.");
+    const base = lines.indexOf("Requested base branch: main.");
+    expect(lines[base + 1]).toBe(`Forge resolution: ${JSON.stringify(DETECTED_GITLAB)}`);
+    expect(lines.at(-1)).toBe("Do not merge yet.");
+  });
+
+  it("re-observes the merge request after the P2 push with its API coordinates", async () => {
+    const lines = promptLines(await renderGitLabPrompt("verifyP2"));
+    expect(lines.join("\n")).toContain(
+      "Re-observe every published merge request after the push with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid>",
+    );
+    expect(lines.at(-1)).toBe(GITLAB_COORDINATES);
+  });
+
+  it("lists, replies to, and resolves merge request discussions", async () => {
+    const lines = promptLines(await renderGitLabPrompt("inspectComments"));
+    const prompt = lines.join("\n");
+    expect(prompt).toContain(
+      "glab api --hostname <hostname> --paginate projects/<apiProject>/merge_requests/<iid>/discussions",
+    );
+    expect(prompt).toContain("ignore notes with system true");
+    expect(prompt).toContain(
+      "glab api --hostname <hostname> --method POST projects/<apiProject>/merge_requests/<iid>/discussions/<discussionId>/notes -f body=<reply>",
+    );
+    expect(prompt).toContain(
+      "glab api --hostname <hostname> --method PUT projects/<apiProject>/merge_requests/<iid>/discussions/<discussionId> -F resolved=true",
+    );
+    expect(lines.at(-2)).toBe(GITLAB_COORDINATES);
+    expect(lines.at(-1)).toMatch(/^Published repositories: /u);
+  });
+
+  it("lists the canonical glab watch for every published target", async () => {
+    const lines = promptLines(await renderGitLabPrompt("inspectCi"));
+    const canonical = {
+      id: GOLDEN_ID,
+      command: "glab",
+      args: ["ci", "status", "--live", "--branch", "feat/golden", "--repo", GITLAB_PROJECT_URL],
+      cwd: "/golden/repository",
+      timeoutMs: 300_000,
+      maxOutputChars: 1_000_000,
+    };
+    expect(lines).toContain(`Canonical glab tracking commands: ${JSON.stringify([canonical])}`);
+    expect(lines.join("\n")).toContain(
+      "glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, and sha.",
+    );
+    expect(lines).toContain(
+      "The expected-output example shows both command forms. On this GitLab run use only the glab form.",
+    );
+    expect(lines.at(-2)).toBe(GITLAB_COORDINATES);
+  });
+
+  it("repairs and assesses glab watches for merge requests", async () => {
+    const repair = await renderGitLabPrompt("repairCiCommand");
+    expect(repair).toContain("local glab prerequisites or authentication");
+    expect(repair).toContain("Do not change the MR identity");
+    const assess = await renderGitLabPrompt("assessTrackedCi");
+    expect(assess).toContain("one target result for every watched MR");
+    expect(assess).toContain("exits 0 for canceled, skipped, and manual pipelines");
+  });
+
+  it("merges with the head guard and trusts only a fresh merged state", async () => {
+    const merge = await renderGitLabPrompt("finalizeDelivery", true);
+    expect(merge).toContain(
+      "glab mr merge <iid> --repo <projectUrl> --sha <headRevision> --auto-merge=false --yes",
+    );
+    expect(merge).toContain(
+      "Report merged true only after a fresh read of the merge request shows state merged.",
+    );
+    expect(merge).toContain(
+      "glab api --hostname <hostname> --method POST projects/<apiProject>/merge_requests/<iid>/notes -f body=<report>",
+    );
+    expect(promptLines(merge).at(-2)).toBe(GITLAB_COORDINATES);
+    const ready = await renderGitLabPrompt("finalizeDelivery");
+    expect(promptLines(ready)[0]).toBe(
+      "Leave every verified MR ready without merging because current workflow settings disable merge.",
+    );
+    expect(ready).not.toContain("glab mr merge");
+  });
+
+  it("summarizes merge request results", async () => {
+    for (const nodeId of ["completedSummary", "blockedSummary"]) {
+      expect(await renderGitLabPrompt(nodeId)).toContain("CI, MR or merge results");
+    }
+  });
+
+  it("explains that direct default-branch work has no merge request", async () => {
+    const node = autoimplementWorkflow.nodes.prepareCompleted;
+    if (node?.nodeType !== "compute") throw new Error("prepareCompleted must be a compute node");
+    const run = (outputs: Record<string, unknown>) => {
+      const context = syntheticAutoimplementContext({
+        outputs: {
+          verifyP2: { passed: true },
+          finalizeDefaultBranch: { status: "completed", pr: "none" },
+          ...outputs,
+        },
+      });
+      return node.run(context) as { ci: unknown };
+    };
+    expect(run({ resolveForge: DETECTED_GITLAB }).ci).toEqual({
+      route: "notApplicable",
+      reason: "Direct default-branch work has no merge request.",
+    });
+    expect(run({}).ci).toEqual({
+      route: "notApplicable",
+      reason: "Direct default-branch work has no pull request.",
+    });
+  });
+});
