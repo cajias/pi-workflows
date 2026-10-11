@@ -14,18 +14,25 @@ export type AutoimplementConcurrency = {
   verification: number;
 };
 
-export type PublishedRepository = {
+/** One repository head that review can run against: a pushed publication or a local commit. */
+export type CandidateRepository = {
   id: string;
   repository: string;
   branch: string;
   baseBranch: string;
   headRevision: string;
-  pr: string;
   dependencyFingerprint?: string;
 };
 
+export type PublishedRepository = CandidateRepository & { pr: string };
+
 export type PublishedRepositories = {
   repositories: PublishedRepository[];
+};
+
+/** Heads committed locally and never pushed, as `commitLocal` and `verifyP2Local` report them. */
+export type LocalCommitRepositories = {
+  repositories: CandidateRepository[];
 };
 
 export type CiTargetInspection = {
@@ -67,50 +74,95 @@ export function parseAutoimplementConcurrency(value: unknown): AutoimplementConc
   };
 }
 
-export function parsePublishedRepositories(value: unknown): PublishedRepositories {
-  const result = requireRecord(value, "publication result");
+/** The labels and the per-kind fields of one repository-record list. */
+type RepositoryRecordKind<TExtra> = {
+  /** Names the whole result, such as `publication result`. */
+  result: string;
+  /** Names one entry, such as `publication repositories`. */
+  entries: string;
+  /** Names a duplicated entry, such as `publication repository`. */
+  entry: string;
+  /** The boolean field every entry must set to true. */
+  flag: "pushed" | "committed";
+  /** Reads the fields that only this kind of record has. */
+  extra: (raw: Record<string, unknown>, label: string) => TExtra;
+};
+
+function parseRepositoryRecords<TExtra extends object>(
+  value: unknown,
+  kind: RepositoryRecordKind<TExtra>,
+): Array<CandidateRepository & TExtra> {
+  const result = requireRecord(value, kind.result);
   if (!Array.isArray(result.repositories) || result.repositories.length === 0) {
-    throw new Error("publication result repositories must be a non-empty array");
+    throw new Error(`${kind.result} repositories must be a non-empty array`);
   }
   if (result.repositories.length > MAX_COMMAND_BATCH_ITEMS) {
     throw new Error(
-      `publication result repositories must contain at most ${MAX_COMMAND_BATCH_ITEMS} entries`,
+      `${kind.result} repositories must contain at most ${MAX_COMMAND_BATCH_ITEMS} entries`,
     );
   }
   const ids = new Set<string>();
-  const repositories = result.repositories.map((entry, index) => {
-    const raw = requireRecord(entry, `publication repositories[${index}]`);
-    const repository = requireAbsolutePath(
-      raw.repository,
-      `publication repositories[${index}].repository`,
-    );
+  return result.repositories.map((entry, index) => {
+    const label = `${kind.entries}[${index}]`;
+    const raw = requireRecord(entry, label);
+    const repository = requireAbsolutePath(raw.repository, `${label}.repository`);
     const id = repositoryId(repository);
-    if (ids.has(id)) throw new Error(`publication repository is duplicated: ${repository}`);
+    if (ids.has(id)) throw new Error(`${kind.entry} is duplicated: ${repository}`);
     ids.add(id);
     const dependencyFingerprint = optionalString(
       raw.dependencyFingerprint,
-      `publication repositories[${index}].dependencyFingerprint`,
+      `${label}.dependencyFingerprint`,
     );
-    if (raw.pushed !== true) {
-      throw new Error(`publication repositories[${index}].pushed must be true`);
+    if (raw[kind.flag] !== true) {
+      throw new Error(`${label}.${kind.flag} must be true`);
     }
     return {
       id,
       repository,
-      branch: requireString(raw.branch, `publication repositories[${index}].branch`),
-      baseBranch: requireString(raw.baseBranch, `publication repositories[${index}].baseBranch`),
-      headRevision: requireString(
-        raw.headRevision,
-        `publication repositories[${index}].headRevision`,
-      ),
-      pr: requireString(raw.pr, `publication repositories[${index}].pr`),
+      branch: requireString(raw.branch, `${label}.branch`),
+      baseBranch: requireString(raw.baseBranch, `${label}.baseBranch`),
+      headRevision: requireString(raw.headRevision, `${label}.headRevision`),
+      ...kind.extra(raw, label),
       ...(dependencyFingerprint !== undefined ? { dependencyFingerprint } : {}),
     };
   });
-  return { repositories };
 }
 
-export function reviewerCommand(repository: PublishedRepository): CommandBatchItem {
+export function parsePublishedRepositories(value: unknown): PublishedRepositories {
+  return {
+    repositories: parseRepositoryRecords(value, {
+      result: "publication result",
+      entries: "publication repositories",
+      entry: "publication repository",
+      flag: "pushed",
+      extra: (raw, label) => ({ pr: requireString(raw.pr, `${label}.pr`) }),
+    }),
+  };
+}
+
+/**
+ * Reads local commit records. They follow the publication rules, but every entry sets
+ * `committed: true` and names neither a pull request nor a push, because nothing is published yet.
+ */
+export function parseLocalCommitRepositories(value: unknown): LocalCommitRepositories {
+  return {
+    repositories: parseRepositoryRecords(value, {
+      result: "local commit result",
+      entries: "local commit repositories",
+      entry: "local commit repository",
+      flag: "committed",
+      extra: (raw, label) => {
+        if (raw.pr !== undefined) throw new Error(`${label}.pr must be absent before publication`);
+        if (raw.pushed !== undefined && raw.pushed !== false) {
+          throw new Error(`${label}.pushed must be false before publication`);
+        }
+        return {};
+      },
+    }),
+  };
+}
+
+export function reviewerCommand(repository: CandidateRepository): CommandBatchItem {
   return {
     id: repository.id,
     command: "pi-reviewer",

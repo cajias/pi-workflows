@@ -6,6 +6,7 @@ import {
   parseAutoimplementConcurrency,
   parseCiCommand,
   parseCiInspectionBatch,
+  parseLocalCommitRepositories,
   parsePublishedRepositories,
   validateVerificationCommandSafety,
   repositoryId,
@@ -106,6 +107,80 @@ describe("autoimplement command batch contracts", () => {
         repositories: [{ ...record, dependencyFingerprint: 1 }],
       }),
     ).toThrow(/non-empty string/);
+  });
+
+  it("reads local commit records with the publication rules and no publication fields", async () => {
+    const repository = await makeTempDir("local-commit-repository");
+    const record = {
+      repository,
+      branch: "feat/demo",
+      baseBranch: "main",
+      headRevision: "abc123",
+      committed: true,
+    };
+    const parsed = parseLocalCommitRepositories({
+      repositories: [{ ...record, dependencyFingerprint: "sha256:dependency" }],
+    });
+    expect(parsed).toEqual({
+      repositories: [
+        {
+          id: repositoryId(repository),
+          repository: path.resolve(repository),
+          branch: "feat/demo",
+          baseBranch: "main",
+          headRevision: "abc123",
+          dependencyFingerprint: "sha256:dependency",
+        },
+      ],
+    });
+    expect(
+      parseLocalCommitRepositories({ repositories: [{ ...record, pushed: false }] }).repositories,
+    ).toEqual([
+      {
+        id: repositoryId(repository),
+        repository: path.resolve(repository),
+        branch: "feat/demo",
+        baseBranch: "main",
+        headRevision: "abc123",
+      },
+    ]);
+    expect(reviewerCommand(parsed.repositories[0]!)).toEqual({
+      id: repositoryId(repository),
+      command: "pi-reviewer",
+      args: ["--base", "main"],
+      cwd: path.resolve(repository),
+      timeoutMs: 600_000,
+      maxOutputChars: 1_000_000,
+    });
+  });
+
+  it("rejects local commit records that are uncommitted, duplicated, relative, or published", async () => {
+    const repository = await makeTempDir("local-commit-rejections");
+    const record = {
+      repository,
+      branch: "feat/demo",
+      baseBranch: "main",
+      headRevision: "abc123",
+      committed: true,
+    };
+    const { committed: _committed, ...uncommitted } = record;
+    const parse = (repositories: unknown[]) => () => parseLocalCommitRepositories({ repositories });
+    expect(parse([uncommitted])).toThrow("local commit repositories[0].committed must be true");
+    expect(parse([{ ...record, committed: false }])).toThrow(
+      "local commit repositories[0].committed must be true",
+    );
+    expect(parse([record, record])).toThrow(`local commit repository is duplicated: ${repository}`);
+    expect(parse([{ ...record, repository: "relative" }])).toThrow(
+      "local commit repositories[0].repository must be absolute",
+    );
+    expect(parse([{ ...record, pr: "https://example.test/pr/1" }])).toThrow(
+      "local commit repositories[0].pr must be absent before publication",
+    );
+    expect(parse([{ ...record, pushed: true }])).toThrow(
+      "local commit repositories[0].pushed must be false before publication",
+    );
+    expect(parse([])).toThrow("local commit result repositories must be a non-empty array");
+    expect(() => parseLocalCommitRepositories([])).toThrow("local commit result must be an object");
   });
 
   it("rejects unsafe verification executables and publication actions", () => {
