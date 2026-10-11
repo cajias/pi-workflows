@@ -327,10 +327,12 @@ function parseGitLabCiCommand(
   if (options.repo !== undefined && !projects.includes(options.repo)) {
     throw new Error("CI tracking command repository must be the merge request project");
   }
-  return {
-    ...command,
-    args: ["ci", "status", "--live", "--branch", branch, "--repo", mergeRequest.projectUrl],
-  };
+  return { ...command, args: gitlabCiWatchArgs(branch, mergeRequest.projectUrl) };
+}
+
+/** The one GitLab watch form the workflow runs: a live status with the branch and project explicit. */
+export function gitlabCiWatchArgs(branch: string, projectUrl: string): string[] {
+  return ["ci", "status", "--live", "--branch", branch, "--repo", projectUrl];
 }
 
 export function repositoryId(repository: string): string {
