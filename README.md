@@ -403,7 +403,8 @@ workflow examples. Copy any of them into `.pi/workflows/` to use them:
   comments and CI and finalizes the PR. P0 and P1 fixes require another review, while P2-only work
   is verified without another reviewer round. A five-minute CI wait routes to
   additional useful local testing, and new evidence can route through autoplan
-  and autodoc before implementation resumes.
+  and autodoc before implementation resumes. It works with GitHub pull requests
+  through `gh` and with GitLab merge requests through `glab`.
 - `human-decision` shows a reusable verified-human gate with a structured
   machine subject, a separate readable operator presentation, plain choices,
   and exact replan text.

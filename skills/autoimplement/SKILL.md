@@ -17,7 +17,7 @@ Build the input as follows:
 - `task`: Preserve the user's requested end state.
 - `plan`: Pass the selected plan or the full contents of its canonical plan document. Do not devise a new initial plan.
 - `repository`: Use the absolute path of the repository that owns the work.
-- `scope`: Always include a concrete authority statement. Name every allowed repository and the allowed edit, test, commit, push, pull-request, merge, and release actions. Carry forward exclusions from the conversation. A repository path alone is not a scope.
+- `scope`: Always include a concrete authority statement. Name every allowed repository and the allowed edit, test, commit, push, pull-request (merge-request on GitLab), merge, and release actions. Carry forward exclusions from the conversation. A repository path alone is not a scope.
 - `constraints`: Include all applicable user and repository constraints. Use an empty array when none apply.
 - `baseBranch`: Use the requested base or the repository default branch.
 - `workspaceMode`: Use `auto` unless the user or repository requires `branch`, `worktree`, or `defaultBranch`. `auto` keeps a correct task branch, creates a task branch from a clean default branch, and isolates a dirty default checkout in a standard sibling worktree. Use `defaultBranch` only with explicit direct-work authority.
@@ -35,7 +35,7 @@ Build the input as follows:
 
 The example below leaves out `forge` and `prTiming`. Add them only when the rules above call for them, so the user's defaults file applies otherwise.
 
-When one repository is clearly named, derive the scope without asking the user to restate it. A safe derived scope permits only work needed for the task in that repository, including local verification and normal branch and pull-request publication. It excludes unrelated repositories, merge, release, deployment, credentials, and policy changes unless those actions are explicitly authorized.
+When one repository is clearly named, derive the scope without asking the user to restate it. A safe derived scope permits only work needed for the task in that repository, including local verification and normal branch and pull-request or merge-request publication. It excludes unrelated repositories, merge, release, deployment, credentials, and policy changes unless those actions are explicitly authorized.
 
 Replace the example values below with facts from the conversation, then make one start call:
 
@@ -95,7 +95,7 @@ Do not manually duplicate stages already owned by the workflow. Autoimplement ob
 
 When this skill is loaded inside an active workflow step, do not start another workflow. Complete the current step contract with the available tools.
 
-Outside Pi, or when the workflow is unavailable, do the following in the order that makes sense. Choose the most efficient order for dependencies, and parallelize independent work.
+Outside Pi, or when the workflow is unavailable, do the following in the order that makes sense. Choose the most efficient order for dependencies, and parallelize independent work. On GitLab, use `glab` and merge requests (MRs) wherever these steps say `gh`, pull request, or PR.
 
 0. Find the clear existing plan in the user's input, conversation, or referenced canonical documents. Do not devise an initial plan. If no clear plan exists, stop as blocked. If the plan exists but its canonical documentation is missing or stale, use `autodoc` to record it before implementation.
 
@@ -115,6 +115,7 @@ Outside Pi, or when the workflow is unavailable, do the following in the order t
    - Do not put mutation testing on the critical path unless repository policy explicitly requires it; keep the mutation test scripts available.
 
 3. Push your latest commits before running review so the review is always against the current PR head.
+   - On GitLab, look up an open MR for the source and target branch with `glab api` before you create one with `glab mr create`, and never open a second MR for the same branch pair.
    - Run pi-reviewer with its configured defaults against the base branch: `pi-reviewer --base <branch_name>`. The model and thinking level come from the reviewer's own config, not from this skill.
    - Run reviewer commands for independent repositories in one bounded batch. Keep each result tied to its repository, base branch, pushed head, and relevant dependency fingerprint.
    - In later rounds, rerun only repositories whose pushed head or relevant dependency fingerprint changed.
@@ -131,10 +132,12 @@ Outside Pi, or when the workflow is unavailable, do the following in the order t
    - Separately check existing inline review comments and PR issue comments, and address valid comments.
    - Ignore irrelevant comments and stale comments from before the latest commit unless they still apply.
    - Reply to and resolve each comment either way.
+   - On GitLab, list MR discussions with `glab api --paginate projects/<project>/merge_requests/<iid>/discussions`, reply through each discussion's `notes` endpoint, and resolve it with `glab api --method PUT` and `-F resolved=true`. Ignore system notes.
    - Do not wait a fixed five minutes; wait only when a required review is known to be pending, and keep that wait bounded.
 
 5. In the final step, make sure that CI/CD is green.
    - Inspect every pull request once before deciding to wait. If waiting is useful, state the exact `gh` tracking command for each pending pull request.
+   - On GitLab, read the MR's `head_pipeline` with `glab api`, and watch a pending pipeline with `glab ci status --live --branch <source branch> --repo <project URL>`.
    - Run supported pending CI watches in one bounded batch. Keep every result tied to its pull request and current head.
    - Bound each CI watch to five minutes. If CI is still pending, use the next model turn for additional useful local tests or smoke tests instead of waiting. Then inspect CI again.
    - Do not invent an ETA when the CI provider does not supply one.
@@ -145,6 +148,7 @@ Outside Pi, or when the workflow is unavailable, do the following in the order t
 
 6. Once CI/CD is green, or the relevant local checks have passed for a documentation-only change, decide whether merge is authorized.
    - Merge only when the user explicitly requested it or an applicable standing instruction authorizes it. Otherwise leave the PR ready.
+   - On GitLab, merge with `glab mr merge <iid> --sha <head> --auto-merge=false --yes`, then confirm on a fresh read that the MR state is `merged`. Setting auto-merge is not a merge.
    - Then finish and give a summary with the PR link.
    - Include the exact validation commands you ran and their outcomes.
    - Also comment a final report on the PR.

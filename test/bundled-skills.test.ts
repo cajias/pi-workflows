@@ -44,6 +44,13 @@ describe("bundled workflow skills", () => {
     expect(skill("autoimplement")).toContain("GitLab CLI");
   });
 
+  it("guides autoimplement outside Pi through glab merge requests on GitLab", () => {
+    const markdown = skill("autoimplement");
+    expect(markdown).toContain("On GitLab, use `glab` and merge requests (MRs)");
+    expect(markdown).toContain("never open a second MR for the same branch pair");
+    expect(markdown).toContain("`glab mr merge <iid> --sha <head> --auto-merge=false --yes`");
+  });
+
   it("keeps initial planning out of autoimplement and autodoc", () => {
     expect(skill("autoimplement")).toContain("Do not devise an initial plan");
     expect(skill("autodoc")).toContain("It does not choose, devise, improve, or revise");
