@@ -40,6 +40,10 @@ describe("bundled workflow skills", () => {
     expect(skill("monitor")).toContain("built-in Pi `monitor` workflow");
   });
 
+  it("forbids the GitLab CLI in autoimplement verification checks", () => {
+    expect(skill("autoimplement")).toContain("GitLab CLI");
+  });
+
   it("keeps initial planning out of autoimplement and autodoc", () => {
     expect(skill("autoimplement")).toContain("Do not devise an initial plan");
     expect(skill("autodoc")).toContain("It does not choose, devise, improve, or revise");

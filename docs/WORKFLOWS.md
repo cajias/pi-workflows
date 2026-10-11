@@ -747,7 +747,7 @@ Autoimplement prepares the workspace before its first edit-capable node. `worksp
 
 Autoimplement gives `implement` and the shared verifier's `semanticRepair` the same named eight-hour deadline. The engine default stays unchanged. Each branch performs one bounded unit of work and returns to observation after expected success, failure, or timeout. The controller can choose plan discovery, workspace preparation, documentation, implementation, repair, verification, publication, review, P2 work, comment handling, CI, delivery, redesign, completion, or blocked. Cancellation remains immediate and terminal. Unexpected parser, graph, and invariant errors still fail the run.
 
-Local verification uses one shared change-verification planner. A caller can supply exact `verificationChecks` and explicit `verificationUntested` work when the prepared workspace is already known. Otherwise the planner uses a 30-minute active-time limit. Its prompt and validator use the same command-safety lists, including the rule that all Git commands are forbidden. One rejection returns all independent check errors in stable order, and no command starts before acceptance. Failed or timed-out planning returns a normal blocked child result to the Autoimplement controller. Candidate-only and remote-only checks remain explicit without invented evidence.
+Local verification uses one shared change-verification planner. A caller can supply exact `verificationChecks` and explicit `verificationUntested` work when the prepared workspace is already known. Otherwise the planner uses a 30-minute active-time limit. Its prompt and validator use the same command-safety lists, including the rules that all Git, GitHub CLI (`gh`), and GitLab CLI (`glab`) commands are forbidden, even read-only ones. The `glab` rule applies on every forge. One rejection returns all independent check errors in stable order, and no command starts before acceptance. Failed or timed-out planning returns a normal blocked child result to the Autoimplement controller. Candidate-only and remote-only checks remain explicit without invented evidence.
 
 Direct program actions run candidate checks and read-only base-eligible checks with the same command, arguments, timeout, and output limit. Results separate related, unrelated, fixed-baseline, unknown, and untested findings. Matching base failures do not block the candidate. Related failures enter a two-attempt mechanical or semantic repair loop. Unknown or incomplete evidence needs bounded judgment, and truncated, timed-out, cancelled, or spawn-failed output cannot pass.
 
@@ -762,6 +762,43 @@ Autoimplement inspects every pull request before it waits for CI. It accepts onl
 The action abort signal stops active command process groups and prevents queued commands from starting. Accepted outputs use immutable events and content-addressed blobs. An interrupted unaccepted batch runs again because batch commands are read-only or isolated local checks. Progress updates contain metadata only and never control routing. Truncated reviewer or CI output cannot count as clean. See [Run independent commands in bounded batches](plans/2026-08-20-bounded-command-batches-plan.md) for the complete contract and implementation plan.
 
 A branch blocker does not end Autoimplement by itself. The controller can repair, retry, redesign, move to another safe branch, or return blocked. A blocked decision requires current evidence and at least one checked alternative. The loop permits at most 40 accepted decisions and removes a route after three consecutive returns with the same stable facts. Changed evidence resets that route count. If the controller itself fails or times out three times without an accepted decision, Autoimplement returns a normal blocked result. These limits prevent blind retries while allowing real progress.
+
+#### Autoimplement forge selection
+
+The `forge` input chooses the code forge: `auto`, `github`, or `gitlab`. An explicit `github` or `gitlab` does no detection. With `auto`, the read-only `resolveForge` step runs between `prepare` and the first observation. It reads the remote of `origin`, or of the first remote when `origin` is missing, in the prepared worktree, the prepared repository, or the requested repository, in that order. It then decides as follows:
+
+1. A remote without a network host, such as a local path or a `file://` URL, or no remote at all, selects GitHub.
+2. `github.com` selects GitHub, and `gitlab.com` selects GitLab.
+3. A host in both the `gh` hosts file and the `glab` configuration selects GitHub and records the ambiguity. Set `forge` explicitly in that case.
+4. A host that matches a `glab` hosts key, its `api_host`, or its `ssh_host`, or the `GITLAB_HOST` hostname, selects GitLab. This covers a self-managed GitLab whose SSH remote uses a separate SSH hostname.
+5. A host in the `gh` hosts file selects GitHub.
+6. Any other host selects GitHub, which is the upstream behavior.
+
+Hostnames compare without case, and ports are ignored. The `gh` hosts file is `$GH_CONFIG_DIR/hosts.yml`, else `$XDG_CONFIG_HOME/gh/hosts.yml`, else `~/.config/gh/hosts.yml`. The `glab` configuration is the first file that exists among `$GLAB_CONFIG_DIR/config.yml`, `~/.config/glab-cli/config.yml`, and `$XDG_CONFIG_HOME/glab-cli/config.yml`. Only host keys, `api_host`, and `ssh_host` are read; tokens are never kept. SSH aliases in `~/.ssh/config`, `GL_HOST`, `GITLAB_URI`, and per-repository `glab` configuration are not read. If detection cannot read a file or run Git, it selects GitHub and records the error.
+
+The step records a `pi-workflows.autoimplement-forge-resolution.v1` value with `requested`, the resolved `forge`, the matched `host`, the `remoteUrl` without any URL credentials, and a `reason`. The step is an idempotent action, so a runner crash before it commits reruns the detection. A resume replays the recorded result, and a restart detects again. The step is not a control attempt, and the decide ledger leaves it out.
+
+On a GitLab run, a pending CI target accepts only `glab ci status` with one watch flag (`--live`, `-l`, or `--wait`) and optional `--branch` and `--repo` values. The branch must be the published source branch, and the repository must be the merge request's project. The target `pr` must be a merge request URL of the form `https://<host>/<project path>/-/merge_requests/<iid>`. The workflow runs the watch as `glab ci status --live --branch <branch> --repo https://<host>/<project path>`, with the same five-minute limit. A GitHub run rejects `glab` watches, and a GitLab run rejects `gh` watches. Prompt wording and merge request validation for GitLab are not part of this change yet, so a GitLab run still uses the GitHub prompts.
+
+The `prTiming` input accepts `early` or `end`. It is validated and stored in the input and in the run settings, but it does not change routing yet: every run publishes before review, as `early` does.
+
+The run settings include the requested `forge` and `prTiming`. Neither model steps nor people can change `forge` during a run. Only a `human` settings actor can change `prTiming`, and only from `end` to `early`. A change from `early` to `end` is rejected for every actor. Settings changes made from a Pi session are recorded as `session` changes today, so this rule cannot yet be used through the server.
+
+#### Autoimplement defaults file
+
+Persistent defaults live in `${PI_WORKFLOWS_CONFIG_DIR:-~/.config/pi-workflows}/autoimplement.json`:
+
+```json
+{
+  "schema": "pi-workflows.autoimplement-defaults.v1",
+  "forge": "gitlab",
+  "prTiming": "early"
+}
+```
+
+`schema` is required. `forge` and `prTiming` are optional, and no other key is allowed. A workflow input value wins over the file, and the file wins over the built-in defaults `auto` and `early`. A missing file means the built-in defaults apply. An unreadable file, invalid JSON, an unknown key, a wrong schema, or an invalid value fails the start with an error that names the file.
+
+Input parsing reads the file only when the input omits `forge` or `prTiming`, then stores both values in the normalized input. Parsing a normalized input again therefore never reads the file. A resume uses the stored input and does not read the file. A restart parses the original raw input again, so a changed file takes effect when that input omitted a field. An included Autoimplement, such as a Monitor repair, parses its input in the runner and inherits the same defaults. The file is read in the workflow server runner's environment, not in the Pi session's environment.
 
 ### Built-in sanity check
 

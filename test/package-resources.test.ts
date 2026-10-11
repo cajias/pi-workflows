@@ -177,6 +177,17 @@ describe("Pi package resources", () => {
     expect(autoimplement).toContain("The workflow planner is the safe default.");
     expect(autoimplement).toContain('"mode": "required"');
     expect(autoimplement).toContain('"mode": "skip"');
+    expect(autoimplement).toContain("- `forge`: Omit it unless the user names a forge.");
+    expect(autoimplement).toContain(
+      "- `prTiming`: Omit it unless the user asks to publish only after review passes. Then use `end`.",
+    );
+    expect(autoimplement).toContain("All Git, GitHub CLI, GitLab CLI, shell-wrapper");
+    const autoimplementExample = JSON.parse(
+      /```json\n([\s\S]*?)\n```/u.exec(autoimplement)?.[1] ?? "{}",
+    ) as { input?: Record<string, unknown> };
+    expect(autoimplementExample.input).toBeTypeOf("object");
+    expect(autoimplementExample.input).not.toHaveProperty("forge");
+    expect(autoimplementExample.input).not.toHaveProperty("prTiming");
 
     const monitor = await fs.readFile(path.join(skillsRoot, "monitor", "SKILL.md"), "utf8");
     expect(monitor).toContain('"mode": "required"');
