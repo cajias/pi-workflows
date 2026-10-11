@@ -246,10 +246,9 @@ export function verificationPlan(repository: string, id = "verify") {
   };
 }
 
-/** Answers every node from implementation through publication with a passing result. */
-export function commonExecutor(
+/** Answers every node from implementation through local verification with a passing result. */
+export function implementationExecutor(
   repository: string,
-  publication: unknown = published(repository),
   decide: (request: AgentStepRequest) => AgentStepSubmission = chooseFirstControlRoute,
 ): ScriptedExecutor {
   return summaryExecutor()
@@ -277,8 +276,26 @@ export function commonExecutor(
     })
     .respond("classifyVerification", {
       output: { route: "publish", summary: "checks passed", evidence: "npm test" },
-    })
-    .respond("publish", { output: publication });
+    });
+}
+
+/** Answers every node from implementation through publication with a passing result. */
+export function commonExecutor(
+  repository: string,
+  publication: unknown = published(repository),
+  decide: (request: AgentStepRequest) => AgentStepSubmission = chooseFirstControlRoute,
+): ScriptedExecutor {
+  return implementationExecutor(repository, decide).respond("publish", { output: publication });
+}
+
+/** Submits an output through the step validator, as a model's workflow submit call would. */
+export async function acceptedOutput(
+  request: AgentStepRequest,
+  output: unknown,
+): Promise<AgentStepSubmission> {
+  const result = await request.accept(output);
+  if (!result.ok) throw new Error(`Scripted output rejected: ${result.error}`);
+  return { output: result.value };
 }
 
 export function completedDelivery(pr = "https://example.test/pr/1", merged = false) {

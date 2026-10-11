@@ -174,6 +174,16 @@ async function changedPaths(repository: string): Promise<string[]> {
   return [...new Set(files)].sort();
 }
 
+/** The checked-out branch, HEAD revision, and changed paths of a work tree. */
+export type LocalHead = { branch: string; headRevision: string; changedPaths: string[] };
+
+/** Reads the local head of a work tree without changing it. Fails on a detached HEAD. */
+export async function inspectLocalHead(repository: string): Promise<LocalHead> {
+  const headRevision = await git(repository, ["rev-parse", "HEAD"]);
+  const branch = await git(repository, ["symbolic-ref", "--short", "HEAD"]);
+  return { branch, headRevision, changedPaths: await changedPaths(repository) };
+}
+
 function workspaceScope(input: WorkspacePreparationInput): string {
   return input.scope ?? `Only ${input.repository}`;
 }

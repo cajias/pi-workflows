@@ -28,7 +28,7 @@ import {
   type EvidenceLedgerEntry,
   type EvidenceViews,
 } from "../workflows/prompt-evidence.js";
-import { allowSettingsPath, workflowSettings } from "../workflows/settings.js";
+import { allowSettingsPath, settingsRoute, workflowSettings } from "../workflows/settings.js";
 import type {
   WorkflowActionContext,
   WorkflowNodeContext,
@@ -40,16 +40,24 @@ import {
   GITHUB_CI_BINDING,
   parseAutoimplementConcurrency,
   parseCiInspectionBatch,
+  parseLocalCommitRepositories,
   parsePublishedRepositories,
   reviewerCommand,
   type AutoimplementConcurrency,
+  type CandidateRepository,
   type CiForgeBinding,
   type CiInspectionBatch,
+  type LocalCommitRepositories,
   type PublishedRepositories,
-  type PublishedRepository,
 } from "./autoimplement-command-batches.js";
 import { loadAutoimplementDefaults, parsePrTiming, type PrTiming } from "./autoimplement-config.js";
-import { forgeText, gitlabApiCoordinates, type ForgeText } from "./autoimplement-forge-text.js";
+import {
+  endTimingText,
+  forgeText,
+  gitlabApiCoordinates,
+  type EndTimingText,
+  type ForgeText,
+} from "./autoimplement-forge-text.js";
 import {
   parseForgeRequest,
   parseForgeResolution,
@@ -59,6 +67,14 @@ import {
   type ForgeRequest,
   type ForgeResolution,
 } from "./autoimplement-forge.js";
+import {
+  gateHead,
+  gateHeadPushed,
+  recordedHeads,
+  reviewCandidate,
+  reviewGatePassed,
+  reviewedHeadAwaitsPush,
+} from "./autoimplement-review-gate.js";
 import changeVerificationWorkflow, {
   CHANGE_VERIFICATION_SCHEMA,
   changeVerificationEvidence,
@@ -69,6 +85,7 @@ import changeVerificationWorkflow, {
 import { parsePlanApprovalPolicy, type PlanApprovalPolicy } from "./plan-approval.workflow.js";
 import planChangeWorkflow, { type NormalizedPlanChangeInput } from "./plan-change.workflow.js";
 import workspacePreparationWorkflow, {
+  inspectLocalHead,
   parsePreparedWorkspace,
   type PreparedWorkspace,
   type WorkspaceMode,
@@ -433,6 +450,33 @@ function autoimplementSettings(context: WorkflowNodeContext): AutoimplementSetti
   return parseAutoimplementSettings(context.settings);
 }
 
+/** The workspace prepared so far, or undefined before preparation is ready. */
+function knownPreparedWorkspace(context: WorkflowNodeContext): PreparedWorkspace | undefined {
+  const request = context.input as AutoimplementInput;
+  if (request.preparedWorkspace !== undefined) return request.preparedWorkspace;
+  if (context.outputs.workspace === undefined) return undefined;
+  const result = includedResult(workspacePreparationWorkflow, context.outputs.workspace);
+  return result.exit === "ready" ? result.output : undefined;
+}
+
+/**
+ * The effective publication timing: the `prTiming` setting, except that direct default-branch work
+ * has no pull or merge request and always follows `early`.
+ */
+function publicationTiming(context: WorkflowNodeContext): PrTiming {
+  return knownPreparedWorkspace(context)?.mode === "defaultBranch"
+    ? "early"
+    : autoimplementSettings(context).prTiming;
+}
+
+/** The line that only `prTiming: end` adds to a prompt, or nothing under `early`. */
+function endTimingLines(
+  context: WorkflowNodeContext,
+  line: keyof Pick<EndTimingText, "noPush" | "decide">,
+): string[] {
+  return publicationTiming(context) === "end" ? [endTimingText(forgeFor(context))[line]] : [];
+}
+
 function parseExistingPlan(value: unknown): ExistingPlanDiscovery {
   const result = requireRecord(value, "existing plan discovery");
   if (result.route !== "found" && result.route !== "blocked") {
@@ -480,7 +524,7 @@ function parseRoute<T extends string>(
 
 type ReviewCommandSelection = {
   route: "run" | "reuse";
-  repositories: PublishedRepository[];
+  repositories: CandidateRepository[];
   commands: CommandBatchItem[];
 };
 
@@ -712,6 +756,7 @@ function decidePrompt(context: WorkflowNodeContext): string {
     `Constraints: ${JSON.stringify(request.constraints ?? [])}`,
     `Merge allowed now: ${autoimplementSettings(context).merge === true}`,
     ...promptText(context).decide,
+    ...endTimingLines(context, "decide"),
   ];
   const observation = projectEvidence(context.outputs.observe, AUTOIMPLEMENT_EVIDENCE_VIEWS);
   const ledger = projectLedger(controlEvidenceLedger(context), AUTOIMPLEMENT_EVIDENCE_VIEWS);
@@ -766,12 +811,14 @@ const CONTROL_ATTEMPT_NODES = new Set([
   "fix",
   "publicationResult",
   "publish",
+  "commitLocal",
   "reviewResult",
   "runReview",
   "repairReviewCommand",
   "p2Result",
   "addressP2",
   "verifyP2",
+  "verifyP2Local",
   "commentsResult",
   "inspectComments",
   "ciResult",
@@ -903,6 +950,77 @@ function initialControlRoutes(context: WorkflowNodeContext): AutoimplementContro
     : ["documentation", "redesign", "blocked"];
 }
 
+/**
+ * The latest route `routeVerifiedWorkspace` chose, or undefined before the first publication.
+ * Only `publishReviewed` changes publication, so other values are left as plain strings.
+ */
+function publicationRoute(context: WorkflowNodeContext): string | undefined {
+  const step = context.state.steps.findLast(
+    (candidate) => candidate.nodeId === "routeVerifiedWorkspace",
+  );
+  const route = (step?.output as { route?: unknown } | undefined)?.route;
+  return typeof route === "string" ? route : undefined;
+}
+
+const AWAITING_REVIEWED_PUSH_ROUTES: AutoimplementControlRoute[] = [
+  "publication",
+  "review",
+  "blocked",
+];
+
+/**
+ * Routes that depend on the review gate. Under `early`, the newest head record is always pushed,
+ * so none of these rules applies and every list stays upstream. Under `end`, a reviewed local head
+ * offers its single push instead of comments, and that push then offers comments.
+ */
+function reviewGateRoutes(
+  context: WorkflowNodeContext,
+  nodeId: string,
+  wrapper: Record<string, unknown>,
+  result: Record<string, unknown>,
+): AutoimplementControlRoute[] | undefined {
+  const steps = context.state.steps;
+  if (nodeId === "commitLocal") return ["publication", "repair", "redesign", "blocked"];
+  if (nodeId === "verifyP2Local") return ["addressP2", "repair", "redesign", "blocked"];
+  if (nodeId === "publicationResult") return reviewedPublicationRoutes(context, wrapper);
+  if (nodeId === "reviewResult") return unpushedReviewRoutes(steps, wrapper, result);
+  if (nodeId === "p2Result" && result.passed === true && reviewedHeadAwaitsPush(steps)) {
+    return AWAITING_REVIEWED_PUSH_ROUTES;
+  }
+  return undefined;
+}
+
+/** After the single push of a reviewed head, comment handling comes next. */
+function reviewedPublicationRoutes(
+  context: WorkflowNodeContext,
+  wrapper: Record<string, unknown>,
+): AutoimplementControlRoute[] | undefined {
+  const steps = context.state.steps;
+  return publicationRoute(context) === "publishReviewed" &&
+    wrapper.sourceNode === "publish" &&
+    reviewGatePassed(steps) &&
+    gateHeadPushed(steps)
+    ? ["comments", "review", "blocked"]
+    : undefined;
+}
+
+/** A clean or reused review of a head that is not pushed offers publication, not comments. */
+function unpushedReviewRoutes(
+  steps: readonly WorkflowStepRecord[],
+  wrapper: Record<string, unknown>,
+  result: Record<string, unknown>,
+): AutoimplementControlRoute[] | undefined {
+  if (wrapper.sourceNode === "selectReviewCommands" && result.route === "reuse") {
+    if (gateHeadPushed(steps)) return undefined;
+    return reviewGatePassed(steps)
+      ? AWAITING_REVIEWED_PUSH_ROUTES
+      : ["repair", "redesign", "blocked"];
+  }
+  return result.route === "clean" && reviewedHeadAwaitsPush(steps)
+    ? AWAITING_REVIEWED_PUSH_ROUTES
+    : undefined;
+}
+
 function resultRoutes(
   context: WorkflowNodeContext,
   nodeId: string,
@@ -967,6 +1085,8 @@ function resultRoutes(
   if (nodeId === "localVerification/blocked") {
     return ["verification", "repair", "redesign", "blocked"];
   }
+  const gated = reviewGateRoutes(context, nodeId, wrapper, result);
+  if (gated !== undefined) return gated;
   if (nodeId === "publicationResult") {
     return result.status === "completed"
       ? ["complete"]
@@ -1255,8 +1375,7 @@ function parsePublishedForContext(
   context: WorkflowNodeContext,
 ): PublishedRepositories {
   const result = parsePublishedRepositories(value);
-  const workspace = preparedWorkspace(context);
-  const expected = path.resolve(workspace.worktreePath ?? workspace.repository);
+  const expected = preparedWorkPath(preparedWorkspace(context));
   if (result.repositories[0]?.repository !== expected) {
     throw new Error(`publication repository must match the prepared workspace: ${expected}`);
   }
@@ -1268,9 +1387,144 @@ function parsePublishedForContext(
       parseGitLabMergeRequestUrl(repository.pr, `publication repositories[${index}].pr`),
     );
   }
+  const reviewed = reviewedPublicationHead(context);
+  if (reviewed !== undefined) {
+    for (const repository of result.repositories) assertPushesReviewedHead(repository, reviewed);
+  }
   return result;
 }
 
+/** The absolute path that every publication and local commit of this run must name. */
+function preparedWorkPath(workspace: PreparedWorkspace): string {
+  return path.resolve(workspace.worktreePath ?? workspace.repository);
+}
+
+/**
+ * The gate head that a `publishReviewed` publication must push, or undefined for every other
+ * publication route. `routeVerifiedWorkspace` chose that route because this head passed review.
+ */
+function reviewedPublicationHead(context: WorkflowNodeContext): CandidateRepository[] | undefined {
+  if (publicationRoute(context) !== "publishReviewed") return undefined;
+  const head = gateHead(context.state.steps);
+  if (head === undefined) throw new Error("reviewed publication has no reviewed local head");
+  return head;
+}
+
+function assertPushesReviewedHead(
+  published: CandidateRepository,
+  reviewed: readonly CandidateRepository[],
+): void {
+  const head = reviewed.find((candidate) => candidate.id === published.id);
+  if (
+    head?.branch !== published.branch ||
+    head.baseBranch !== published.baseBranch ||
+    head.headRevision !== published.headRevision ||
+    head.dependencyFingerprint !== published.dependencyFingerprint
+  ) {
+    throw new Error(
+      `publication must push exactly the reviewed head: ${JSON.stringify({ reviewed: head ?? null, published })}`,
+    );
+  }
+}
+
+/**
+ * Checks a reported local commit against the work tree: the head is the checked-out HEAD of the
+ * reported branch, and only paths that were already changed before the run stay uncommitted.
+ */
+async function assertLocalHead(
+  repository: CandidateRepository,
+  workspace: PreparedWorkspace,
+  label: string,
+): Promise<void> {
+  const local = await inspectLocalHead(repository.repository);
+  if (local.headRevision !== repository.headRevision) {
+    throw new Error(`${label}.headRevision must be the checked-out HEAD ${local.headRevision}`);
+  }
+  if (local.branch !== repository.branch) {
+    throw new Error(`${label}.branch must be the checked-out branch ${local.branch}`);
+  }
+  const preExisting = new Set(workspace.preExistingChangedPaths);
+  const uncommitted = local.changedPaths.filter((file) => !preExisting.has(file));
+  if (uncommitted.length > 0) {
+    throw new Error(`${label} leaves task changes uncommitted: ${uncommitted.join(", ")}`);
+  }
+}
+
+async function parseLocalCommitForContext(
+  value: unknown,
+  context: WorkflowNodeContext,
+): Promise<LocalCommitRepositories> {
+  const result = parseLocalCommitRepositories(value);
+  const workspace = preparedWorkspace(context);
+  const expected = preparedWorkPath(workspace);
+  for (const [index, repository] of result.repositories.entries()) {
+    const label = `local commit repositories[${index}]`;
+    if (repository.repository !== expected) {
+      throw new Error(`${label}.repository must be the prepared workspace: ${expected}`);
+    }
+    if (repository.branch !== workspace.workBranch) {
+      throw new Error(`${label}.branch must be the prepared task branch: ${workspace.workBranch}`);
+    }
+    if (repository.baseBranch !== workspace.baseBranch) {
+      throw new Error(
+        `${label}.baseBranch must be the prepared base branch: ${workspace.baseBranch}`,
+      );
+    }
+    await assertLocalHead(repository, workspace, label);
+  }
+  return result;
+}
+
+/** The heads of the newest `commitLocal` or `publish` record: what the last review ran against. */
+function reviewedCandidateHeads(context: WorkflowNodeContext): CandidateRepository[] {
+  const candidate = reviewCandidate(context.state.steps);
+  if (candidate === undefined) throw new Error("No reviewed commitLocal or publish record found");
+  return recordedHeads(candidate);
+}
+
+async function parseLocalP2Verification(
+  value: unknown,
+  context: WorkflowNodeContext,
+): Promise<Record<string, unknown>> {
+  const result = requireRecord(value, "local P2 verification");
+  if (typeof result.passed !== "boolean") {
+    throw new Error("local P2 verification passed must be a boolean");
+  }
+  if (result.pushed !== false) {
+    throw new Error("local P2 verification pushed must be false");
+  }
+  const committed = parseLocalCommitRepositories(result);
+  const expected = new Map(
+    reviewedCandidateHeads(context).map((repository) => [repository.id, repository] as const),
+  );
+  const workspace = preparedWorkspace(context);
+  for (const [index, repository] of committed.repositories.entries()) {
+    const prior = expected.get(repository.id);
+    if (
+      prior?.repository !== repository.repository ||
+      prior.branch !== repository.branch ||
+      prior.baseBranch !== repository.baseBranch ||
+      prior.dependencyFingerprint !== repository.dependencyFingerprint
+    ) {
+      throw new Error(
+        `local P2 verification repository does not match the reviewed local commit: ${repository.id}`,
+      );
+    }
+    expected.delete(repository.id);
+    await assertLocalHead(repository, workspace, `local P2 verification repositories[${index}]`);
+  }
+  if (expected.size > 0) {
+    throw new Error(
+      `local P2 verification is missing repository ids: ${[...expected.keys()].join(", ")}`,
+    );
+  }
+  return { ...result, repositories: committed.repositories };
+}
+
+/**
+ * The latest pushed record. `verifyP2Local` is deliberately not listed: it commits locally, and its
+ * head is pushed only by the reviewed `publish` that follows it.
+ */
 function currentPublishedRepositories(context: WorkflowNodeContext): PublishedRepositories {
   return latestOutput<PublishedRepositories>(context, ["verifyP2", "publish"]);
 }
@@ -1546,9 +1800,10 @@ function parseTrackedCiAssessment(
 }
 
 function selectReviewCommands(context: WorkflowNodeContext): ReviewCommandSelection {
-  const published = latestOutput<PublishedRepositories>(context, ["publish"]);
+  // Under `early` only `publish` records exist, so this reads the same record as upstream.
+  const candidates = latestOutput<LocalCommitRepositories>(context, ["publish", "commitLocal"]);
   const reviewed = reviewRounds(context).flatMap((round) => round.repositories ?? []);
-  const repositories = published.repositories.filter(
+  const repositories = candidates.repositories.filter(
     (repository) =>
       !reviewed.some(
         (entry) =>
@@ -1938,6 +2193,7 @@ export const autoimplementWorkflow = defineWorkflow({
           "If implementation exposes a new design or scope problem, report it precisely instead of forcing the old plan.",
           "Report every changed repository as an absolute path so independent verification can be bounded safely.",
           "Do not merge yet.",
+          ...endTimingLines(context, "noPush"),
         ].join("\n");
       },
       expectedOutput: `{ "status": "implemented" | "issue" | "blocked", "summary": "work completed or issue", "files": ["changed file"], "repositories": ["absolute repository path changed"], "issueKind": "design" | "implementation" | null, "evidence": "new evidence" }`,
@@ -1962,14 +2218,18 @@ export const autoimplementWorkflow = defineWorkflow({
           "implementation assessment",
         ),
     }),
-    routeVerifiedWorkspace: compute({
-      run: (context) => ({
-        route:
-          preparedWorkspace(context).mode === "defaultBranch" ? "defaultBranch" : "pullRequest",
-      }),
+    // Reads the timing setting, so a settings change before route settlement reruns the choice.
+    routeVerifiedWorkspace: settingsRoute({
+      run: (context) => {
+        if (preparedWorkspace(context).mode === "defaultBranch") return { route: "defaultBranch" };
+        if (reviewedHeadAwaitsPush(context.state.steps)) return { route: "publishReviewed" };
+        if (publicationTiming(context) === "end") return { route: "commitLocal" };
+        return { route: "pullRequest" };
+      },
     }),
     publicationResult: compute({
-      run: (context) => branchResultFrom(context, ["finalizeDefaultBranch", "publish"]),
+      run: (context) =>
+        branchResultFrom(context, ["finalizeDefaultBranch", "publish", "commitLocal"]),
     }),
     finalizeDefaultBranch: agent({
       timeoutMs: 30 * 60_000,
@@ -2008,6 +2268,7 @@ export const autoimplementWorkflow = defineWorkflow({
           `Current plan: ${JSON.stringify(currentPlan(context))}`,
           `Prepared workspace: ${JSON.stringify(preparedWorkspace(context))}`,
           "Stop after the fix so verification can run again.",
+          ...endTimingLines(context, "noPush"),
         ].join("\n"),
       expectedOutput: `{ "fixed": "what changed", "files": ["changed file"] }`,
       validate: (value) => requireRecord(value, "fix result"),
@@ -2020,8 +2281,12 @@ export const autoimplementWorkflow = defineWorkflow({
       statusDetail: "committing and pushing",
       prompt: (context) => {
         const request = context.input as AutoimplementInput;
+        const publish = promptText(context).publish;
+        const reviewed = reviewedPublicationHead(context);
         return [
-          ...promptText(context).publish.early,
+          ...(reviewed === undefined
+            ? publish.early
+            : publish.reviewed(reviewed.map((repository) => repository.headRevision).join(", "))),
           `Requested base branch: ${request.baseBranch ?? "discover each repository default branch"}.`,
           ...gitlabResolutionLines(context),
           `Prepared workspace: ${JSON.stringify(preparedWorkspace(context))}`,
@@ -2030,6 +2295,18 @@ export const autoimplementWorkflow = defineWorkflow({
       },
       expectedOutput: `{ "repositories": [{ "repository": "/absolute/repository", "branch": "branch", "baseBranch": "base", "headRevision": "revision", "pr": "URL", "pushed": true, "dependencyFingerprint": "optional digest" }] }`,
       validate: parsePublishedForContext,
+    }),
+    // Under `prTiming: end`, publication first commits the verified work here and never pushes.
+    commitLocal: agent({
+      timeoutMs: 30 * 60_000,
+      statusDetail: "committing locally",
+      prompt: (context) =>
+        [
+          ...endTimingText(forgeFor(context)).commitLocal,
+          `Prepared workspace: ${JSON.stringify(preparedWorkspace(context))}`,
+        ].join("\n"),
+      expectedOutput: `{ "repositories": [{ "repository": "/absolute/repository", "branch": "task branch", "baseBranch": "base", "headRevision": "local commit", "committed": true, "dependencyFingerprint": "optional digest" }] }`,
+      validate: parseLocalCommitForContext,
     }),
     selectReviewCommands: compute({
       run: selectReviewCommands,
@@ -2094,15 +2371,22 @@ export const autoimplementWorkflow = defineWorkflow({
     addressP2: agent({
       timeoutMs: 30 * 60_000,
       statusDetail: "addressing P2 findings",
-      prompt: ({ outputs }) =>
+      prompt: (context) =>
         [
           "Address valid P2 findings from the last review when the improvement is proportionate and in scope.",
           "Inspect the current diff and commits first. Do not repeat a P2 change that is already present.",
           "Do not rerun pi-reviewer solely because P2 work changes files. Verification will run once, then the workflow continues.",
-          `Review: ${JSON.stringify(outputs.assessReview)}`,
+          `Review: ${JSON.stringify(context.outputs.assessReview)}`,
+          ...endTimingLines(context, "noPush"),
         ].join("\n"),
       expectedOutput: `{ "addressed": ["P2 change"], "skipped": [{ "finding": "finding", "reason": "why" }] }`,
       validate: (value) => requireRecord(value, "P2 result"),
+    }),
+    // P2 work on a pushed candidate is verified and pushed; on a local commit it stays local.
+    routeAddressedP2: compute({
+      run: (context) => ({
+        route: reviewCandidate(context.state.steps)?.nodeId === "commitLocal" ? "local" : "push",
+      }),
     }),
     verifyP2: agent({
       timeoutMs: 30 * 60_000,
@@ -2112,8 +2396,20 @@ export const autoimplementWorkflow = defineWorkflow({
       expectedOutput: `{ "passed": true | false, "commands": [{ "command": "command", "outcome": "result" }], "pushed": true, "repositories": [{ "repository": "/absolute/repository", "branch": "branch", "baseBranch": "base", "headRevision": "current pushed revision", "pr": "URL", "pushed": true, "dependencyFingerprint": "optional fingerprint" }] }`,
       validate: parseP2Verification,
     }),
+    verifyP2Local: agent({
+      timeoutMs: 30 * 60_000,
+      statusDetail: "verifying P2 changes locally",
+      prompt: (context) =>
+        [
+          ...endTimingText(forgeFor(context)).verifyP2Local,
+          `Reviewed local commits: ${JSON.stringify(reviewedCandidateHeads(context))}`,
+          `Prepared workspace: ${JSON.stringify(preparedWorkspace(context))}`,
+        ].join("\n"),
+      expectedOutput: `{ "passed": true | false, "commands": [{ "command": "command", "outcome": "result" }], "pushed": false, "repositories": [{ "repository": "/absolute/repository", "branch": "task branch", "baseBranch": "base", "headRevision": "local commit", "committed": true, "dependencyFingerprint": "optional fingerprint" }] }`,
+      validate: parseLocalP2Verification,
+    }),
     p2Result: compute({
-      run: (context) => branchResultFrom(context, ["verifyP2"]),
+      run: (context) => branchResultFrom(context, ["verifyP2", "verifyP2Local"]),
     }),
     inspectComments: agent({
       timeoutMs: 20 * 60_000,
@@ -2260,7 +2556,7 @@ export const autoimplementWorkflow = defineWorkflow({
           implementation: latestOutput(context, ["implement"]),
           verification:
             context.outputs.localVerification === undefined
-              ? latestOutput(context, ["verifyP2"])
+              ? latestOutput(context, ["verifyP2", "verifyP2Local"])
               : includedResult(changeVerificationWorkflow, context.outputs.localVerification)
                   .output,
           reviewRounds:
@@ -2322,7 +2618,19 @@ export const autoimplementWorkflow = defineWorkflow({
       from: "routeVerifiedWorkspace",
       switch: {
         on: "$.route",
-        cases: { pullRequest: "publish", defaultBranch: "finalizeDefaultBranch" },
+        cases: {
+          pullRequest: "publish",
+          publishReviewed: "publish",
+          commitLocal: "commitLocal",
+          defaultBranch: "finalizeDefaultBranch",
+        },
+      },
+    },
+    {
+      from: "commitLocal",
+      switch: {
+        on: "$result.outcome",
+        cases: { ok: "publicationResult", timed_out: "observe", failed: "observe" },
       },
     },
     {
@@ -2384,11 +2692,22 @@ export const autoimplementWorkflow = defineWorkflow({
       from: "addressP2",
       switch: {
         on: "$result.outcome",
-        cases: { ok: "verifyP2", timed_out: "observe", failed: "observe" },
+        cases: { ok: "routeAddressedP2", timed_out: "observe", failed: "observe" },
       },
     },
     {
+      from: "routeAddressedP2",
+      switch: { on: "$.route", cases: { push: "verifyP2", local: "verifyP2Local" } },
+    },
+    {
       from: "verifyP2",
+      switch: {
+        on: "$result.outcome",
+        cases: { ok: "p2Result", timed_out: "observe", failed: "observe" },
+      },
+    },
+    {
+      from: "verifyP2Local",
       switch: {
         on: "$result.outcome",
         cases: { ok: "p2Result", timed_out: "observe", failed: "observe" },
