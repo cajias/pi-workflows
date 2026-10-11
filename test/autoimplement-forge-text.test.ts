@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { repositoryId } from "../src/builtins/autoimplement-command-batches.js";
 import {
+  endTimingText,
   forgeTerms,
   forgeText,
   gitlabApiCoordinates,
@@ -44,10 +45,12 @@ describe("forgeTerms", () => {
 
 function gitlabLines(): string[] {
   const text = forgeText("gitlab");
+  const end = endTimingText("gitlab");
   return [
     text.implementInspect,
     text.defaultBranchNoSelfRequest,
     ...text.publish.early,
+    ...text.publish.reviewed("abc123"),
     ...text.verifyP2,
     ...text.inspectComments,
     ...text.inspectCi({ repositories: [] }),
@@ -58,6 +61,10 @@ function gitlabLines(): string[] {
     text.summaryResults,
     text.defaultBranchCiReason,
     ...text.decide,
+    end.noPush,
+    end.decide,
+    ...end.commitLocal,
+    ...end.verifyP2Local,
   ];
 }
 
@@ -141,6 +148,67 @@ describe("forgeText", () => {
     ];
     expect(forgeText("gitlab").inspectCi(published).at(-1)).toBe(
       `Canonical glab tracking commands: ${JSON.stringify(commands)}`,
+    );
+  });
+});
+
+describe("reviewed publication text", () => {
+  it("pushes exactly the reviewed head and reuses the one pull request on GitHub", () => {
+    const lines = forgeText("github").publish.reviewed("abc123");
+    expect(lines.slice(0, 2)).toEqual([
+      "Push exactly the reviewed local head abc123 to the task branch without force. Review passed for this head, so create no new commits and do not amend or rewrite any commit.",
+      "If the local HEAD is not abc123, do not push. Report the difference instead.",
+    ]);
+    expect(lines).toContain(
+      "Inspect the branch, local and remote heads, and matching pull requests first. Reuse the existing pull request for this branch and base, or open one when none exists. Never create a second pull request for the same branch and base.",
+    );
+    expect(lines).toContain(
+      "When you open a pull request, use the pr-description skill for its body.",
+    );
+    expect(lines.slice(-3)).toEqual(forgeText("github").publish.early.slice(-3));
+    expect(lines.join("\n")).not.toContain("before review");
+  });
+
+  it("pushes exactly the reviewed head and reuses the one merge request on GitLab", () => {
+    const github = forgeText("github").publish.reviewed("abc123");
+    const lines = forgeText("gitlab").publish.reviewed("abc123");
+    expect(lines.slice(0, 2)).toEqual(github.slice(0, 2));
+    expect(lines[2]).toBe(
+      "Inspect the branch, local and remote heads, and matching merge requests first. Never create a second merge request for the same source and target branch.",
+    );
+    expect(lines.slice(3)).toEqual(forgeText("gitlab").publish.early.slice(2));
+    expect(lines.join("\n")).toContain("glab mr create --source-branch <branch>");
+  });
+});
+
+describe("endTimingText", () => {
+  it("names the pull request on GitHub", () => {
+    const text = endTimingText("github");
+    expect(text.noPush).toBe(
+      "Do not push and do not open or update a pull request. This run pushes only after review passes.",
+    );
+    expect(text.decide).toBe(
+      "Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single pull request.",
+    );
+    expect(text.commitLocal[1]).toBe(
+      "Never push, never open or update a pull request, and never amend or rewrite a commit that was already pushed.",
+    );
+    expect(text.verifyP2Local[2]).toBe(
+      "Do not run pi-reviewer again because the previous round had no P0 or P1 findings.",
+    );
+    expect(text.verifyP2Local.at(-1)).toBe("Report exact commands and outcomes.");
+  });
+
+  it("names the merge request on GitLab and shares every other line", () => {
+    const github = endTimingText("github");
+    const gitlab = endTimingText("gitlab");
+    expect(gitlab.noPush).toBe(github.noPush.replace("pull request", "merge request"));
+    expect(gitlab.decide).toBe(github.decide.replace("pull request", "merge request"));
+    expect(gitlab.commitLocal).toEqual(
+      github.commitLocal.map((line) => line.replace("pull request", "merge request")),
+    );
+    expect(gitlab.verifyP2Local).toEqual(
+      github.verifyP2Local.map((line) => line.replace("pull request", "merge request")),
     );
   });
 });

@@ -33,8 +33,11 @@ export type ForgeText = {
   implementInspect: string;
   /** `finalizeDefaultBranch`: never request a merge of the default branch into itself. */
   defaultBranchNoSelfRequest: string;
-  /** `publish`: the lines before the requested base branch. */
-  publish: { early: readonly string[] };
+  /**
+   * `publish`: the lines before the requested base branch. `early` publishes before review, as
+   * upstream. `reviewed` makes the single push of a head that passed review under `prTiming: end`.
+   */
+  publish: { early: readonly string[]; reviewed: (headRevision: string) => readonly string[] };
   /** `verifyP2`: every rule line. */
   verifyP2: readonly string[];
   /** `inspectComments`: the lines before the published repositories. */
@@ -78,6 +81,18 @@ export function forgeTerms(forge: Forge): ForgeTerms {
 const PUBLISH_BEFORE_REVIEW = "Commit and push the verified implementation before review.";
 const PUBLISH_DEPENDENCY_FINGERPRINT =
   "Include dependencyFingerprint only when a declared dependency result is relevant to review reuse.";
+
+/** The push of a reviewed local head. Review passed for exactly this head, so nothing may change it. */
+function reviewedPushLines(headRevision: string): string[] {
+  return [
+    `Push exactly the reviewed local head ${headRevision} to the task branch without force. Review passed for this head, so create no new commits and do not amend or rewrite any commit.`,
+    `If the local HEAD is not ${headRevision}, do not push. Report the difference instead.`,
+  ];
+}
+
+const GITHUB_PUBLISH_DIFF = "Inspect the complete public diff before every push or PR mutation.";
+const GITHUB_PUBLISH_REPORT =
+  "Report every repository that received a pushed pull request with its absolute repository path, branch, base branch, pushed head revision, and PR URL.";
 const P2_VERIFY = "Run focused verification for the P2 changes and push the verified result.";
 const P2_HEADS =
   "Inspect the local and remote heads first. Do not push again when the verified head is already remote.";
@@ -122,8 +137,16 @@ const GITHUB_TEXT: ForgeText = {
       PUBLISH_BEFORE_REVIEW,
       "Inspect the branch, local and remote heads, and matching pull requests first. Do not push an already-pushed head or create a second pull request for the same branch and base.",
       "Use the existing implementation-plan PR when one exists. Otherwise open a PR and use the pr-description skill for its body.",
-      "Inspect the complete public diff before every push or PR mutation.",
-      "Report every repository that received a pushed pull request with its absolute repository path, branch, base branch, pushed head revision, and PR URL.",
+      GITHUB_PUBLISH_DIFF,
+      GITHUB_PUBLISH_REPORT,
+      PUBLISH_DEPENDENCY_FINGERPRINT,
+    ],
+    reviewed: (headRevision) => [
+      ...reviewedPushLines(headRevision),
+      "Inspect the branch, local and remote heads, and matching pull requests first. Reuse the existing pull request for this branch and base, or open one when none exists. Never create a second pull request for the same branch and base.",
+      "When you open a pull request, use the pr-description skill for its body.",
+      GITHUB_PUBLISH_DIFF,
+      GITHUB_PUBLISH_REPORT,
       PUBLISH_DEPENDENCY_FINGERPRINT,
     ],
   },
@@ -191,6 +214,16 @@ const GITLAB_DELIVERY_RULES = [
   GITLAB_COORDINATES_RULE,
 ] as const;
 
+/** How GitLab publication finds, reuses, or creates the one merge request, and what it reports. */
+const GITLAB_PUBLISH_REQUEST = [
+  'Look up an open merge request for this source and target branch with glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>". <hostname> is the host in the forge resolution, or the glab host of the work repository\'s Git remote when that is null. <apiProject> is the URL-encoded project path, such as group%2Fsub%2Fproject.',
+  "Reuse that merge request when one exists, and update a stale description with glab mr update <iid> --description <description> --yes. Otherwise run glab in the prepared workspace to create one with glab mr create --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes.",
+  "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
+  "Inspect the complete public diff before every push or MR mutation.",
+  "Report every repository that received a pushed merge request with its absolute repository path, branch, base branch, pushed head revision, and the MR web URL https://<hostname>/<project path>/-/merge_requests/<iid> as pr.",
+  PUBLISH_DEPENDENCY_FINGERPRINT,
+] as const;
+
 const GITLAB_TEXT: ForgeText = {
   implementInspect:
     "Before changing files, inspect the current worktree, diff, commits, branch, remote state, and matching merge request. Continue existing work and do not repeat completed effects.",
@@ -199,12 +232,12 @@ const GITLAB_TEXT: ForgeText = {
     early: [
       PUBLISH_BEFORE_REVIEW,
       "Inspect the branch, local and remote heads, and matching merge requests first. Do not push an already-pushed head or create a second merge request for the same source and target branch.",
-      'Look up an open merge request for this source and target branch with glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>". <hostname> is the host in the forge resolution, or the glab host of the work repository\'s Git remote when that is null. <apiProject> is the URL-encoded project path, such as group%2Fsub%2Fproject.',
-      "Reuse that merge request when one exists, and update a stale description with glab mr update <iid> --description <description> --yes. Otherwise run glab in the prepared workspace to create one with glab mr create --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes.",
-      "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
-      "Inspect the complete public diff before every push or MR mutation.",
-      "Report every repository that received a pushed merge request with its absolute repository path, branch, base branch, pushed head revision, and the MR web URL https://<hostname>/<project path>/-/merge_requests/<iid> as pr.",
-      PUBLISH_DEPENDENCY_FINGERPRINT,
+      ...GITLAB_PUBLISH_REQUEST,
+    ],
+    reviewed: (headRevision) => [
+      ...reviewedPushLines(headRevision),
+      "Inspect the branch, local and remote heads, and matching merge requests first. Never create a second merge request for the same source and target branch.",
+      ...GITLAB_PUBLISH_REQUEST,
     ],
   },
   verifyP2: [
@@ -256,6 +289,51 @@ const GITLAB_TEXT: ForgeText = {
 
 export function forgeText(forge: Forge): ForgeText {
   return forge === "gitlab" ? GITLAB_TEXT : GITHUB_TEXT;
+}
+
+/**
+ * Lines that only `prTiming: end` adds. They are new text, not upstream GitHub lines, so they name
+ * the forge's request through {@link forgeTerms}.
+ */
+export type EndTimingText = {
+  /** `implement`, `fix`, and `addressP2`: the last line. */
+  noPush: string;
+  /** `decide`: the line after the merge setting and any forge line. */
+  decide: string;
+  /** `commitLocal`: the lines before the prepared workspace. */
+  commitLocal: readonly string[];
+  /** `verifyP2Local`: the lines before the reviewed local commits. */
+  verifyP2Local: readonly string[];
+};
+
+const LOCAL_COMMIT_INSPECT =
+  "Inspect the branch, status, and commits first. Add one or more new commits. When everything is already committed, report the current HEAD and do not create an empty commit.";
+const LOCAL_COMMIT_CHECKED =
+  "Commit every task-related change. The workflow checks that the reported head is the checked-out HEAD of the task branch and that only changes that existed before the run stay uncommitted.";
+
+export function endTimingText(forge: Forge): EndTimingText {
+  const { request } = forgeTerms(forge);
+  return {
+    noPush: `Do not push and do not open or update a ${request}. This run pushes only after review passes.`,
+    decide: `Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single ${request}.`,
+    commitLocal: [
+      "Commit the verified work locally on the prepared task branch, so review runs on these commits before anything is published.",
+      `Never push, never open or update a ${request}, and never amend or rewrite a commit that was already pushed.`,
+      LOCAL_COMMIT_INSPECT,
+      LOCAL_COMMIT_CHECKED,
+      "Report the absolute repository path, task branch, base branch, full local HEAD revision, and committed true.",
+      PUBLISH_DEPENDENCY_FINGERPRINT,
+    ],
+    verifyP2Local: [
+      "Run focused verification for the P2 changes, then commit the verified result locally on the task branch.",
+      `Never push, never open or update a ${request}, and never amend or rewrite a commit that was already pushed. Publication follows this verification.`,
+      P2_NO_REVIEW,
+      LOCAL_COMMIT_INSPECT,
+      LOCAL_COMMIT_CHECKED,
+      "Return passed and pushed false. For every repository, return its absolute path, task branch, base branch, full local HEAD revision, committed true, and unchanged dependency fingerprint.",
+      REPORT_COMMANDS,
+    ],
+  };
 }
 
 function mergeRequestOf(repository: PublishedRepository) {
