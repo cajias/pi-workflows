@@ -1235,3 +1235,145 @@ describe("autoimplement GitLab publication validation", () => {
     }
   });
 });
+
+/** Agent prompts the Autoimplement graph renders itself, without its included workflows. */
+function topLevelPrompts(scenario: AutoimplementScenario): string[] {
+  return scenario.executor.requests
+    .filter((request) => !request.contract.nodeId.includes("/"))
+    .map((request) => request.prompt);
+}
+
+function nodeIndex(nodeIds: readonly string[], nodeId: string): number {
+  const index = nodeIds.indexOf(nodeId);
+  if (index < 0) throw new Error(`${nodeId} did not run`);
+  return index;
+}
+
+const GITLAB_RUN_MR = "https://gitlab.example.test/group/project/-/merge_requests/7";
+const CANONICAL_GLAB_WATCH = [
+  "ci",
+  "status",
+  "--live",
+  "--branch",
+  "feat/demo",
+  "--repo",
+  "https://gitlab.example.test/group/project",
+];
+
+function gitlabScenario(scenario: AutoimplementScenario, forge?: "gitlab"): AutoimplementScenario {
+  return { ...scenario, input: { ...scenario.input, ...(forge === undefined ? {} : { forge }) } };
+}
+
+describe("autoimplement GitLab early runs", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("publishes before review and runs the bound glab watch with an explicit forge", async () => {
+    const scenario = gitlabScenario(
+      pendingCiScenario(fixture.repository, GITLAB_RUN_MR, {
+        command: "glab",
+        args: ["ci", "status", "--live"],
+      }),
+      "gitlab",
+    );
+    const { state } = await runScenario("gitlab-pending-ci", scenario);
+    expect(state.status, state.error).toBe("completed");
+    const nodeIds = state.steps.map((step) => step.nodeId);
+    expect(upstreamView(nodeIds)).toEqual(UPSTREAM_NODE_SEQUENCES.pendingCi);
+    expect(nodeIndex(nodeIds, "publish")).toBeLessThan(nodeIndex(nodeIds, "runReview"));
+    expect(state.outputs.resolveForge).toEqual(resolution("gitlab", "gitlab"));
+    expect(state.steps.find((step) => step.nodeId === "trackCi")?.output).toMatchObject({
+      route: "assess",
+      batch: {
+        items: [{ command: "glab", args: CANONICAL_GLAB_WATCH, stdout: "pipeline complete\n" }],
+      },
+    });
+    expect(await fs.readFile(fixture.glabLog, "utf8")).toBe(
+      "ci status --live --branch feat/demo --repo https://gitlab.example.test/group/project\n",
+    );
+    expect(state.finalOutput).toMatchObject({
+      status: "completed",
+      delivery: { status: "completed", pr: GITLAB_RUN_MR },
+    });
+    for (const prompt of topLevelPrompts(scenario)) {
+      expect(prompt).not.toContain("pull request");
+      expect(prompt).not.toContain("pr-description");
+    }
+    const publish = scenario.executor.requests.find(
+      (request) => request.contract.nodeId === "publish",
+    );
+    expect(publish?.prompt).toContain("glab mr create --source-branch <branch>");
+  });
+
+  it("detects GitLab from the remote and normalizes a --wait watch", async () => {
+    const glabDir = await makeTempDir("autoimplement-glab-run-config");
+    await fs.writeFile(
+      path.join(glabDir, "config.yml"),
+      "hosts:\n    gitlab.example.test:\n        api_protocol: https\n        token: SECRET\n",
+    );
+    vi.stubEnv("GLAB_CONFIG_DIR", glabDir);
+    await git(fixture.repository, [
+      "remote",
+      "add",
+      "origin",
+      "git@gitlab.example.test:group/project.git",
+    ]);
+    const scenario = pendingCiScenario(fixture.repository, GITLAB_RUN_MR, {
+      command: "glab",
+      args: ["ci", "status", "--wait", "-b", "feat/demo"],
+    });
+    const { state } = await runScenario("gitlab-auto", scenario);
+    expect(state.status, state.error).toBe("completed");
+    expect(state.outputs.resolveForge).toMatchObject({
+      requested: "auto",
+      forge: "gitlab",
+      remoteUrl: "git@gitlab.example.test:group/project.git",
+      reason: "glab host gitlab.example.test",
+    });
+    expect(await fs.readFile(fixture.glabLog, "utf8")).toBe(
+      "ci status --live --branch feat/demo --repo https://gitlab.example.test/group/project\n",
+    );
+    const decide = scenario.executor.requests.find(
+      (request) => request.contract.nodeId === "decide",
+    );
+    expect(decide?.prompt).toContain(
+      "Forge: gitlab. Publication uses one GitLab merge request through glab.",
+    );
+    const publish = scenario.executor.requests.find(
+      (request) => request.contract.nodeId === "publish",
+    );
+    expect(publish?.prompt).toContain(
+      `Forge resolution: ${JSON.stringify(state.outputs.resolveForge)}`,
+    );
+  });
+
+  it("follows the upstream P2 path and gives verifyP2 the merge request coordinates", async () => {
+    const scenario = gitlabScenario(p2PathScenario(fixture.repository, GITLAB_RUN_MR), "gitlab");
+    const { state } = await runScenario("gitlab-p2", scenario);
+    expect(state.status, state.error).toBe("completed");
+    expect(upstreamView(state.steps.map((step) => step.nodeId))).toEqual(
+      UPSTREAM_NODE_SEQUENCES.p2,
+    );
+    const verify = scenario.executor.requests.find(
+      (request) => request.contract.nodeId === "verifyP2",
+    );
+    expect(verify?.prompt).toContain('"apiProject":"group%2Fproject","iid":7');
+    const finalize = scenario.executor.requests.find(
+      (request) => request.contract.nodeId === "finalizeDelivery",
+    );
+    expect(finalize?.prompt).toContain("--sha <headRevision> --auto-merge=false --yes");
+    expect(state.finalOutput).toMatchObject({ delivery: { merged: true, pr: GITLAB_RUN_MR } });
+  });
+
+  it("returns a GitHub-style publication URL on GitLab to the controller as a failed step", async () => {
+    const scenario = gitlabScenario(pendingCiScenario(fixture.repository), "gitlab");
+    const { state } = await runScenario("gitlab-github-url", scenario);
+    const publish = state.steps.find((step) => step.nodeId === "publish");
+    expect(publish).toMatchObject({ outcome: "failed" });
+    expect(publish?.error).toContain(
+      "publication repositories[0].pr must be a GitLab merge request URL",
+    );
+    expect(state.steps.findIndex((step) => step.nodeId === "runReview")).toBe(-1);
+  });
+});
