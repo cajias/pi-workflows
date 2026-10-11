@@ -1,3 +1,4 @@
+export { workflowsConfigDir } from "./config-dir.js";
 export {
   StateDatabase,
   workflowStatePath,

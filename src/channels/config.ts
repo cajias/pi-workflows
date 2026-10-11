@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { workflowsConfigDir } from "../state/config-dir.js";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 const NUMERIC_ID = /^-?[0-9]+$/;
@@ -37,7 +37,7 @@ export type TelegramFetch = (
 ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 export function decisionConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.PI_WORKFLOWS_CONFIG_DIR ?? path.join(os.homedir(), ".config", "pi-workflows");
+  return workflowsConfigDir(env);
 }
 
 export function audienceChannels(config: DecisionChannelConfig | null, audience: string): string[] {
