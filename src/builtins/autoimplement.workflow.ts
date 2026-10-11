@@ -53,6 +53,7 @@ import { forgeText, gitlabApiCoordinates, type ForgeText } from "./autoimplement
 import {
   parseForgeRequest,
   parseForgeResolution,
+  parseGitLabMergeRequestUrl,
   resolveForge,
   type Forge,
   type ForgeRequest,
@@ -1261,6 +1262,11 @@ function parsePublishedForContext(
   }
   if (result.repositories.some((repository) => repository.repository !== expected)) {
     throw new Error("publication cannot include an unprepared repository");
+  }
+  if (forgeFor(context) === "gitlab") {
+    result.repositories.forEach((repository, index) =>
+      parseGitLabMergeRequestUrl(repository.pr, `publication repositories[${index}].pr`),
+    );
   }
   return result;
 }

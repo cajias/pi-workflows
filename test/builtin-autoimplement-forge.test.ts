@@ -1185,3 +1185,53 @@ describe("autoimplement GitLab prompts", () => {
     });
   });
 });
+
+describe("autoimplement GitLab publication validation", () => {
+  const validatePublish = async (value: unknown, outputs: Record<string, unknown>) => {
+    const node = autoimplementWorkflow.nodes.publish;
+    if (node?.nodeType !== "agent" || node.validate === undefined) {
+      throw new Error("publish must be a validated agent node");
+    }
+    const validate = node.validate;
+    return await validate(value, syntheticAutoimplementContext({ outputs }));
+  };
+  const publication = (pr: string) => ({
+    repositories: [
+      {
+        repository: "/golden/repository",
+        branch: "feat/golden",
+        baseBranch: "main",
+        headRevision: "abc123",
+        pr,
+        pushed: true,
+      },
+    ],
+  });
+
+  it("requires a merge request URL on GitLab and keeps the reported string", async () => {
+    await expect(
+      validatePublish(publication("https://example.test/pr/1"), {
+        resolveForge: DETECTED_GITLAB,
+      }),
+    ).rejects.toThrow(
+      "publication repositories[0].pr must be a GitLab merge request URL https://<host>/<project path>/-/merge_requests/<iid>",
+    );
+    await expect(
+      validatePublish(
+        publication("https://gitlab.example.test/group/sub/project/merge_requests/7"),
+        { resolveForge: DETECTED_GITLAB },
+      ),
+    ).rejects.toThrow("must be a GitLab merge request URL");
+    await expect(
+      validatePublish(publication(GITLAB_MR), { resolveForge: DETECTED_GITLAB }),
+    ).resolves.toMatchObject({ repositories: [{ id: GOLDEN_ID, pr: GITLAB_MR }] });
+  });
+
+  it("leaves GitHub publication URLs unchecked", async () => {
+    for (const outputs of [{}, { resolveForge: resolution("github") }]) {
+      await expect(
+        validatePublish(publication("https://example.test/pr/1"), outputs),
+      ).resolves.toMatchObject({ repositories: [{ pr: "https://example.test/pr/1" }] });
+    }
+  });
+});
