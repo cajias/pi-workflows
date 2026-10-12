@@ -92,6 +92,7 @@ import changeVerificationWorkflow, {
 import { parsePlanApprovalPolicy, type PlanApprovalPolicy } from "./plan-approval.workflow.js";
 import planChangeWorkflow, { type NormalizedPlanChangeInput } from "./plan-change.workflow.js";
 import workspacePreparationWorkflow, {
+  commitTimeSeconds,
   inspectLocalHead,
   pushTrackingHead,
   parsePreparedWorkspace,
@@ -1608,8 +1609,49 @@ async function parseLocalCommitForContext(
       );
     }
     await assertLocalHead(repository, workspace, label);
+    await assertNotPushedBeforeGate(repository, context, label);
   }
   return result;
+}
+
+/** The head of a repository in the newest accepted `publish` or `verifyP2` record of this run. */
+function lastPublishedHead(context: WorkflowNodeContext, id: string): string | undefined {
+  const step = context.state.steps.findLast(
+    (candidate) =>
+      candidate.outcome === "ok" &&
+      (candidate.nodeId === "publish" || candidate.nodeId === "verifyP2"),
+  );
+  if (step === undefined) return undefined;
+  return recordedHeads(step).find((repository) => repository.id === id)?.headRevision;
+}
+
+/**
+ * Under `prTiming: end`, nothing is pushed before the review gate passes. When the push destination
+ * of the task branch is known and its tracking ref exists, the ref must not have moved. After a
+ * publication of this run it records that published head. Before any publication it records a
+ * commit made before the run started, because the run records no tracking value from before its
+ * first local commit, and every commit the run makes is newer than its start. Local refs only.
+ */
+async function assertNotPushedBeforeGate(
+  repository: CandidateRepository,
+  context: WorkflowNodeContext,
+  label: string,
+): Promise<void> {
+  const tracking = await pushTrackingHead(repository.repository, repository.branch);
+  if (tracking?.headRevision === undefined || tracking.headRevision === null) return;
+  const published = lastPublishedHead(context, repository.id);
+  if (published === tracking.headRevision) return;
+  if (published === undefined) {
+    const committed = await commitTimeSeconds(repository.repository, tracking.headRevision);
+    if (committed * 1000 < Date.parse(context.state.startedAt)) return;
+  }
+  const moved =
+    published === undefined
+      ? "a commit made during this run"
+      : `not the published head ${published}`;
+  throw new Error(
+    `${label}: ${tracking.ref} moved to ${tracking.headRevision}, ${moved}. Do not push before the review gate passes; under prTiming end this run pushes only a reviewed head. Pushed commits cannot be withdrawn without a force push, so the controller should choose blocked.`,
+  );
 }
 
 /** The heads of the newest `commitLocal` or `publish` record: what the last review ran against. */
@@ -1648,7 +1690,9 @@ async function parseLocalP2Verification(
       );
     }
     expected.delete(repository.id);
-    await assertLocalHead(repository, workspace, `local P2 verification repositories[${index}]`);
+    const label = `local P2 verification repositories[${index}]`;
+    await assertLocalHead(repository, workspace, label);
+    await assertNotPushedBeforeGate(repository, context, label);
   }
   if (expected.size > 0) {
     throw new Error(
