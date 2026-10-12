@@ -215,11 +215,18 @@ export function detectForge(requested: ForgeRequest, facts: ForgeFacts): ForgeRe
   return detectRemoteForge(facts, remote.host, facts.remoteUrl);
 }
 
+/** GitLab.com serves SSH over port 443 on this host. Its web and API host is `gitlab.com`. */
+const GITLAB_COM_ALT_SSH_HOST = "altssh.gitlab.com";
+
 function detectRemoteForge(facts: ForgeFacts, host: string, remoteUrl: string): ForgeResolution {
   if (host === "github.com")
     return resolution("auto", "github", host, remoteUrl, `remote host ${host}`);
   if (host === "gitlab.com")
     return resolution("auto", "gitlab", host, remoteUrl, `remote host ${host}`);
+  if (host === GITLAB_COM_ALT_SSH_HOST) {
+    const reason = `remote host ${host}, the GitLab.com SSH host on port 443`;
+    return resolution("auto", "gitlab", "gitlab.com", remoteUrl, reason);
+  }
   const gh = facts.ghHosts.some((entry) => hostnameOf(entry) === host);
   const gitlab = gitlabMatch(facts, host);
   if (gh && gitlab !== undefined) {
@@ -272,12 +279,15 @@ export function ghHostsFile(io: Pick<ForgeIo, "env" | "homeDir">): string {
   return path.join(io.homeDir, ".config", "gh", "hosts.yml");
 }
 
-/** Candidate glab config files in order. The first one that exists is used. */
+/**
+ * Candidate glab config files in order. The first one that exists is used. A set `GLAB_CONFIG_DIR`
+ * is the only candidate, because glab then reads no other directory.
+ */
 export function glabConfigFiles(io: Pick<ForgeIo, "env" | "homeDir">): string[] {
   const configDir = envValue(io.env, "GLAB_CONFIG_DIR");
+  if (configDir !== undefined) return [path.join(configDir, "config.yml")];
   const xdg = envValue(io.env, "XDG_CONFIG_HOME");
   return [
-    ...(configDir === undefined ? [] : [path.join(configDir, "config.yml")]),
     path.join(io.homeDir, ".config", "glab-cli", "config.yml"),
     ...(xdg === undefined ? [] : [path.join(xdg, "glab-cli", "config.yml")]),
   ];

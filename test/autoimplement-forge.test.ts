@@ -223,6 +223,22 @@ describe("autoimplement forge detection", () => {
     ).toMatchObject({ forge: "gitlab", host: "gitlab.com", reason: "remote host gitlab.com" });
   });
 
+  it("treats the GitLab.com SSH host on port 443 as gitlab.com", () => {
+    for (const remoteUrl of [
+      "ssh://git@altssh.gitlab.com:443/g/p.git",
+      "git@AltSSH.GitLab.com:g/p.git",
+    ]) {
+      expect(detectForge("auto", facts({ remoteUrl }))).toEqual({
+        schema: FORGE_RESOLUTION_SCHEMA,
+        requested: "auto",
+        forge: "gitlab",
+        host: "gitlab.com",
+        remoteUrl,
+        reason: "remote host altssh.gitlab.com, the GitLab.com SSH host on port 443",
+      });
+    }
+  });
+
   it("matches a self-managed GitLab through ssh_host, the key, or api_host", () => {
     expect(
       detectForge("auto", facts({ remoteUrl: "git@ssh.code.aws.dev:g/p.git", glabHosts })),
@@ -341,12 +357,14 @@ describe("autoimplement forge IO", () => {
     );
   });
 
-  it("lists glab config candidates in order", () => {
+  it("lists glab config candidates in order and uses only a set GLAB_CONFIG_DIR", () => {
     const homeDir = "/home/user";
     expect(
       glabConfigFiles({ env: { GLAB_CONFIG_DIR: "/glab", XDG_CONFIG_HOME: "/xdg" }, homeDir }),
+    ).toEqual([path.join("/glab", "config.yml")]);
+    expect(
+      glabConfigFiles({ env: { GLAB_CONFIG_DIR: "", XDG_CONFIG_HOME: "/xdg" }, homeDir }),
     ).toEqual([
-      path.join("/glab", "config.yml"),
       path.join(homeDir, ".config", "glab-cli", "config.yml"),
       path.join("/xdg", "glab-cli", "config.yml"),
     ]);
@@ -388,7 +406,7 @@ describe("autoimplement forge IO", () => {
   it("uses the first remote when origin is missing and falls through glab candidates", async () => {
     const { io, calls } = fakeIo({
       remotes: { upstream: "git@code.aws.dev:g/p.git", other: "git@github.com:o/r.git" },
-      env: { GLAB_CONFIG_DIR: "/glab", XDG_CONFIG_HOME: "/xdg" },
+      env: { XDG_CONFIG_HOME: "/xdg" },
       files: { [path.join("/xdg", "glab-cli", "config.yml")]: GLAB_CONFIG },
     });
     const read = await readForgeFacts("/repo", io);
@@ -403,10 +421,26 @@ describe("autoimplement forge IO", () => {
       "remote",
       "remote get-url upstream",
       path.join("/xdg", "gh", "hosts.yml"),
-      path.join("/glab", "config.yml"),
       path.join("/home/user", ".config", "glab-cli", "config.yml"),
       path.join("/xdg", "glab-cli", "config.yml"),
     ]);
+  });
+
+  it("never falls back from a set GLAB_CONFIG_DIR to the home or XDG glab config", async () => {
+    const { io, calls } = fakeIo({
+      remotes: { origin: "git@code.aws.dev:g/p.git" },
+      env: { GLAB_CONFIG_DIR: "/glab", XDG_CONFIG_HOME: "/xdg" },
+      files: {
+        [path.join("/home/user", ".config", "glab-cli", "config.yml")]: GLAB_CONFIG,
+        [path.join("/xdg", "glab-cli", "config.yml")]: GLAB_CONFIG,
+      },
+    });
+    expect(await readForgeFacts("/repo", io)).toMatchObject({ glabHosts: [] });
+    expect(calls.filter((call) => call.kind === "read").map((call) => call.value)).toEqual([
+      path.join("/xdg", "gh", "hosts.yml"),
+      path.join("/glab", "config.yml"),
+    ]);
+    expect(await resolveForge("auto", "/repo", io)).toMatchObject({ forge: "github" });
   });
 
   it("reads no hosts when the host files are missing", async () => {

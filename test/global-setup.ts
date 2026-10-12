@@ -7,7 +7,8 @@ export const TEST_TEMP_ROOT_ENV = "PI_WORKFLOWS_TEST_TEMP_ROOT";
 
 /**
  * Forge configuration the suite isolates. The two config directories point at missing temporary
- * paths, so forge detection never reads the developer's gh or glab hosts.
+ * paths. Detection reads only `GH_CONFIG_DIR` or `GLAB_CONFIG_DIR` when it is set, so it never falls
+ * back to the developer's gh or glab hosts. `GITLAB_HOST` is unset for the same reason.
  */
 const FORGE_ENVIRONMENT = ["GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "GITLAB_HOST"] as const;
 

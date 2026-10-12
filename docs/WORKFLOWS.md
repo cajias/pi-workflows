@@ -768,13 +768,13 @@ A branch blocker does not end Autoimplement by itself. The controller can repair
 The `forge` input chooses the code forge: `auto`, `github`, or `gitlab`. An explicit `github` or `gitlab` does no detection. With `auto`, the read-only `resolveForge` step runs between `prepare` and the first observation. It reads the remote of `origin`, or of the first remote when `origin` is missing, in the prepared worktree, the prepared repository, or the requested repository, in that order. It then decides as follows:
 
 1. A remote without a network host, such as a local path or a `file://` URL, or no remote at all, selects GitHub.
-2. `github.com` selects GitHub, and `gitlab.com` selects GitLab.
+2. `github.com` selects GitHub, and `gitlab.com` selects GitLab. `altssh.gitlab.com`, the GitLab.com SSH host on port 443, selects GitLab with the host `gitlab.com`.
 3. A host in both the `gh` hosts file and the `glab` configuration selects GitHub and records the ambiguity. Set `forge` explicitly in that case.
 4. A host that matches a `glab` hosts key, its `api_host`, or its `ssh_host`, or the `GITLAB_HOST` hostname, selects GitLab. This covers a self-managed GitLab whose SSH remote uses a separate SSH hostname.
 5. A host in the `gh` hosts file selects GitHub.
 6. Any other host selects GitHub, which is the upstream behavior.
 
-Hostnames compare without case, and ports are ignored. The `gh` hosts file is `$GH_CONFIG_DIR/hosts.yml`, else `$XDG_CONFIG_HOME/gh/hosts.yml`, else `~/.config/gh/hosts.yml`. The `glab` configuration is the first file that exists among `$GLAB_CONFIG_DIR/config.yml`, `~/.config/glab-cli/config.yml`, and `$XDG_CONFIG_HOME/glab-cli/config.yml`. Only host keys, `api_host`, and `ssh_host` are read; tokens are never kept. SSH aliases in `~/.ssh/config`, `GL_HOST`, `GITLAB_URI`, and per-repository `glab` configuration are not read. If detection cannot read a file or run Git, it selects GitHub and records the error.
+Hostnames compare without case, and ports are ignored. The `gh` hosts file is `$GH_CONFIG_DIR/hosts.yml`, else `$XDG_CONFIG_HOME/gh/hosts.yml`, else `~/.config/gh/hosts.yml`. The `glab` configuration is `$GLAB_CONFIG_DIR/config.yml` when `GLAB_CONFIG_DIR` is set, and detection then reads no other `glab` file. Otherwise it is the first file that exists among `~/.config/glab-cli/config.yml` and `$XDG_CONFIG_HOME/glab-cli/config.yml`. Only host keys, `api_host`, and `ssh_host` are read; tokens are never kept. SSH aliases in `~/.ssh/config`, `GL_HOST`, `GITLAB_URI`, and per-repository `glab` configuration are not read. If detection cannot read a file or run Git, it selects GitHub and records the error.
 
 The step records a `pi-workflows.autoimplement-forge-resolution.v1` value with `requested`, the resolved `forge`, the matched `host`, the `remoteUrl` without any URL credentials, and a `reason`. The step is an idempotent action, so a runner crash before it commits reruns the detection. A resume replays the recorded result, and a restart detects again. The step is not a control attempt, and the decide ledger leaves it out.
 
