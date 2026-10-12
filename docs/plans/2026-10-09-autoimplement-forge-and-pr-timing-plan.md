@@ -1620,3 +1620,38 @@ These are out of scope for this plan.
   no reflog for it" (`test/builtin-autoimplement-pr-timing.test.ts`):
   - an accepted `verifyP2` as the newest published head;
   - a failed `publish` that does not count as a published head.
+- F13: Keep a `verifyP2` push excused across a runner restart (review R1).
+  - The gap: a P2 commit is unreviewed, so only its `verifyP2` attempt window excuses its push in
+    `publicationPush` (`src/builtins/autoimplement.workflow.ts`). A resume marks the interrupted
+    attempt `interrupted` in `node_attempts` and writes no `run_steps` record, so the window is
+    lost. This was already true before the N2 fix.
+  - Scenario: a `verifyP2` attempt pushes P2 commit P, then the runner restarts. The replacement
+    `verifyP2` fails, the controller picks `repair`, and every later `commitLocal` is rejected.
+  - Fix idea: also consult the windows of interrupted `node_attempts`, or record each attempt's
+    start.
+- F14: Use the reviewed-head excuse in the no-reflog fallback (review R2). Group it with F12.
+  - The gap: when Git keeps no reflog for the ref, `assertNotPushedBeforeGate` compares the ref
+    value with the last published head only and does not call `revisionPassesGate`.
+  - Scenario: `core.logAllRefUpdates=false`. A reviewed publish pushes H and then fails or is
+    lost. The `commitLocal` after the repair is rejected with "moved to H, a commit this run did
+    not publish".
+  - Fix: also accept when `revisionPassesGate(steps, id, tracking.headRevision)` holds.
+- F15: Skip the push check in `verifyP2Local` under `early` timing (review R3). Track it with F2.
+  - The gap: `verifyP2Local` calls `assertNotPushedBeforeGate` even when `publicationTiming` is
+    `early`.
+  - Scenario: after a human end→early switch, a failed early publish pushes X. Then
+    `verifyP2Local` rejects X and advises `blocked`, which is misleading under `early`.
+  - Unreachable until F2 lets a person change `prTiming`.
+  - Fix: skip the check when `publicationTiming(context) === "early"`.
+- F16: Small consistency fixes from the review (R4, R5 nits):
+  - the accepted-record rule in `publicationPush` does not compare `head.id`, unlike
+    `revisionPassesGate`. This is harmless because the validators pin the run to the prepared
+    workspace;
+  - on a regression, the "end repair after a runner restart during the reviewed push" graph tests
+    (`test/builtin-autoimplement-pr-timing.test.ts`) fail by the 30 s `GRAPH_RUN_TIMEOUT_MS`
+    timeout rather than by an assertion.
+- F17: Name both forges in the `prTiming` field rule of `skills/autoimplement/SKILL.md:30` (grep
+  audit). It says `early` "opens the pull request before review" without the GitLab wording. Fix:
+  "opens the pull request or merge request".
+- F18: Correct `docs/WORKFLOWS.md:858`. It says that after a failed push check "a person can move
+  `prTiming` to `early`". That is not possible until F2 lands.
