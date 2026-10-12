@@ -1600,3 +1600,23 @@ These are out of scope for this plan.
   (`github-merge` at `:99`, the GitHub API accept header at `:201`).
 - F9: Fix the stale `codex review` and "PR" text in `skills/autoimplement/agents/openai.yaml:3-4`.
   The workflow uses `pi-reviewer`.
+- F10: Detect a push before the review gate that bypasses the push destination's remote-tracking
+  ref (review N3).
+  - The gap: `assertNotPushedBeforeGate` (`src/builtins/autoimplement.workflow.ts`) reads only the
+    `update by push` entries of `refs/remotes/<remote>/<branch>`. A push to a URL, to another
+    remote, or to another branch name, followed by a fetch, leaves only a fetch entry. That looks
+    like a commit someone else added, so the check accepts it.
+  - Optional detection: also treat a fetched commit as a stray push when the local
+    `refs/heads/<branch>` reflog shows that this clone created it during the run (a `commit`
+    entry), and no publication of the run recorded it.
+- F11: Use only the first fetch refspec that matches the branch (review N4).
+  - Git maps `refs/heads/<branch>` through the first matching positive fetch refspec.
+    `fetchRefspecTracks` (`src/builtins/workspace-preparation.workflow.ts`) accepts any match.
+  - With `+refs/heads/feat/*:refs/remotes/origin/feat-alias/*` before
+    `+refs/heads/*:refs/remotes/origin/*`, a push updates only `origin/feat-alias/<name>`, while
+    the code trusts a stale `origin/feat/<name>`, so every reviewed publish fails.
+  - Take the first positive refspec that matches and compare only its target.
+- F12: Restore two no-reflog test cases (review N6) in "falls back to the ref value when Git keeps
+  no reflog for it" (`test/builtin-autoimplement-pr-timing.test.ts`):
+  - an accepted `verifyP2` as the newest published head;
+  - a failed `publish` that does not count as a published head.
