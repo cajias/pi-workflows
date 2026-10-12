@@ -26,8 +26,8 @@ Build the input as follows:
 - `verificationUntested`: Use non-empty strings for required checks that cannot run locally, such as remote browser tests. Supply it only with `verificationChecks`. Omit it with the planner path because the planner returns its own `untested` list.
 - `directDefaultBranchAuthorized`: Set `true` only when direct work on the actual default branch is explicit. It does not grant commit, push, merge, or release authority.
 - `merge`: Set `true` only when the user explicitly requested merge or an applicable standing instruction authorizes it. Otherwise set `false`.
-- `forge`: Omit it unless the user names a forge. Then use `github` or `gitlab`. The safe default is the user's Autoimplement defaults file, else `auto`, which detects GitHub or GitLab from the repository's Git remote and falls back to GitHub. Use an explicit value when the user says detection chose the wrong forge.
-- `prTiming`: Omit it unless the user asks to publish only after review passes. Then use `end`. The safe default is the user's Autoimplement defaults file, else `early`, which pushes and opens the pull request before review. With `end`, the workflow commits locally, runs pi-reviewer on the local commits, and pushes once to open or update the single pull request or merge request only after review passes. Direct `defaultBranch` work ignores this field.
+- `forge`: Omit it unless the user names a forge. Then use `github` or `gitlab`. The safe default is the `forge` field of the user's Autoimplement defaults file, `${PI_WORKFLOWS_CONFIG_DIR:-~/.config/pi-workflows}/autoimplement.json`, else `auto`, which detects GitHub or GitLab from the repository's Git remote and falls back to GitHub. Use an explicit value when the user says detection chose the wrong forge.
+- `prTiming`: Omit it unless the user asks to publish only after review passes. Then use `end`. The safe default is the `prTiming` field of that defaults file, else `early`, which pushes and opens the pull request before review. With `end`, the workflow commits locally, runs pi-reviewer on the local commits, and pushes once to open or update the single pull request or merge request only after review passes. Direct `defaultBranch` work ignores this field.
 - `documents`: Include known canonical plan or specification paths. Use an empty array when none are known.
 - `documentation`: Include a trusted current-document receipt only when it names the matching plan digest and canonical documents. Omit it when documentation still needs inspection.
 - `approval`: Omit it for the default behavior: ask on each new plan and continue after 10 minutes without an answer. Use `{ "mode": "required" }` when the user says to block on plan changes. Use `{ "mode": "skip" }` when the user says to continue without asking about plan changes.
@@ -55,7 +55,7 @@ Replace the example values below with facts from the conversation, then make one
       "verification": ["npm run check", "npm run test:e2e"]
     },
     "repository": "/absolute/path/to/repository",
-    "scope": "Only /absolute/path/to/repository. May edit and test task-related files, create commits, push the task branch, and open or update its pull request. Must not modify other repositories, merge, release, deploy, change credentials, or change repository policy.",
+    "scope": "Only /absolute/path/to/repository. May edit and test task-related files, create commits, push the task branch, and open or update its pull request or merge request. Must not modify other repositories, merge, release, deploy, change credentials, or change repository policy.",
     "constraints": ["Preserve immediate cancellation.", "Keep deferred-turn work separate."],
     "baseBranch": "main",
     "workspaceMode": "auto",
