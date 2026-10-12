@@ -1153,16 +1153,25 @@ wake:
   still names it, and clients retry through the brief window.
 - Only the epoch owner writes `server/server.lock.json`. The probe only reads,
   so a starter owns nothing on disk until it wins the claim. A starter whose
-  claim is fenced exits without touching the lock file, the socket, or the
-  owner's registered child processes. This holds when many sessions respawn
-  servers at once, as during `pi-workflows server stop`. The claim winner reaps
-  exact stale child processes and then writes its own lock record atomically:
-  a private temporary file in the same directory is renamed over the lock.
-  While the claim row still names the owner and its epoch, every poll rewrites
-  a lock file that is missing or names another record. A superseded server
-  never rewrites it. On stop or failed startup, the owner removes its own
-  record before it releases the claim, so its cleanup cannot remove a
-  successor's lock.
+  claim is fenced exits without writing or removing the lock file or the
+  socket, and without reaping the owner's child processes. This holds when
+  many sessions respawn servers at once, as during `pi-workflows server stop`.
+  The claim winner reaps exact stale child processes and then writes its own
+  lock record atomically: a private temporary file in the same directory is
+  renamed over the lock. While the claim row still names the owner and its
+  epoch, every poll rewrites a lock file that is missing or names another
+  record. A superseded server never rewrites it.
+- A server removes the lock file only while it still owns the epoch and the
+  lock names it. Stop, and a startup that fails after the claim, remove it
+  before they release the claim. A superseded server leaves the lock to its
+  successor, which may have claimed the epoch without having written its
+  record yet. Two narrow windows remain. The ownership check and the removal
+  are separate steps, so a successor that claims an expired lease and writes
+  its lock between them can still lose its record. And during the first
+  restart onto this behavior, the stopping server still runs the earlier code,
+  which releases its claim before it removes its lock. In both cases the
+  owner's poll rewrites the missing lock within one claim poll, 2 seconds by
+  default.
 - Clients re-spawn failed replacements. When a spawned server exits without
   becoming ready, the client starts the next one within the same start window,
   capped at three attempts, so one lost race costs milliseconds instead of the

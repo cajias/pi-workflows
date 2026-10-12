@@ -472,19 +472,15 @@ export class WorkflowServer {
   }
 
   /**
-   * Give up this server's lock file and epoch claim. The lock goes first, while
-   * the claim may still name this server: no other server writes the lock while
-   * this server owns the epoch, so the removal cannot race a successor's write.
-   * A superseded server removes the lock only while it still names this server;
-   * if a successor's write lands between that read and the removal, the
-   * successor's poll rewrites its record. The explicit socket-file removal is
-   * gated on releasing this server's own claim, and closing the listener is
+   * Give up this server's lock file and epoch claim. The lock goes first,
+   * while the claim still names this server. The explicit socket-file removal
+   * is gated on releasing this server's own claim, and closing the listener is
    * gated the same way inside closeServer, because closing unlinks the bound
    * path.
    */
   private releaseOwnership(context: string): void {
     if (this.claim === null) return;
-    this.releaseLock();
+    this.releaseOwnedLock(context);
     let released = false;
     try {
       released = this.serverState.releaseServer(this.claim);
@@ -493,6 +489,25 @@ export class WorkflowServer {
     }
     this.claim = null;
     if (released) this.removeBoundSocket();
+  }
+
+  /**
+   * Remove the lock only while this server still owns the epoch and the lock
+   * names it. A superseded server leaves the lock to its successor, which may
+   * have claimed the epoch without having written its own record yet. When the
+   * ownership read fails, the removal falls back to the lock's server ID check.
+   * The ownership check and the removal are separate steps, so a successor
+   * that claims an expired lease and writes its lock between them can still
+   * lose its record. The successor's poll rewrites it within one claim poll.
+   */
+  private releaseOwnedLock(context: string): void {
+    let owns = true;
+    try {
+      owns = this.ownsCurrentEpoch();
+    } catch (error) {
+      this.log(`epoch ownership check failed during ${context}: ${errorMessage(error)}`);
+    }
+    if (owns) this.releaseLock();
   }
 
   /** True while the epoch row still names this server and its claimed epoch. */

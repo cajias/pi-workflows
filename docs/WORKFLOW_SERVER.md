@@ -73,7 +73,7 @@ pi-workflows server run
 
 `run` stays attached for direct operation and tests. `start` starts the package process on demand and waits for a ready handshake. It does not install systemd, launchd, or another persistent service.
 
-The server uses one global lock file and one server epoch. The SQLite server claim decides ownership. A starting server first probes the socket and refuses to start when a server answers, even when the lock file is missing. Only the server that wins the epoch claim writes `server/server.lock.json`, atomically, and it rewrites a missing or foreign record while its claim still names it. A starter that loses the claim exits without touching the lock file, the socket, or the owner's child processes. Socket creation and the SQLite server claim must agree before the server accepts commands. A second live server refuses to start. After the old server lease expires, a new server increases the epoch before it handles work. Messages from an older epoch are rejected.
+The server uses one global lock file and one server epoch. The SQLite server claim decides ownership. A starting server first probes the socket and refuses to start when a server answers, even when the lock file is missing. Only the server that wins the epoch claim writes `server/server.lock.json`, atomically, and it rewrites a missing or foreign record while its claim still names it. A starter that loses the claim exits without writing or removing the lock file or the socket, and without reaping the owner's child processes. A server removes the lock only while it still owns the epoch and the lock names it; [Wake recovery](WORKFLOWS.md#wake-recovery) describes the narrow windows that the owner's poll repairs. Socket creation and the SQLite server claim must agree before the server accepts commands. A second live server refuses to start. After the old server lease expires, a new server increases the epoch before it handles work. Messages from an older epoch are rejected.
 
 The server stays alive while it has a connected client, an active runner, a scheduled wake, a pending managed resource, a pending external-channel decision, or other unsettled work. An idle server may exit after a documented idle period. A later client can start it again.
 
@@ -438,7 +438,7 @@ A client cannot force-cancel a live claim through the stale recovery path.
 
 At startup the server:
 
-1. Takes the global server epoch. A starter that loses the claim exits here and changes nothing on disk.
+1. Takes the global server epoch. A starter that loses the claim exits here without writing or removing the lock file or the socket, and without reaping recorded child processes.
 2. Reaps runner records that match an exact stale process identity, then atomically writes its own server lock record.
 3. Finds expired running runs and active attempts.
 4. Reads managed effect state before deciding whether work can repeat.

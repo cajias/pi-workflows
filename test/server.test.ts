@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import nodeFs, { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -4177,6 +4177,87 @@ export { default } from ${JSON.stringify(path.resolve("examples/workflows/echo.w
       await server.stop();
     }
   }, 30_000);
+
+  it("keeps a superseded server off the lock its successor is about to write", async () => {
+    const databasePath = path.join(await makeTempDir("server-lock-successor"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    // Long timers keep the heartbeat and the poll out of the way; the test
+    // stops the superseded server itself.
+    const server = new WorkflowServer({
+      databasePath,
+      runnerId: "server-superseded",
+      claimPollMs: 1_000_000,
+      serverRenewMs: 1_000_000,
+    });
+    await server.start();
+    const store = new ServerStateStore(databasePath);
+    const superseded = readServerLock(lockPath);
+    expect(superseded?.serverId).toBe("server-superseded");
+    const successorPid = await exitedPid();
+    const successor = {
+      pid: successorPid,
+      startIdentity: "start-successor",
+      serverId: "server-successor",
+    };
+    // The successor's write lands between any read and removal of the lock.
+    const rmSync = nodeFs.rmSync;
+    const lockRemovals: string[] = [];
+    const removal = vi.spyOn(nodeFs, "rmSync").mockImplementation((target, options) => {
+      if (target === lockPath) {
+        lockRemovals.push(readServerLock(lockPath)?.serverId ?? "missing");
+        replaceServerLock(lockPath, successor);
+      }
+      rmSync(target, options);
+    });
+    try {
+      await updateServerLease(store, Date.now() - 10_000);
+      // The successor has claimed the epoch but has not written its lock, so
+      // the lock still names the superseded server when its stop runs.
+      store.acquireServer({
+        serverId: "server-successor",
+        pid: successorPid,
+        processStartIdentity: "start-successor",
+        leaseMs: 30_000,
+      });
+      await server.stop();
+      expect(lockRemovals).toEqual([]);
+      expect(readServerLock(lockPath)).toEqual(superseded);
+    } finally {
+      removal.mockRestore();
+      store.close();
+      await server.stop();
+    }
+  });
+
+  it("falls back to the lock's server ID when the epoch read fails during stop", async () => {
+    const databasePath = path.join(await makeTempDir("server-lock-fallback"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    const logs: string[] = [];
+    const server = new WorkflowServer({
+      databasePath,
+      runnerId: "server-fallback",
+      claimPollMs: 1_000_000,
+      onLog: (message) => logs.push(message),
+    });
+    await server.start();
+    expect(readServerLock(lockPath)?.serverId).toBe("server-fallback");
+    const status = vi.spyOn(ServerStateStore.prototype, "serverStatus").mockImplementation(() => {
+      throw new Error("the epoch row is unreadable");
+    });
+    try {
+      await server.stop();
+    } finally {
+      status.mockRestore();
+    }
+    expect(logs).toContain("epoch ownership check failed during stop: the epoch row is unreadable");
+    expect(existsSync(lockPath)).toBe(false);
+    const state = new ServerStateStore(databasePath, { readOnly: true });
+    try {
+      expect(state.serverStatus()).toMatchObject({ serverId: null, live: false });
+    } finally {
+      state.close();
+    }
+  });
 
   it("leaves the epoch owner's registered children alone when a starter is fenced", async () => {
     const databasePath = path.join(await makeTempDir("server-fenced-reap"), "state.sqlite");
