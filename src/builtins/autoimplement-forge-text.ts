@@ -307,6 +307,8 @@ export type EndTimingText = {
   commitLocal: readonly string[];
   /** `verifyP2Local`: the lines before the reviewed local commits. */
   verifyP2Local: readonly string[];
+  /** Reviewed `publish` after an earlier publication: the request every later push must reuse. */
+  alreadyPublished: (requests: readonly string[]) => string;
 };
 
 const LOCAL_COMMIT_INSPECT =
@@ -327,6 +329,8 @@ export function endTimingText(forge: Forge): EndTimingText {
       "Report the absolute repository path, task branch, base branch, full local HEAD revision, and committed true.",
       PUBLISH_DEPENDENCY_FINGERPRINT,
     ],
+    alreadyPublished: (requests) =>
+      `This run already published ${requests.join(", ")}. Push to it. If it is closed or merged, do not open another ${request}; report that it is no longer open.`,
     verifyP2Local: [
       "Run focused verification for the P2 changes, then commit the verified result locally on the task branch.",
       `Never push, never open or update a ${request}, and never amend or rewrite a commit that was already pushed. Publication follows this verification.`,

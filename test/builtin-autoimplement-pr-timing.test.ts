@@ -623,6 +623,33 @@ describe("autoimplement end-timing prompts", () => {
     );
   });
 
+  it("names the request this run already published in a later reviewed push", async () => {
+    const line = (forge: Forge, url: string) =>
+      `This run already published ${url}. Push to it. If it is closed or merged, do not open another ${forge === "gitlab" ? "merge" : "pull"} request; report that it is no longer open.`;
+    for (const forge of ["github", "gitlab"] as const) {
+      const url = forge === "gitlab" ? GITLAB_MR : "https://github.com/golden/repository/pull/7";
+      // The golden history holds an accepted publish of the same branch.
+      const lines = (
+        await renderPrompt("publish", endPromptContext(forge, END_PROMPT_STEPS))
+      ).split("\n");
+      expect(lines).toContain(line(forge, url));
+      const firstPush = endPromptContext(forge, END_PROMPT_STEPS);
+      const unpublished = {
+        ...firstPush,
+        state: {
+          ...firstPush.state,
+          steps: firstPush.state.steps.filter((entry) => entry.nodeId !== "publish"),
+        },
+      };
+      expect(await renderPrompt("publish", unpublished)).not.toContain(
+        "This run already published",
+      );
+    }
+    expect(await renderPrompt("publish", syntheticAutoimplementContext())).not.toContain(
+      "This run already published",
+    );
+  });
+
   it.each(END_PROMPT_NODES)(
     "renders the GitLab end %s prompt without pull request wording",
     async (nodeId) => {

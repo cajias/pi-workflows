@@ -1452,15 +1452,7 @@ function assertReusesPublishedRequest(
   result: PublishedRepositories,
   context: WorkflowNodeContext,
 ): void {
-  const earlier = context.state.steps.findLast(
-    (step) => step.nodeId === "publish" && step.outcome === "ok",
-  );
-  if (earlier === undefined) return;
-  const requests = new Map(
-    (earlier.output as PublishedRepositories).repositories.map(
-      (repository) => [repository.id, repository.pr] as const,
-    ),
-  );
+  const requests = publishedRequests(context);
   const { request } = forgeTerms(forgeFor(context));
   result.repositories.forEach((repository, index) => {
     const pr = requests.get(repository.id);
@@ -1470,6 +1462,25 @@ function assertReusesPublishedRequest(
       );
     }
   });
+}
+
+/** The request URL of every repository in the newest accepted `publish` of this run, by id. */
+function publishedRequests(context: WorkflowNodeContext): Map<string, string> {
+  const earlier = context.state.steps.findLast(
+    (step) => step.nodeId === "publish" && step.outcome === "ok",
+  );
+  return new Map(
+    ((earlier?.output as PublishedRepositories | undefined)?.repositories ?? []).map(
+      (repository) => [repository.id, repository.pr] as const,
+    ),
+  );
+}
+
+/** The end-only `publish` line that names the request a later reviewed push must reuse. */
+function alreadyPublishedLines(context: WorkflowNodeContext): string[] {
+  const requests = [...new Set(publishedRequests(context).values())];
+  if (requests.length === 0) return [];
+  return [endTimingText(forgeFor(context)).alreadyPublished(requests)];
 }
 
 /**
@@ -2598,7 +2609,12 @@ export const autoimplementWorkflow = defineWorkflow({
         return [
           ...(reviewed === undefined
             ? publish.early
-            : publish.reviewed(reviewed.map((repository) => repository.headRevision).join(", "))),
+            : [
+                ...publish.reviewed(
+                  reviewed.map((repository) => repository.headRevision).join(", "),
+                ),
+                ...alreadyPublishedLines(context),
+              ]),
           `Requested base branch: ${request.baseBranch ?? "discover each repository default branch"}.`,
           ...gitlabResolutionLines(context),
           `Prepared workspace: ${JSON.stringify(preparedWorkspace(context))}`,
