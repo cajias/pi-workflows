@@ -823,7 +823,7 @@ Input parsing reads the file only when the input omits `forge` or `prTiming`, th
 
 #### Autoimplement publication timing
 
-The `prTiming` input chooses when Autoimplement publishes. `early`, the default, commits, pushes, and opens or updates the pull request or merge request before review, exactly as upstream does. `end` keeps every implementation, verification, review, and fix round local. It pushes only after the review gate passes for the exact head it pushes, so no pull request or merge request exists before the first clean review.
+The `prTiming` input chooses when Autoimplement publishes. `early`, the default, commits, pushes, and opens or updates the pull request or merge request before review, exactly as upstream does. `end` keeps every implementation, verification, review, and fix round local. It pushes only after the review gate passes for the exact head it pushes, so no pull request or merge request exists until the review gate passes. The gate passes after a clean review, or after verified P2 work that follows a P2-only review, as described below.
 
 The `publication` route runs `routeVerifiedWorkspace`, a settings route that chooses one of four branches:
 

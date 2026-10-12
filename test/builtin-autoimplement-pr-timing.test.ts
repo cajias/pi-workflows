@@ -520,13 +520,13 @@ describe("autoimplement end-timing prompts", () => {
     const github = (await renderPrompt("decide", endPromptContext("github"))).split("\n");
     const merge = github.indexOf("Merge allowed now: false");
     expect(github[merge + 1]).toBe(
-      "Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single pull request.",
+      "Publication timing: end. Publication first commits locally; after the review gate passes, publication pushes once to the single pull request.",
     );
     const gitlab = (await renderPrompt("decide", endPromptContext("gitlab"))).split("\n");
     const gitlabMerge = gitlab.indexOf("Merge allowed now: false");
     expect(gitlab.slice(gitlabMerge + 1, gitlabMerge + 3)).toEqual([
       "Forge: gitlab. Publication uses one GitLab merge request through glab.",
-      "Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single merge request.",
+      "Publication timing: end. Publication first commits locally; after the review gate passes, publication pushes once to the single merge request.",
     ]);
     const early = await renderPrompt("decide", syntheticAutoimplementContext());
     expect(early).not.toContain("Publication timing");
@@ -559,14 +559,14 @@ describe("autoimplement end-timing prompts", () => {
     async (nodeId) => {
       const github = (await renderPrompt(nodeId, endPromptContext("github"))).split("\n");
       expect(github.at(-1)).toBe(
-        "Do not push and do not open or update a pull request. This run pushes only after review passes.",
+        "Do not push and do not open or update a pull request. This run pushes only after the review gate passes.",
       );
       const gitlab = (await renderPrompt(nodeId, endPromptContext("gitlab"))).split("\n");
       expect(gitlab.at(-1)).toBe(
-        "Do not push and do not open or update a merge request. This run pushes only after review passes.",
+        "Do not push and do not open or update a merge request. This run pushes only after the review gate passes.",
       );
       const early = await renderPrompt(nodeId, syntheticAutoimplementContext());
-      expect(early).not.toContain("This run pushes only after review passes.");
+      expect(early).not.toContain("This run pushes only after the review gate passes.");
     },
   );
 
@@ -602,7 +602,7 @@ describe("autoimplement end-timing prompts", () => {
       await renderPrompt("publish", endPromptContext("github", END_PROMPT_STEPS))
     ).split("\n");
     expect(lines[0]).toBe(
-      "Push exactly the reviewed local head local123 to the task branch without force. Review passed for this head, so create no new commits and do not amend or rewrite any commit.",
+      "Push exactly the reviewed local head local123 to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
     );
     expect(lines[1]).toBe(
       "If the local HEAD is not local123, do not push. Report the difference instead.",
@@ -1363,7 +1363,7 @@ describe.each(["github", "gitlab"] as const)("autoimplement %s × end", (forge) 
       const implement = executor.requests.find(
         (request) => request.contract.nodeId === "implement",
       );
-      expect(implement?.prompt).toContain("This run pushes only after review passes.");
+      expect(implement?.prompt).toContain("This run pushes only after the review gate passes.");
     },
     GRAPH_RUN_TIMEOUT_MS,
   );
@@ -1784,7 +1784,7 @@ describe("autoimplement default-branch work with prTiming end", () => {
       });
       for (const prompt of topLevelPrompts(executor)) {
         expect(prompt).not.toContain("Publication timing");
-        expect(prompt).not.toContain("This run pushes only after review passes.");
+        expect(prompt).not.toContain("This run pushes only after the review gate passes.");
       }
       expect(state.finalOutput).toMatchObject({ delivery: { pr: "none" }, reviewRounds: [] });
     },

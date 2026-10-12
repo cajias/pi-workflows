@@ -144,7 +144,7 @@ describe("reviewed publication text", () => {
   it("pushes exactly the reviewed head and reuses the one pull request on GitHub", () => {
     const lines = forgeText("github").publish.reviewed("abc123");
     expect(lines.slice(0, 2)).toEqual([
-      "Push exactly the reviewed local head abc123 to the task branch without force. Review passed for this head, so create no new commits and do not amend or rewrite any commit.",
+      "Push exactly the reviewed local head abc123 to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
       "If the local HEAD is not abc123, do not push. Report the difference instead.",
     ]);
     expect(lines).toContain(
@@ -175,10 +175,10 @@ describe("endTimingText", () => {
   it("names the pull request on GitHub", () => {
     const text = endTimingText("github");
     expect(text.noPush).toBe(
-      "Do not push and do not open or update a pull request. This run pushes only after review passes.",
+      "Do not push and do not open or update a pull request. This run pushes only after the review gate passes.",
     );
     expect(text.decide).toBe(
-      "Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single pull request.",
+      "Publication timing: end. Publication first commits locally; after the review gate passes, publication pushes once to the single pull request.",
     );
     expect(text.commitLocal[1]).toBe(
       "Never push, never open or update a pull request, and never amend or rewrite a commit that was already pushed.",

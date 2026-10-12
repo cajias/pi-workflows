@@ -66,10 +66,10 @@ const PUBLISH_BEFORE_REVIEW = "Commit and push the verified implementation befor
 const PUBLISH_DEPENDENCY_FINGERPRINT =
   "Include dependencyFingerprint only when a declared dependency result is relevant to review reuse.";
 
-/** The push of a reviewed local head. Review passed for exactly this head, so nothing may change it. */
+/** The push of a reviewed local head. This exact head passed the review gate, so nothing may change it. */
 function reviewedPushLines(headRevision: string): string[] {
   return [
-    `Push exactly the reviewed local head ${headRevision} to the task branch without force. Review passed for this head, so create no new commits and do not amend or rewrite any commit.`,
+    `Push exactly the reviewed local head ${headRevision} to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.`,
     `If the local HEAD is not ${headRevision}, do not push. Report the difference instead.`,
   ];
 }
@@ -315,8 +315,8 @@ const LOCAL_COMMIT_CHECKED =
 export function endTimingText(forge: Forge): EndTimingText {
   const { request } = forgeTerms(forge);
   return {
-    noPush: `Do not push and do not open or update a ${request}. This run pushes only after review passes.`,
-    decide: `Publication timing: end. Publication first commits locally; after review passes, publication pushes once to the single ${request}.`,
+    noPush: `Do not push and do not open or update a ${request}. This run pushes only after the review gate passes.`,
+    decide: `Publication timing: end. Publication first commits locally; after the review gate passes, publication pushes once to the single ${request}.`,
     commitLocal: [
       "Commit the verified work locally on the prepared task branch, so review runs on these commits before anything is published.",
       `Never push, never open or update a ${request}, and never amend or rewrite a commit that was already pushed.`,
