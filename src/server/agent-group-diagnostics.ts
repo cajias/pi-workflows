@@ -10,6 +10,7 @@ import type {
 import { errorMessage } from "../workflows/errors.js";
 
 const TERMINAL_STATES = new Set<PiAgentLifecycleState>(["completed", "failed", "cancelled"]);
+const QUEUED_PHASE = "cancelled: the session did not start";
 
 /**
  * The complete stderr stream of one headless pi child, in a private temporary file.
@@ -101,22 +102,29 @@ export class AgentLifecycleLedger {
   }
 
   /**
-   * Terminal facts for unsettled requests. Started requests take `state`; requests that never
-   * started are cancelled, as when a group stops before queued work runs.
+   * Terminal facts for unsettled requests. Started requests take `state` with `phase`;
+   * requests that never started are cancelled, as when a group stops before queued work runs.
    */
   unsettled(state: "cancelled" | "failed", phase: string): PiAgentLifecycleEvent[] {
     const events: PiAgentLifecycleEvent[] = [];
     for (const request of this.requests) {
       const record = this.latest.get(request.id);
-      if (record !== undefined && TERMINAL_STATES.has(record.event.state)) continue;
-      const started = record !== undefined;
-      const terminal = started ? state : "cancelled";
-      events.push({
-        ...(record?.event ?? { id: request.id, role: request.role, elapsedMs: 0 }),
-        state: terminal,
-        phase: `${terminal}: ${phase}`,
-        elapsedMs: started ? record.event.elapsedMs + this.now() - record.seenAt : 0,
-      });
+      if (record === undefined) {
+        events.push({
+          id: request.id,
+          role: request.role,
+          state: "cancelled",
+          phase: QUEUED_PHASE,
+          elapsedMs: 0,
+        });
+      } else if (!TERMINAL_STATES.has(record.event.state)) {
+        events.push({
+          ...record.event,
+          state,
+          phase: `${state}: ${phase}`,
+          elapsedMs: record.event.elapsedMs + this.now() - record.seenAt,
+        });
+      }
     }
     return events;
   }

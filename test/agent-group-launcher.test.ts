@@ -19,6 +19,7 @@ const FAKE_PI = path.resolve("test/fixtures/fake-agent-group-pi.mjs");
 const SETTLE_MS = 400;
 const UNSETTLED_CANCEL = "cancelled: headless pi did not report that the session settled";
 const UNFINISHED_RUN = "failed: headless pi stopped before the session finished";
+const NEVER_STARTED = "cancelled: the session did not start";
 
 function request(id: string): PiAgentRequest {
   return { id, role: `Role ${id}`, prompt: `Prompt ${id}`, cwd: "/repo", tools: ["read"] };
@@ -298,7 +299,7 @@ describe("headless pi agent group launcher", () => {
     expect(states(seen)).toEqual([
       "a:running:running",
       `a:cancelled:${UNSETTLED_CANCEL}`,
-      `b:cancelled:${UNSETTLED_CANCEL}`,
+      `b:cancelled:${NEVER_STARTED}`,
     ]);
     expect(seen[1]?.elapsedMs).toBeGreaterThanOrEqual(seen[0]?.elapsedMs ?? 0);
     expect(seen[2]).toMatchObject({ role: "Role b", elapsedMs: 0 });
@@ -349,7 +350,7 @@ describe("headless pi agent group launcher", () => {
     expect(states(seen)).toEqual([
       "a:running:running",
       `a:failed:${UNFINISHED_RUN}`,
-      "b:cancelled:cancelled: headless pi stopped before the session finished",
+      `b:cancelled:${NEVER_STARTED}`,
     ]);
     expect(await namedStderrLog(error)).toContain("provider crashed\n");
   });
