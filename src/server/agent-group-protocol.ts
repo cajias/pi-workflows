@@ -83,8 +83,12 @@ export function agentGroupIdOf(argument: string): string | undefined {
   }
 }
 
+/**
+ * One stderr record. The leading newline ends any partial line that other code in the Pi
+ * process wrote first, so that text cannot hide the event prefix.
+ */
 export function encodeAgentGroupEvent(event: AgentGroupEvent): string {
-  return `${AGENT_GROUP_EVENT_PREFIX}${JSON.stringify({ schema: EVENT_SCHEMA, ...event })}\n`;
+  return `\n${AGENT_GROUP_EVENT_PREFIX}${JSON.stringify({ schema: EVENT_SCHEMA, ...event })}\n`;
 }
 
 /** Decode one stderr line. Lines that are not valid bridge events return undefined. */

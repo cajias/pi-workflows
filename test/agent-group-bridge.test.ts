@@ -70,10 +70,13 @@ function loadBridge(): Bridge {
   const onShutdown = shutdown;
   return {
     get events() {
-      return stderrLines.flatMap((line) => {
-        const event = decodeAgentGroupEvent(line.trimEnd());
-        return event === undefined ? [] : [event];
-      });
+      return stderrLines
+        .join("")
+        .split("\n")
+        .flatMap((line) => {
+          const event = decodeAgentGroupEvent(line);
+          return event === undefined ? [] : [event];
+        });
     },
     command: handler,
     shutdown: onShutdown,
@@ -106,6 +109,8 @@ describe("agent group bridge", () => {
   it("announces itself and runs one group with lifecycle facts before the result", async () => {
     const bridge = loadBridge();
     expect(bridge.events).toEqual([{ type: "ready" }]);
+    // Each event starts a new line, so text that other code left unterminated cannot hide it.
+    expect(stderrLines).toEqual([expect.stringMatching(/^\nPI_WORKFLOWS_AGENT_GROUP \{.*\}\n$/u)]);
     groupRunner.run.mockImplementation(async (_requests, options) => {
       await options.onLifecycle?.({
         id: "review",
