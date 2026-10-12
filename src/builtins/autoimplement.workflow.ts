@@ -1638,7 +1638,7 @@ async function assertNotPushedBeforeGate(
   label: string,
 ): Promise<void> {
   const tracking = await pushTrackingHead(repository.repository, repository.branch);
-  if (tracking?.headRevision === undefined || tracking.headRevision === null) return;
+  if (tracking === undefined || tracking.headRevision === null) return;
   const published = lastPublishedHead(context, repository.id);
   if (published === tracking.headRevision) return;
   if (published === undefined) {

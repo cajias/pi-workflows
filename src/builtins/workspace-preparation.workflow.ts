@@ -258,9 +258,7 @@ async function pushRemote(repository: string, branch: string): Promise<string | 
     `branch.${branch}.remote`,
   ]) {
     const configured = await optionalGit(repository, ["config", "--get", key]);
-    if (configured !== undefined && configured.length > 0) {
-      return remotes.includes(configured) ? configured : undefined;
-    }
+    if (configured !== undefined) return remotes.includes(configured) ? configured : undefined;
   }
   return remotes.length === 1 ? remotes[0] : undefined;
 }
@@ -290,8 +288,10 @@ async function fetchRefspecTracks(
     return false;
   }
   return specs.some((spec) => {
-    const [from, to] = spec.replace(/^\+/, "").split(":", 2);
-    return to !== undefined && mapRefspec(from ?? "", to, source) === target;
+    const positive = spec.replace(/^\+/, "");
+    const colon = positive.indexOf(":");
+    if (colon < 0) return false;
+    return mapRefspec(positive.slice(0, colon), positive.slice(colon + 1), source) === target;
   });
 }
 
