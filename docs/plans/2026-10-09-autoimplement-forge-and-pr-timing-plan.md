@@ -1661,3 +1661,33 @@ These are out of scope for this plan.
   - If upstream reuses them for different content, mixed fork and upstream installs would silently
     accept each other's runs.
   - Re-check revisions when merging upstream.
+- F20: Settle durable per-agent tracks after an action times out or is cancelled.
+  - The gap: the `agents/<group>/<id>` tracks stay `running`. This predates the resolver host-peer
+    fix: `WorkflowEngine.publishUpdate` rejects updates once the attempt signal aborts
+    (`src/workflows/engine.ts:168-177`), and the engine stops waiting for an aborted action
+    (`src/workflows/engine.ts:1046`).
+  - Fix: the engine finalizes progress for aborted attempts.
+- F21: Revisit the 2,000-character agent error cap as a product decision.
+  - `MAX_ERROR_CHARS` (`src/builtins/pi-agent-launch.ts:59`, moved from
+    `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
+    not from a named external interface.
+  - `PiAgentGroupError.detail` keeps the complete cause.
+- F22: Let Sanity Check agent groups use built-in providers and run offline.
+  - The gap: a group accepts only a provider that a user extension registers, and it needs that
+    provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
+    refresh. Groups therefore fail with `PI_OFFLINE=1` (set in the user's `~/.zprofile`) and with
+    built-in providers such as `amazon-bedrock`.
+  - This predates the fix: `src/builtins/pi-agent-group.ts` at 2cb8ab3, lines 477 (user-scope
+    candidates), 521-532 (extension-registered owner check), and 298 and 400-404
+    (`models-store.json` snapshot).
+- F23: Prune kept agent group stderr logs.
+  - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
+    stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
+- F24: Install the live E2E candidate the way Pi does.
+  - `scripts/live-e2e.mjs:541-545` runs plain `npm install`, which installs the peer packages, so
+    it cannot catch a plain Node entry that value-imports a host-only Pi package. Add
+    `--legacy-peer-deps` to match `pi install`.
+- F25: Pin the `pi` and Node that headless Pi uses.
+  - Agent steps and agent groups spawn `pi` from the server's inherited `PATH`
+    (`src/server/headless-pi.ts:85-86`), and npm-installed `pi` starts through
+    `#!/usr/bin/env node`. A server started with a mise shim on `PATH` would run that Node.
