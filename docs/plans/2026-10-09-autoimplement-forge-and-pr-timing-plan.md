@@ -1676,7 +1676,7 @@ These are out of scope for this plan.
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
     refresh. Groups therefore fail with `PI_OFFLINE=1` (set in the user's `~/.zprofile`) and with
-    built-in providers such as `amazon-bedrock`.
+    providers built into Pi rather than registered by a user extension.
   - This predates the fix: `src/builtins/pi-agent-group.ts` at 2cb8ab3, lines 477 (user-scope
     candidates), 521-532 (extension-registered owner check), and 298 and 400-404
     (`models-store.json` snapshot).
@@ -1691,3 +1691,12 @@ These are out of scope for this plan.
   - Agent steps and agent groups spawn `pi` from the server's inherited `PATH`
     (`src/server/headless-pi.ts:85-86`), and npm-installed `pi` starts through
     `#!/usr/bin/env node`. A server started with a mise shim on `PATH` would run that Node.
+- F26: Make the timing-sensitive agent group test robust under load.
+  - `test/pi-agent-group.test.ts:1170` ("discovers a legacy provider owner and uses its configured
+    authentication") runs a real SDK session with the helper's `timeoutMs: 1_000`
+    (`test/pi-agent-group.test.ts:25`). It failed with "Pi agent legacy timed out: after 1000ms" on
+    the first full `npm run check` while concurrent gates ran: load average about 16-20
+    (`/tmp/resolver-peers-fix4-check.attempt1.log`) and about 24
+    (`/tmp/resolver-peers-int3-check.attempt1-flake.log`).
+  - It passed alone (3/3 and 36/36) and on full reruns. It predates the resolver host-peer fix,
+    which changed only its imports.
