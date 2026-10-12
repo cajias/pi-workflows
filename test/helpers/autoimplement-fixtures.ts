@@ -147,17 +147,21 @@ export function reviewOf(
 
 export type ScenarioForge = "github" | "gitlab";
 
+/** The pipeline status a GitLab head pipeline of the published head has for each CI route. */
+const HEAD_PIPELINE_STATUS: Record<string, string> = { green: "success", failed: "failed" };
+
 /**
- * The head pipeline a GitLab CI target reports for `headRevision`: successful when green, running
- * otherwise. GitHub targets report none.
+ * The branch pipeline a GitLab CI target reports for `headRevision`: successful when green, failed
+ * when failed, and running otherwise. GitHub targets report none.
  */
 export function headPipelineFields(
   forge: ScenarioForge,
   route: string,
   headRevision: string,
-): { headPipeline?: { sha: string; status: string } } {
+): { headPipeline?: { sha: string; status: string; ref: string } } {
   if (forge === "github") return {};
-  return { headPipeline: { sha: headRevision, status: route === "green" ? "success" : "running" } };
+  const status = HEAD_PIPELINE_STATUS[route] ?? "running";
+  return { headPipeline: { sha: headRevision, status, ref: "feat/demo" } };
 }
 
 export function ciInspection(
@@ -488,6 +492,8 @@ function goldenStep(index: number, nodeId: string, output: unknown): WorkflowSte
 export type SyntheticContextOptions = {
   merge?: boolean;
   pr?: string;
+  /** The published head revision. Defaults to {@link GOLDEN_HEAD}. */
+  headRevision?: string;
   /** Extra or replacement outputs, such as a recorded `resolveForge` result. */
   outputs?: Record<string, unknown>;
   settings?: Record<string, unknown>;
@@ -503,6 +509,7 @@ export function syntheticAutoimplementContext(
   options: SyntheticContextOptions = {},
 ): WorkflowNodeContext {
   const pr = options.pr ?? GOLDEN_PR;
+  const head = options.headRevision ?? GOLDEN_HEAD;
   const id = repositoryId(GOLDEN_REPOSITORY);
   const plan = { summary: "Ship the golden change", steps: ["change code", "verify"] };
   const publication = {
@@ -512,7 +519,7 @@ export function syntheticAutoimplementContext(
         repository: GOLDEN_REPOSITORY,
         branch: "feat/golden",
         baseBranch: "main",
-        headRevision: GOLDEN_HEAD,
+        headRevision: head,
         pr,
       },
     ],
@@ -538,7 +545,7 @@ export function syntheticAutoimplementContext(
         id,
         repository: GOLDEN_REPOSITORY,
         baseBranch: "main",
-        headRevision: GOLDEN_HEAD,
+        headRevision: head,
         invocationSucceeded: true,
         p0: [],
         p1: [],
@@ -600,7 +607,7 @@ export function syntheticAutoimplementContext(
       {
         id,
         repository: GOLDEN_REPOSITORY,
-        headRevision: GOLDEN_HEAD,
+        headRevision: head,
         pr,
         route: "pending",
         reason: "checks are running",

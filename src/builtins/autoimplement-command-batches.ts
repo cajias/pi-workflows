@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { MAX_COMMAND_BATCH_ITEMS, type CommandBatchItem } from "../workflows/command-batch.js";
-import { parseGitLabMergeRequestUrl } from "./autoimplement-forge.js";
+import { isFullCommitId, parseGitLabMergeRequestUrl } from "./autoimplement-forge.js";
 
 export const REVIEW_TIMEOUT_MS = 10 * 60_000;
 export const CI_WATCH_TIMEOUT_MS = 5 * 60_000;
@@ -35,8 +35,11 @@ export type LocalCommitRepositories = {
   repositories: CandidateRepository[];
 };
 
-/** The merge request's `head_pipeline` as a GitLab CI target reports it. */
-export type GitLabHeadPipeline = { sha: string; status: string };
+/**
+ * The merge request's `head_pipeline` as a GitLab CI target reports it. `parentIds` holds the
+ * `parent_ids` of the pipeline commit for a merged results or merge train pipeline.
+ */
+export type GitLabHeadPipeline = { sha: string; status: string; ref: string; parentIds?: string[] };
 
 export type CiTargetInspection = {
   id: string;
@@ -391,35 +394,81 @@ function parseGitLabCiCommand(
  * Reads the `head_pipeline` that a GitLab CI target reports, null when the merge request has none.
  *
  * The source-branch watch follows the newest pipeline of the branch, which can belong to another
- * commit or differ from the merge request's own pipeline. So a target is green only when the merge
- * request's head pipeline ran for the published head and succeeded.
+ * commit or differ from the merge request's own pipeline. So a green or failed target must name a
+ * head pipeline that ran for the published head, with status `success` or `failed`. It ran for that
+ * head when its sha is the head, or when it is a merged results or merge train pipeline of this
+ * merge request whose commit has the head as a parent.
  */
 export function parseGitLabHeadPipeline(
   value: unknown,
   route: string,
   headRevision: string,
+  iid: number,
   label: string,
 ): GitLabHeadPipeline | null {
   if (value === undefined) {
     throw new Error(
-      `${label}.headPipeline must report the merge request head_pipeline sha and status, or null when it has none`,
+      `${label}.headPipeline must report the merge request head_pipeline sha, status, and ref, or null when it has none`,
     );
   }
-  const pipeline = value === null ? null : headPipelineRecord(value, `${label}.headPipeline`);
-  if (route === "green" && (pipeline?.sha !== headRevision || pipeline.status !== "success")) {
+  const pipeline = value === null ? null : headPipelineRecord(value, iid, `${label}.headPipeline`);
+  if (route !== "green" && route !== "failed") return pipeline;
+  if (pipeline === null || !ranForHead(pipeline, headRevision, iid)) {
     throw new Error(
-      `${label} can be green only when the merge request head_pipeline has sha ${headRevision} and status success; reported ${JSON.stringify(pipeline)}`,
+      `${label} can be ${route} only when the merge request head_pipeline ran for the published head ${headRevision}: its sha is that head, or its ref is ${mergedResultsRefs(iid).join(" or ")} and that head is a parent; reported ${JSON.stringify(pipeline)}`,
+    );
+  }
+  const status = route === "green" ? "success" : "failed";
+  if (pipeline.status !== status) {
+    throw new Error(
+      `${label} can be ${route} only when the head_pipeline status is ${status}; reported ${pipeline.status}`,
     );
   }
   return pipeline;
 }
 
-function headPipelineRecord(value: unknown, label: string): GitLabHeadPipeline {
+/** The refs of the merged results and merge train pipelines of one merge request. */
+function mergedResultsRefs(iid: number): string[] {
+  return [`refs/merge-requests/${iid}/merge`, `refs/merge-requests/${iid}/train`];
+}
+
+function ranForHead(pipeline: GitLabHeadPipeline, headRevision: string, iid: number): boolean {
+  return (
+    pipeline.sha === headRevision ||
+    (mergedResultsRefs(iid).includes(pipeline.ref) &&
+      (pipeline.parentIds?.includes(headRevision) ?? false))
+  );
+}
+
+function headPipelineRecord(value: unknown, iid: number, label: string): GitLabHeadPipeline {
   const record = requireRecord(value, label);
+  const ref = requireString(record.ref, `${label}.ref`);
+  const parentIds =
+    record.parentIds === undefined && !mergedResultsRefs(iid).includes(ref)
+      ? undefined
+      : commitIds(record.parentIds, `${label}.parentIds`, ref);
   return {
-    sha: requireString(record.sha, `${label}.sha`),
+    sha: commitId(record.sha, `${label}.sha`),
     status: requireString(record.status, `${label}.status`),
+    ref,
+    ...(parentIds === undefined ? {} : { parentIds }),
   };
+}
+
+function commitId(value: unknown, label: string): string {
+  const sha = requireString(value, label);
+  if (!isFullCommitId(sha)) throw new Error(`${label} must be a full commit SHA: ${sha}`);
+  return sha;
+}
+
+/** The `parent_ids` of a pipeline commit: required for a merged results or merge train ref. */
+function commitIds(value: unknown, label: string, ref: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(
+      `${label} must list the full commit SHAs in parent_ids of the ${ref} pipeline commit`,
+    );
+  }
+  return value.map((entry, index) => commitId(entry, `${label}[${index}]`));
 }
 
 /** The one GitLab watch form the workflow runs: a live status with the branch and project explicit. */

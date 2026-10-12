@@ -180,16 +180,18 @@ const GITLAB_COORDINATES_RULE =
  * request's `head_pipeline` decides a route.
  */
 const GITLAB_HEAD_PIPELINE_RULES = [
-  "A target is green only when head_pipeline.sha equals the target's published headRevision and head_pipeline.status is success.",
-  "When head_pipeline names another sha, or its status is created, waiting_for_resource, preparing, pending, running, or scheduled, return pending, because the pipeline of the published head has not finished. When the merge request has no head_pipeline, return unavailable.",
-  'Report it on every target as headPipeline {"sha": "<head_pipeline.sha>", "status": "<head_pipeline.status>"}, or as headPipeline null when the merge request has no head_pipeline. The workflow rejects a green target without a successful head pipeline for its published head.',
+  "Judge each target by the merge request's head_pipeline. It ran for the published head when head_pipeline.sha equals the target's published headRevision, or when head_pipeline.ref is refs/merge-requests/<iid>/merge or refs/merge-requests/<iid>/train of this merge request and headRevision is a parent of head_pipeline.sha. For those two refs, read the commit with glab api --hostname <hostname> projects/<apiProject>/repository/commits/<head_pipeline.sha> and report its parent_ids.",
+  "Return green only when the head pipeline ran for the published head and its status is success. Return failed only when it ran for the published head and its status is failed.",
+  "Return pending when the head pipeline ran for another commit, or when its status is created, waiting_for_resource, preparing, waiting_for_callback, pending, running, scheduled, canceling, or manual, because the pipeline of the published head has not finished. A manual pipeline waits for a person to start a job.",
+  "Return unavailable when the merge request has no head_pipeline, or when the head pipeline of the published head is canceled or skipped, because no CI result exists for that head.",
+  'Report it on every target as headPipeline {"sha": "<head_pipeline.sha>", "status": "<head_pipeline.status>", "ref": "<head_pipeline.ref>"}, add "parentIds" with the parent_ids for a merge or train ref, or report headPipeline null when the merge request has no head_pipeline. The workflow rejects a green or failed target whose head pipeline did not run for its published head.',
 ] as const;
 
 const GITLAB_INSPECT_CI = [
   "Inspect every published merge request once without waiting for completion.",
   "Return one target per repository and current MR head.",
   CI_ROUTES,
-  "Read each merge request with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, and sha. For a failed pipeline, list its jobs with glab api --hostname <hostname> projects/<apiProject>/pipelines/<pipelineId>/jobs and read a failed job log with glab api --hostname <hostname> projects/<apiProject>/jobs/<jobId>/trace.",
+  "Read each merge request with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, sha, and ref. For a failed pipeline, list its jobs with glab api --hostname <hostname> projects/<apiProject>/pipelines/<pipelineId>/jobs and read a failed job log with glab api --hostname <hostname> projects/<apiProject>/jobs/<jobId>/trace.",
   ...GITLAB_HEAD_PIPELINE_RULES,
   "When pending, set trackingCommand to exactly the canonical glab tracking command listed for that target. The workflow accepts only glab ci status with --live or --wait, the published source branch, and the merge request project, with timeoutMs at most 300000 and maxOutputChars at most 1000000.",
   "The expected-output example shows both command forms and omits headPipeline. On this GitLab run use only the glab form and add headPipeline to every target.",

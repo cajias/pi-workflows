@@ -1865,7 +1865,10 @@ function parseCiInspectionForPublished(
   return forge === "gitlab" ? withInspectedHeadPipelines(value, inspected) : inspected;
 }
 
-/** Adds the reported GitLab head pipeline to every inspected target and checks green against it. */
+/**
+ * Adds the reported GitLab head pipeline to every inspected target and checks a green or failed
+ * target against it.
+ */
 function withInspectedHeadPipelines(
   value: unknown,
   inspected: CiInspectionBatch,
@@ -1879,6 +1882,7 @@ function withInspectedHeadPipelines(
         requireRecord(raw[index], `CI targets[${index}]`).headPipeline,
         target.route,
         target.headRevision,
+        parseGitLabMergeRequestUrl(target.pr, `CI targets[${index}].pr`).iid,
         `CI targets[${index}]`,
       ),
     })),
@@ -1893,29 +1897,36 @@ type TrackedCiTarget = {
 };
 
 /**
- * Adds the reported GitLab head pipeline to every tracked target. A target is green only when the
- * merge request's head pipeline ran for the published head of that target and succeeded.
+ * Adds the reported GitLab head pipeline to every tracked target. A green or failed target must
+ * name a head pipeline that ran for the published head of its merge request.
  */
 function withTrackedHeadPipelines(
   raw: readonly unknown[],
   targets: readonly TrackedCiTarget[],
   context: WorkflowNodeContext,
 ): TrackedCiTarget[] {
-  const heads = new Map(
+  const published = new Map(
     currentPublishedRepositories(context).repositories.map(
-      (repository) => [repository.id, repository.headRevision] as const,
+      (repository) => [repository.id, repository] as const,
     ),
   );
   return targets.map((target, index) => {
-    const headRevision = heads.get(target.id);
-    if (headRevision === undefined) {
+    const repository = published.get(target.id);
+    if (repository === undefined) {
       throw new Error(`tracked CI assessment target is not a published repository: ${target.id}`);
     }
     const label = `tracked CI assessment targets[${index}]`;
+    const { iid } = parseGitLabMergeRequestUrl(repository.pr, `${label} published pr`);
     const pipeline = requireRecord(raw[index], label).headPipeline;
     return {
       ...target,
-      headPipeline: parseGitLabHeadPipeline(pipeline, target.route, headRevision, label),
+      headPipeline: parseGitLabHeadPipeline(
+        pipeline,
+        target.route,
+        repository.headRevision,
+        iid,
+        label,
+      ),
     };
   });
 }

@@ -1487,6 +1487,11 @@ describe.each(["github", "gitlab"] as const)("autoimplement %s × end", (forge) 
   );
 });
 
+/** A GitLab branch pipeline of the fixture task branch. */
+function branchPipeline(sha: string | undefined, status: string) {
+  return { sha, status, ref: "feat/demo" };
+}
+
 /** Submits an invalid output the way a model would, and returns the validation error it gets. */
 async function refusedOutput(request: AgentStepRequest, output: unknown): Promise<string> {
   const result = await request.accept(output);
@@ -1542,6 +1547,59 @@ describe("autoimplement end publication before review", () => {
   );
 });
 
+describe("autoimplement GitLab CI with only unrelated failures", () => {
+  it(
+    "offers delivery only after a failed head pipeline of the published head",
+    async () => {
+      const refusals: string[] = [];
+      const { state, work } = await runTiming("gitlab-unrelated-failures", {
+        forge: "gitlab",
+        prTiming: "early",
+        inspectCi: async (request, local) => {
+          const failed = (headPipeline: unknown) => {
+            const inspection = ciInspection(
+              fixture.repository,
+              "failed",
+              local.head,
+              prFor("gitlab"),
+            );
+            return {
+              targets: inspection.targets.map((entry) => ({
+                ...entry,
+                unrelatedFailures: ["external job timed out"],
+                headPipeline,
+              })),
+            };
+          };
+          for (const stale of [null, branchPipeline("9".repeat(40), "failed")]) {
+            refusals.push(await refusedOutput(request, failed(stale)));
+          }
+          return await acceptedOutput(request, failed(branchPipeline(local.head, "failed")));
+        },
+      });
+      expect(state.status, state.error).toBe("completed");
+      expect(refusals).toHaveLength(2);
+      for (const error of refusals) {
+        expect(error).toContain(
+          `CI targets[0] can be failed only when the merge request head_pipeline ran for the published head ${work.head}`,
+        );
+      }
+      const ciResult = state.steps.findIndex((entry) => entry.nodeId === "ciResult");
+      expect(state.steps[ciResult]?.output).toMatchObject({
+        sourceNode: "inspectCi",
+        result: {
+          route: "failed",
+          unrelatedFailures: ["external job timed out"],
+          targets: [{ headPipeline: branchPipeline(work.head, "failed") }],
+        },
+      });
+      expect(routesAfter(state, ciResult)).toEqual(["delivery", "ci", "blocked"]);
+      expect(okSteps(state, "finalizeDelivery")).toHaveLength(1);
+    },
+    GRAPH_RUN_TIMEOUT_MS,
+  );
+});
+
 describe("autoimplement GitLab CI after a second publication", () => {
   it(
     "never reports green for an old, running, failed, or missing head pipeline of the new head",
@@ -1573,26 +1631,23 @@ describe("autoimplement GitLab CI after a second publication", () => {
           if (inspections > 1) {
             return await acceptedOutput(
               request,
-              target("green", { sha: second, status: "success" }),
+              target("green", branchPipeline(second, "success")),
             );
           }
           for (const headPipeline of [
-            { sha: first, status: "success" },
-            { sha: second, status: "running" },
+            branchPipeline(first, "success"),
+            branchPipeline(second, "running"),
             null,
           ]) {
             refusals.inspectCi!.push(await refusedOutput(request, target("green", headPipeline)));
           }
-          return await acceptedOutput(
-            request,
-            target("pending", { sha: first, status: "success" }),
-          );
+          return await acceptedOutput(request, target("pending", branchPipeline(first, "success")));
         },
         assessTrackedCi: async (request, local) => {
           const [first, second] = local.heads;
           for (const headPipeline of [
-            { sha: second, status: "failed" },
-            { sha: first, status: "success" },
+            branchPipeline(second, "failed"),
+            branchPipeline(first, "success"),
             null,
           ]) {
             refusals.assessTrackedCi!.push(
@@ -1601,19 +1656,22 @@ describe("autoimplement GitLab CI after a second publication", () => {
           }
           return await acceptedOutput(
             request,
-            trackedAssessment("pending", green({ sha: second, status: "running" })),
+            trackedAssessment("pending", green(branchPipeline(second, "running"))),
           );
         },
       });
       expect(state.status, state.error).toBe("completed");
       const [first, second] = work.heads;
       expect(okSteps(state, "publish").map(headsOf)).toEqual([[first], [second]]);
-      const expected = `can be green only when the merge request head_pipeline has sha ${second} and status success`;
+      const expected = "can be green only when the";
       expect(refusals.inspectCi).toHaveLength(3);
       expect(refusals.assessTrackedCi).toHaveLength(3);
       for (const error of [...refusals.inspectCi!, ...refusals.assessTrackedCi!]) {
         expect(error).toContain(expected);
       }
+      expect(refusals.inspectCi![0]).toContain(`ran for the published head ${second}`);
+      expect(refusals.inspectCi![1]).toContain("status is success; reported running");
+      expect(refusals.assessTrackedCi![0]).toContain("status is success; reported failed");
       // A pending assessment runs more local tests, and the controller then inspects CI again.
       const ids = nodeIdsOf(state);
       expect(ids.slice(ids.indexOf("assessTrackedCi") + 1, ids.lastIndexOf("inspectCi"))).toEqual([
@@ -1630,11 +1688,11 @@ describe("autoimplement GitLab CI after a second publication", () => {
       ]);
       expect(okSteps(state, "assessTrackedCi")[0]?.output).toMatchObject({
         route: "pending",
-        targets: [{ headPipeline: { sha: second, status: "running" } }],
+        targets: [{ headPipeline: branchPipeline(second, "running") }],
       });
       expect(okSteps(state, "inspectCi").map((entry) => entry.output)).toMatchObject([
-        { route: "pending", targets: [{ headPipeline: { sha: first, status: "success" } }] },
-        { route: "green", targets: [{ headPipeline: { sha: second, status: "success" } }] },
+        { route: "pending", targets: [{ headPipeline: branchPipeline(first, "success") }] },
+        { route: "green", targets: [{ headPipeline: branchPipeline(second, "success") }] },
       ]);
       expect(okSteps(state, "opportunisticTest")).toHaveLength(1);
       expect(ids.indexOf("finalizeDelivery")).toBeGreaterThan(ids.lastIndexOf("inspectCi"));

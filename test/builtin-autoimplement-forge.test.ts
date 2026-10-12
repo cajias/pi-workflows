@@ -936,7 +936,9 @@ describe("autoimplement forge graph shape", () => {
           pr,
           route: "pending",
           reason: "running",
-          ...(command === "glab" ? { headPipeline: { sha: "abc123", status: "running" } } : {}),
+          ...(command === "glab"
+            ? { headPipeline: { sha: "1".repeat(40), status: "running", ref: "feat/demo" } }
+            : {}),
           trackingCommand: {
             id: repositoryId(repository),
             command,
@@ -1172,13 +1174,13 @@ describe("autoimplement GitLab prompts", () => {
     };
     expect(lines).toContain(`Canonical glab tracking commands: ${JSON.stringify([canonical])}`);
     expect(lines.join("\n")).toContain(
-      "glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, and sha.",
+      "glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, sha, and ref.",
     );
     expect(lines).toContain(
       "The expected-output example shows both command forms and omits headPipeline. On this GitLab run use only the glab form and add headPipeline to every target.",
     );
     expect(lines).toContain(
-      "A target is green only when head_pipeline.sha equals the target's published headRevision and head_pipeline.status is success.",
+      "Return green only when the head pipeline ran for the published head and its status is success. Return failed only when it ran for the published head and its status is failed.",
     );
     expect(lines.at(-2)).toBe(GITLAB_COORDINATES);
   });
@@ -1195,7 +1197,13 @@ describe("autoimplement GitLab prompts", () => {
       "The watch follows the newest pipeline of the source branch, so its output can show another pipeline than the merge request's. Before you return any target route, including green and failed, read the merge request with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and judge its head_pipeline, not the watch output.",
     );
     expect(lines).toContain(
-      "When head_pipeline names another sha, or its status is created, waiting_for_resource, preparing, pending, running, or scheduled, return pending, because the pipeline of the published head has not finished. When the merge request has no head_pipeline, return unavailable.",
+      "Return pending when the head pipeline ran for another commit, or when its status is created, waiting_for_resource, preparing, waiting_for_callback, pending, running, scheduled, canceling, or manual, because the pipeline of the published head has not finished. A manual pipeline waits for a person to start a job.",
+    );
+    expect(lines).toContain(
+      "Return unavailable when the merge request has no head_pipeline, or when the head pipeline of the published head is canceled or skipped, because no CI result exists for that head.",
+    );
+    expect(lines.join("\n")).toContain(
+      "read the commit with glab api --hostname <hostname> projects/<apiProject>/repository/commits/<head_pipeline.sha> and report its parent_ids.",
     );
     expect(lines.at(-3)).toBe(GITLAB_COORDINATES);
     expect(lines.at(-2)).toMatch(/^Initial inspection: /u);
@@ -1439,98 +1447,175 @@ describe("autoimplement forge-aware validation errors", () => {
 });
 
 describe("autoimplement GitLab CI head pipeline", () => {
+  const HEAD = "c".repeat(40);
+  const OLDER = "b".repeat(40);
+  const MERGE = "d".repeat(40);
+  const TARGET = "e".repeat(40);
+  const gitlabContext = () =>
+    syntheticAutoimplementContext({
+      pr: GITLAB_MR,
+      headRevision: HEAD,
+      outputs: { resolveForge: DETECTED_GITLAB },
+    });
   const validatorOf = (nodeId: "inspectCi" | "assessTrackedCi") => {
     const node = autoimplementWorkflow.nodes[nodeId];
     if (node?.nodeType !== "agent" || node.validate === undefined) {
       throw new Error(`${nodeId} must be a validated agent node`);
     }
     const validate = node.validate;
-    return async (value: unknown, outputs: Record<string, unknown> = {}) =>
-      await validate(
-        value,
-        syntheticAutoimplementContext({
-          pr: GITLAB_MR,
-          outputs: { resolveForge: DETECTED_GITLAB, ...outputs },
-        }),
-      );
+    return async (value: unknown) => await validate(value, gitlabContext());
   };
   const inspect = validatorOf("inspectCi");
   const assess = validatorOf("assessTrackedCi");
-  const inspection = (route: string, extra: Record<string, unknown>) => ({
+  const inspection = (
+    route: string,
+    headPipeline: unknown,
+    extra: Record<string, unknown> = {},
+  ) => ({
     targets: [
       {
         repository: "/golden/repository",
-        headRevision: "abc123",
+        headRevision: HEAD,
         pr: GITLAB_MR,
         route,
         reason: route,
+        ...(headPipeline === undefined ? {} : { headPipeline }),
         ...extra,
       },
     ],
   });
-  const assessment = (route: string, extra: Record<string, unknown>) => ({
+  const assessment = (route: string, headPipeline: unknown) => ({
     route,
     reason: route,
-    targets: [{ id: GOLDEN_ID, route, reason: route, ...extra }],
+    targets: [
+      {
+        id: GOLDEN_ID,
+        route,
+        reason: route,
+        ...(headPipeline === undefined ? {} : { headPipeline }),
+      },
+    ],
   });
-  const success = { sha: "abc123", status: "success" };
-  const notGreen = [
-    { sha: "older00", status: "success" },
-    { sha: "abc123", status: "running" },
-    { sha: "abc123", status: "failed" },
-    { sha: "abc123", status: "skipped" },
+  const pipeline = (status: string, ref: string, sha = HEAD, parentIds?: string[]) => ({
+    sha,
+    status,
+    ref,
+    ...(parentIds === undefined ? {} : { parentIds }),
+  });
+  /** Head pipelines that ran for the published head: branch, detached, merged results, and train. */
+  const forHead = (status: string) => [
+    pipeline(status, "feat/golden"),
+    pipeline(status, "refs/merge-requests/7/head"),
+    pipeline(status, "refs/merge-requests/7/merge", MERGE, [TARGET, HEAD]),
+    pipeline(status, "refs/merge-requests/7/train", MERGE, [TARGET, HEAD]),
+  ];
+  /** Head pipelines that did not run for the published head. */
+  const notForHead = (status: string) => [
+    pipeline(status, "feat/golden", OLDER),
+    pipeline(status, "refs/merge-requests/8/merge", MERGE, [TARGET, HEAD]),
+    pipeline(status, "refs/merge-requests/7/merge", MERGE, [TARGET, OLDER]),
+    pipeline(status, "refs/merge-requests/7/head/merge", MERGE, [TARGET, HEAD]),
     null,
   ];
 
-  it("accepts a green inspection only for a successful head pipeline of the published head", async () => {
-    await expect(inspect(inspection("green", { headPipeline: success }))).resolves.toMatchObject({
-      route: "green",
-      targets: [{ route: "green", headPipeline: success }],
-    });
-    for (const headPipeline of notGreen) {
-      await expect(inspect(inspection("green", { headPipeline }))).rejects.toThrow(
-        `CI targets[0] can be green only when the merge request head_pipeline has sha abc123 and status success; reported ${JSON.stringify(headPipeline)}`,
-      );
-    }
-    await expect(inspect(inspection("unavailable", { headPipeline: null }))).resolves.toMatchObject(
-      { targets: [{ route: "unavailable", headPipeline: null }] },
-    );
-    await expect(
-      inspect(inspection("failed", { headPipeline: { sha: "abc123", status: "failed" } })),
-    ).resolves.toMatchObject({ targets: [{ headPipeline: { status: "failed" } }] });
-  });
+  it.each(["inspectCi", "assessTrackedCi"] as const)(
+    "%s accepts green and failed only for a head pipeline of the published head",
+    async (nodeId) => {
+      const submit = nodeId === "inspectCi" ? inspect : assess;
+      const build = nodeId === "inspectCi" ? inspection : assessment;
+      const label = nodeId === "inspectCi" ? "CI targets[0]" : "tracked CI assessment targets[0]";
+      for (const [route, status] of [
+        ["green", "success"],
+        ["failed", "failed"],
+      ] as const) {
+        for (const headPipeline of forHead(status)) {
+          await expect(submit(build(route, headPipeline))).resolves.toMatchObject({
+            targets: [{ route, headPipeline }],
+          });
+        }
+        for (const headPipeline of notForHead(status)) {
+          await expect(submit(build(route, headPipeline))).rejects.toThrow(
+            `${label} can be ${route} only when the merge request head_pipeline ran for the published head ${HEAD}: its sha is that head, or its ref is refs/merge-requests/7/merge or refs/merge-requests/7/train and that head is a parent; reported ${JSON.stringify(headPipeline)}`,
+          );
+        }
+      }
+      for (const [route, status] of [
+        ["green", "failed"],
+        ["green", "running"],
+        ["green", "skipped"],
+        ["failed", "success"],
+        ["failed", "canceled"],
+      ] as const) {
+        await expect(submit(build(route, pipeline(status, "feat/golden")))).rejects.toThrow(
+          `${label} can be ${route} only when the head_pipeline status is ${route === "green" ? "success" : "failed"}; reported ${status}`,
+        );
+      }
+      // A pending inspection needs a watch, so an unavailable one shows the same rule there.
+      const other = nodeId === "inspectCi" ? "unavailable" : "pending";
+      for (const headPipeline of [...notForHead("running"), pipeline("canceled", "feat/golden")]) {
+        await expect(submit(build(other, headPipeline))).resolves.toMatchObject({
+          targets: [{ route: other, headPipeline }],
+        });
+      }
+    },
+  );
 
-  it("requires every GitLab inspection target to report its head pipeline", async () => {
-    await expect(inspect(inspection("unavailable", {}))).rejects.toThrow(
-      "CI targets[0].headPipeline must report the merge request head_pipeline sha and status, or null when it has none",
+  it("requires a strict head pipeline shape on every GitLab target", async () => {
+    await expect(inspect(inspection("unavailable", undefined))).rejects.toThrow(
+      "CI targets[0].headPipeline must report the merge request head_pipeline sha, status, and ref, or null when it has none",
     );
-    await expect(inspect(inspection("failed", { headPipeline: "abc123" }))).rejects.toThrow(
-      "CI targets[0].headPipeline must be an object",
-    );
-    await expect(
-      inspect(inspection("failed", { headPipeline: { sha: "abc123" } })),
-    ).rejects.toThrow("CI targets[0].headPipeline.status must be a non-empty string");
-  });
-
-  it("accepts a green tracked assessment only for a successful head pipeline of the published head", async () => {
-    await expect(assess(assessment("green", { headPipeline: success }))).resolves.toMatchObject({
-      route: "green",
-      targets: [{ id: GOLDEN_ID, route: "green", headPipeline: success }],
-    });
-    for (const headPipeline of notGreen) {
-      await expect(assess(assessment("green", { headPipeline }))).rejects.toThrow(
-        "tracked CI assessment targets[0] can be green only when the merge request head_pipeline has sha abc123 and status success",
-      );
-    }
-    await expect(assess(assessment("green", {}))).rejects.toThrow(
+    await expect(assess(assessment("pending", undefined))).rejects.toThrow(
       "tracked CI assessment targets[0].headPipeline must report the merge request head_pipeline",
     );
-    await expect(
-      assess(assessment("pending", { headPipeline: { sha: "older00", status: "success" } })),
-    ).resolves.toMatchObject({
-      route: "pending",
-      targets: [{ headPipeline: { sha: "older00" } }],
+    const rejected: Array<[unknown, string]> = [
+      ["sha", "CI targets[0].headPipeline must be an object"],
+      [
+        { sha: HEAD, status: "running" },
+        "CI targets[0].headPipeline.ref must be a non-empty string",
+      ],
+      [
+        { sha: HEAD, ref: "feat/golden" },
+        "CI targets[0].headPipeline.status must be a non-empty string",
+      ],
+      [
+        pipeline("running", "feat/golden", "abc123"),
+        "CI targets[0].headPipeline.sha must be a full commit SHA: abc123",
+      ],
+      [
+        pipeline("running", "refs/merge-requests/7/merge", MERGE),
+        "CI targets[0].headPipeline.parentIds must list the full commit SHAs in parent_ids of the refs/merge-requests/7/merge pipeline commit",
+      ],
+      [
+        pipeline("running", "refs/merge-requests/7/train", MERGE, []),
+        "CI targets[0].headPipeline.parentIds must list the full commit SHAs in parent_ids of the refs/merge-requests/7/train pipeline commit",
+      ],
+      [
+        pipeline("running", "refs/merge-requests/7/merge", MERGE, [TARGET, "abc123"]),
+        "CI targets[0].headPipeline.parentIds[1] must be a full commit SHA: abc123",
+      ],
+      [
+        pipeline("running", "feat/golden", HEAD, ["abc123"]),
+        "CI targets[0].headPipeline.parentIds[0] must be a full commit SHA: abc123",
+      ],
+    ];
+    for (const [headPipeline, error] of rejected) {
+      await expect(inspect(inspection("unavailable", headPipeline))).rejects.toThrow(error);
+    }
+    await expect(inspect(inspection("unavailable", null))).resolves.toMatchObject({
+      targets: [{ route: "unavailable", headPipeline: null }],
     });
+  });
+
+  it("rejects a GitLab failure judged on another commit even with only unrelated failures", async () => {
+    const unrelated = { relatedFailures: [], unrelatedFailures: ["flaky external job"] };
+    for (const headPipeline of [null, pipeline("failed", "feat/golden", OLDER)]) {
+      await expect(inspect(inspection("failed", headPipeline, unrelated))).rejects.toThrow(
+        "CI targets[0] can be failed only when the merge request head_pipeline ran for the published head",
+      );
+    }
+    await expect(
+      inspect(inspection("failed", pipeline("failed", "feat/golden"), unrelated)),
+    ).resolves.toMatchObject({ route: "failed", unrelatedFailures: ["flaky external job"] });
   });
 
   it("refuses a tracked target that is no published repository", async () => {
@@ -1541,15 +1626,12 @@ describe("autoimplement GitLab CI head pipeline", () => {
           repository: "/other",
           branch: "feat/golden",
           baseBranch: "main",
-          headRevision: "abc123",
+          headRevision: HEAD,
           pr: GITLAB_MR,
         },
       ],
     };
-    const context = syntheticAutoimplementContext({
-      pr: GITLAB_MR,
-      outputs: { resolveForge: DETECTED_GITLAB },
-    });
+    const context = gitlabContext();
     const node = autoimplementWorkflow.nodes.assessTrackedCi;
     if (node?.nodeType !== "agent" || node.validate === undefined) {
       throw new Error("assessTrackedCi must be a validated agent node");
@@ -1560,7 +1642,7 @@ describe("autoimplement GitLab CI head pipeline", () => {
     );
     await expect(
       Promise.resolve().then(() =>
-        validate(assessment("green", { headPipeline: success }), {
+        validate(assessment("green", pipeline("success", "feat/golden")), {
           ...context,
           state: { ...context.state, steps },
         }),
@@ -1579,9 +1661,10 @@ describe("autoimplement GitLab CI head pipeline", () => {
           repository: "/golden/repository",
           headRevision: "abc123",
           pr: GOLDEN_PR,
-          route: "green",
-          reason: "green",
-          headPipeline: { sha: "other", status: "failed" },
+          route: "failed",
+          reason: "failed",
+          unrelatedFailures: ["flaky"],
+          headPipeline: { sha: "other", status: "success" },
         },
       ],
     };
