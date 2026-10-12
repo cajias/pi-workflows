@@ -10,6 +10,7 @@ import {
   parseWorkspacePreparationInput,
   prepareWorkspace,
   pushTrackingHead,
+  refUpdates,
   validateBranchName,
   workspacePreparationWorkflow,
   type WorkspacePreparationInput,
@@ -538,6 +539,47 @@ describe("push tracking head", () => {
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
     await fetchSpecs("+refs/heads/feat/x/*:refs/remotes/origin/*");
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+  });
+
+  it("reads the push and fetch entries of a remote-tracking reflog", async () => {
+    const { repo, head, bare } = await taskBranch("tracking-reflog");
+    const ref = "refs/remotes/origin/feat/x";
+    expect(await refUpdates(repo, ref)).toEqual([]);
+    await execFileAsync("git", ["push", "-q", "origin", "feat/x"], {
+      cwd: repo,
+      env: { ...process.env, GIT_COMMITTER_DATE: "2030-01-01T00:00:00Z" },
+    });
+    const other = path.join(path.dirname(bare), "other");
+    await git(path.dirname(bare), ["clone", "-q", "-b", "feat/x", bare, other]);
+    await git(other, ["config", "user.name", "Other"]);
+    await git(other, ["config", "user.email", "other@example.com"]);
+    await fs.writeFile(path.join(other, "other.txt"), "other\n");
+    await git(other, ["add", "other.txt"]);
+    await git(other, ["commit", "-q", "-m", "other"]);
+    await git(other, ["push", "-q", "origin", "feat/x"]);
+    await git(repo, ["fetch", "-q", "origin"]);
+    const fetched = await git(other, ["rev-parse", "HEAD"]);
+    const updates = await refUpdates(repo, ref);
+    expect(updates).toHaveLength(2);
+    expect(updates[0]).toMatchObject({
+      headRevision: fetched,
+      message: "fetch -q origin: fast-forward",
+    });
+    expect(updates[1]).toEqual({
+      headRevision: head,
+      seconds: 1893456000,
+      message: "update by push",
+    });
+  });
+
+  it("finds no reflog when Git does not log ref updates", async () => {
+    const { repo } = await taskBranch("tracking-no-reflog");
+    await git(repo, ["config", "core.logAllRefUpdates", "false"]);
+    await git(repo, ["push", "-q", "origin", "feat/x"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
+      headRevision: expect.any(String),
+    });
+    expect(await refUpdates(repo, "refs/remotes/origin/feat/x")).toEqual([]);
   });
 
   it("gives no tracking ref without a remote and reads commit times", async () => {

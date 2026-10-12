@@ -95,6 +95,8 @@ import workspacePreparationWorkflow, {
   commitTimeSeconds,
   inspectLocalHead,
   pushTrackingHead,
+  refUpdates,
+  type RefUpdate,
   parsePreparedWorkspace,
   type PreparedWorkspace,
   type WorkspaceMode,
@@ -1625,12 +1627,47 @@ function lastPublishedHead(context: WorkflowNodeContext, id: string): string | u
   return recordedHeads(step).find((repository) => repository.id === id)?.headRevision;
 }
 
+/** Steps that may push: each attempt's time window excuses the pushes made during it. */
+const PUSHING_NODES: ReadonlySet<string> = new Set(["publish", "verifyP2"]);
+
+const PUSH_BEFORE_GATE_GUIDANCE =
+  "Do not push before the review gate passes; under prTiming end this run pushes only a reviewed head. Pushed commits cannot be withdrawn without a force push, so the controller should choose blocked.";
+
 /**
- * Under `prTiming: end`, nothing is pushed before the review gate passes. When the push destination
- * of the task branch is known and its tracking ref exists, the ref must not have moved. After a
- * publication of this run it records that published head. Before any publication it records a
- * commit made before the run started, because the run records no tracking value from before its
- * first local commit, and every commit the run makes is newer than its start. Local refs only.
+ * When this run started, in milliseconds: the start of its first recorded step. Step records are
+ * persisted, so a resume keeps this value, while the run state's own start can be rebuilt then.
+ */
+function runStartMs(context: WorkflowNodeContext): number {
+  return Date.parse(context.state.steps[0]?.startedAt ?? context.state.startedAt);
+}
+
+/** True when the whole second `seconds` overlaps the closed interval from `from` to `to` in ms. */
+function secondOverlaps(seconds: number, from: number, to: number): boolean {
+  return seconds * 1000 <= to && seconds * 1000 + 999 >= from;
+}
+
+/**
+ * True when a push logged in this clone belongs to this run's publication: it happened during a
+ * `publish` or `verifyP2` attempt, which may have failed after pushing, or it pushed a head that an
+ * accepted publication recorded, such as one pushed by an attempt that a runner restart replaced.
+ */
+function publicationPush(context: WorkflowNodeContext, update: RefUpdate): boolean {
+  return context.state.steps.some(
+    (step) =>
+      PUSHING_NODES.has(step.nodeId) &&
+      (secondOverlaps(update.seconds, Date.parse(step.startedAt), Date.parse(step.finishedAt)) ||
+        (step.outcome === "ok" &&
+          recordedHeads(step).some((head) => head.headRevision === update.headRevision))),
+  );
+}
+
+/**
+ * Under `prTiming: end`, nothing is pushed before the review gate passes. The evidence is the reflog
+ * of the push destination's remote-tracking ref in this clone: an `update by push` entry written
+ * after the run started must belong to a publication of this run. Fetch and pull entries are
+ * ignored, so commits that someone else added on the forge do not block the run. Without a reflog
+ * the ref value decides: it must record the newest head this run published, or, before any
+ * publication, a commit made before the run started. Local refs only.
  */
 async function assertNotPushedBeforeGate(
   repository: CandidateRepository,
@@ -1639,18 +1676,28 @@ async function assertNotPushedBeforeGate(
 ): Promise<void> {
   const tracking = await pushTrackingHead(repository.repository, repository.branch);
   if (tracking === undefined || tracking.headRevision === null) return;
+  const start = runStartMs(context);
+  const updates = await refUpdates(repository.repository, tracking.ref);
+  if (updates.length > 0) {
+    const stray = updates.find(
+      (update) =>
+        update.message === "update by push" &&
+        secondOverlaps(update.seconds, start, Number.POSITIVE_INFINITY) &&
+        !publicationPush(context, update),
+    );
+    if (stray === undefined) return;
+    throw new Error(
+      `${label}: this clone pushed ${stray.headRevision} to ${tracking.ref} at ${new Date(stray.seconds * 1000).toISOString()}, outside every publication of this run. ${PUSH_BEFORE_GATE_GUIDANCE}`,
+    );
+  }
   const published = lastPublishedHead(context, repository.id);
   if (published === tracking.headRevision) return;
   if (published === undefined) {
     const committed = await commitTimeSeconds(repository.repository, tracking.headRevision);
-    if (committed * 1000 < Date.parse(context.state.startedAt)) return;
+    if (committed * 1000 < start) return;
   }
-  const moved =
-    published === undefined
-      ? "a commit made during this run"
-      : `not the published head ${published}`;
   throw new Error(
-    `${label}: ${tracking.ref} moved to ${tracking.headRevision}, ${moved}. Do not push before the review gate passes; under prTiming end this run pushes only a reviewed head. Pushed commits cannot be withdrawn without a force push, so the controller should choose blocked.`,
+    `${label}: ${tracking.ref} moved to ${tracking.headRevision}, a commit this run did not publish (pushed by this run or by someone else). Git keeps no reflog for that ref, so the workflow cannot tell who moved it. ${PUSH_BEFORE_GATE_GUIDANCE}`,
   );
 }
 

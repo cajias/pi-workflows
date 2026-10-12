@@ -310,6 +310,30 @@ function mapRefspec(from: string, to: string, name: string): string | undefined 
   return to.replace("*", name.slice(prefix.length, name.length - suffix.length));
 }
 
+/** One reflog entry of a ref: the commit it set, when it was written, and its message. */
+export type RefUpdate = { headRevision: string; seconds: number; message: string };
+
+/**
+ * The reflog of a ref in this clone, newest first. It is empty when Git keeps no reflog for the ref,
+ * for example with `core.logAllRefUpdates` off. A push of a branch logs `update by push` on the
+ * remote-tracking ref it updates, while a fetch or pull logs its own command.
+ */
+export async function refUpdates(repository: string, ref: string): Promise<RefUpdate[]> {
+  const log = await optionalGit(repository, [
+    "log",
+    "--walk-reflogs",
+    "--date=unix",
+    "--format=%H%x09%gd%x09%gs",
+    ref,
+    "--",
+  ]);
+  return (log ?? "").split(/\r?\n/).flatMap((line) => {
+    const entry = /^([0-9a-f]+)\t.*@\{(\d+)\}\t(.*)$/.exec(line);
+    if (entry === null) return [];
+    return [{ headRevision: entry[1]!, seconds: Number(entry[2]), message: entry[3]! }];
+  });
+}
+
 /** The committer time of a commit, in seconds since the epoch. */
 export async function commitTimeSeconds(repository: string, revision: string): Promise<number> {
   return Number(await git(repository, ["show", "-s", "--format=%ct", `${revision}^{commit}`]));
