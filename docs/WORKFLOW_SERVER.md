@@ -195,7 +195,7 @@ A runner exit is not automatically a run failure. The server decides from the la
 
 ## Process supervision
 
-Each runner starts in its own process group. A headless Pi child starts in another process group so normal runner completion can stop all Pi tool descendants without signaling the runner itself. The runner registers that direct child with the server before it sends a prompt and unregisters it only after group shutdown. The server owns the one process registry and reaps a registered child if its runner exits first.
+Each runner starts in its own process group. A headless Pi child starts in another process group so normal runner completion can stop all Pi tool descendants without signaling the runner itself. The runner registers that direct child with the server before it sends a prompt and unregisters it only after group shutdown. The server owns the one process registry and reaps a registered child if its runner exits first. Headless Pi children that run [Sanity Check agent groups](WORKFLOWS.md#built-in-sanity-check) start and register the same way in interactive and headless runs, one child per group.
 
 The server enforces:
 

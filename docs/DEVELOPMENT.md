@@ -69,6 +69,13 @@ work and `RpcStepExecutor` for headless resource manager work. The runner
 receives a `ServerBackedWorkflowStore`; it cannot open a writable production
 store.
 
+The server, runners, resolver, channel adapter, and `piw` are plain Node
+processes. Pi supplies its own packages only to code that it loads, so modules
+those processes reach must not value-import `@earendil-works/pi-*` or `typebox`.
+Pi SDK work runs in a headless Pi child with a bridge extension. See
+[Host-provided Pi packages](WORKFLOWS.md#host-provided-pi-packages) and
+`test/plain-node-entries.test.ts`.
+
 The Pi extension uses documented session lifecycle, message, tool, and session
 manager APIs. It writes no Pi session file. It saves server mutations through the
 local protocol and uses the public session branch only to adopt the exact

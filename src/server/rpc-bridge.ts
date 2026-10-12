@@ -3,8 +3,7 @@ import {
   parseWorkflowSubmissionInput,
   WorkflowSubmissionToolParameters,
 } from "../workflows/tool-input.js";
-
-export const RPC_SUBMISSION_PREFIX = "PI_WORKFLOWS_STEP_SUBMISSION ";
+import { RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
 
 /**
  * Loaded into headless `pi --mode rpc` children spawned by the standalone

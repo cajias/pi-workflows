@@ -22,7 +22,7 @@ describe("BuiltinWorkflowCatalog", () => {
     expect(builtinWorkflowCatalog.get("monitor")?.revision).toBe("14");
     expect(builtinWorkflowCatalog.get("change-verification")?.revision).toBe("2");
     expect(builtinWorkflowCatalog.get("plan-approval")?.revision).toBe("4");
-    expect(builtinWorkflowCatalog.get("sanity-check")?.revision).toBe("6");
+    expect(builtinWorkflowCatalog.get("sanity-check")?.revision).toBe("7");
   });
 
   it("rejects unfinished Sanity Check revision 3 with restart guidance", () => {
