@@ -748,6 +748,48 @@ describe("autoimplement GitHub early node sequences", () => {
   });
 });
 
+describe("autoimplement GitHub early run detected from a github.com remote", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("detects GitHub with forge auto and keeps the upstream pending CI path", async () => {
+    // Empty config directories: detection must never read the developer's gh or glab hosts.
+    vi.stubEnv("GH_CONFIG_DIR", await makeTempDir("autoimplement-github-gh-config"));
+    vi.stubEnv("GLAB_CONFIG_DIR", await makeTempDir("autoimplement-github-glab-config"));
+    await git(fixture.repository, ["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+    const scenario = pendingCiScenario(fixture.repository);
+    const { state } = await runScenario("github-remote-auto", {
+      ...scenario,
+      input: { ...scenario.input, forge: "auto", prTiming: "early" },
+    });
+    expect(state.status, state.error).toBe("completed");
+    expect(state.outputs.resolveForge).toEqual({
+      schema: FORGE_RESOLUTION_SCHEMA,
+      requested: "auto",
+      forge: "github",
+      host: "github.com",
+      remoteUrl: "git@github.com:owner/repo.git",
+      reason: "remote host github.com",
+    });
+    const nodeIds = state.steps.map((step) => step.nodeId);
+    expect(upstreamView(nodeIds)).toEqual(UPSTREAM_NODE_SEQUENCES.pendingCi);
+    expect(nodeIds.filter((nodeId) => ADDED_EARLY_PATH_NODES.has(nodeId))).toEqual([
+      "resolveForge",
+    ]);
+    expect(state.steps.find((step) => step.nodeId === "trackCi")?.output).toMatchObject({
+      batch: {
+        items: [{ command: "gh", args: ["pr", "checks", "https://example.test/pr/1", "--watch"] }],
+      },
+    });
+    for (const request of scenario.executor.requests) {
+      expect(request.prompt).not.toContain("Forge: gitlab");
+      expect(request.prompt).not.toContain("glab api");
+      expect(request.prompt).not.toContain("Publication timing");
+    }
+  });
+});
+
 function resolution(forge: "github" | "gitlab", requested = "auto") {
   return {
     schema: FORGE_RESOLUTION_SCHEMA,

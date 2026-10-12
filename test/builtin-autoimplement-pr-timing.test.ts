@@ -21,10 +21,12 @@ import {
   chooseFirstControlRoute,
   ciInspection,
   completedDelivery,
+  controlDecision,
   documentedPlan,
   git,
   headPipelineFields,
   implementationExecutor,
+  observationOf,
   preparedWorkspaceFor,
   published,
   reviewOf,
@@ -365,6 +367,14 @@ describe("autoimplement publication timing routes", () => {
     const reviewedLocal = [commitLocal("h1"), ...reviewed("h1")];
     expect(await route(verified, "early")).toEqual({ route: "pullRequest" });
     expect(await route(verified, "end")).toEqual({ route: "commitLocal" });
+    // A local commit that is not reviewed, or reviewed with findings, is committed again first.
+    expect(await route([commitLocal("h1")], "end")).toEqual({ route: "commitLocal" });
+    expect(await route([commitLocal("h1"), ...reviewed("h1", { p1: ["race"] })], "end")).toEqual({
+      route: "commitLocal",
+    });
+    expect(await route([commitLocal("h1"), ...reviewed("h1", { p2: ["tidy"] })], "end")).toEqual({
+      route: "commitLocal",
+    });
     expect(await route(reviewedLocal, "end")).toEqual({ route: "publishReviewed" });
     expect(await route([...reviewedLocal, edit("fix")], "end")).toEqual({ route: "commitLocal" });
     expect(await route([publish("h1"), ...reviewed("h1")], "end")).toEqual({
@@ -1483,6 +1493,54 @@ async function refusedOutput(request: AgentStepRequest, output: unknown): Promis
   if (result.ok) throw new Error(`expected ${request.contract.nodeId} to refuse the output`);
   return result.error;
 }
+
+describe("autoimplement end publication before review", () => {
+  it(
+    "commits again instead of pushing and refuses comments until the clean review",
+    async () => {
+      const refused: string[] = [];
+      let publicationResults = 0;
+      const decide = async (request: AgentStepRequest): Promise<AgentStepSubmission> => {
+        if (observationOf(request).latestAttempt?.nodeId === "publicationResult") {
+          publicationResults += 1;
+          // Right after the first local commit, ask to publish before any review.
+          if (publicationResults === 1) {
+            return await acceptedOutput(request, controlDecision("publication").output);
+          }
+          // After the second local commit, try to skip review and handle comments.
+          if (publicationResults === 2) {
+            const result = await request.accept(controlDecision("comments").output);
+            if (result.ok) throw new Error("comments must not be available before review");
+            refused.push(result.error);
+          }
+        }
+        return chooseFirstControlRoute(request);
+      };
+      const { state, work } = await runTiming("github-end-early-publication", {
+        forge: "github",
+        prTiming: "end",
+        decide,
+      });
+      expect(state.status, state.error).toBe("completed");
+      expect(refused).toEqual([
+        "autoimplement control route comments is not available; choose one of review, publication, redesign, blocked",
+      ]);
+      const ids = nodeIdsOf(state);
+      const firstReview = ids.indexOf("runReview");
+      expect(ids.slice(0, firstReview).filter((id) => id === "commitLocal")).toHaveLength(2);
+      expect(
+        state.steps
+          .slice(0, firstReview)
+          .filter((entry) => entry.nodeId === "routeVerifiedWorkspace")
+          .map((entry) => entry.output),
+      ).toEqual([{ route: "commitLocal" }, { route: "commitLocal" }]);
+      expectPushesOnlyAfterCleanReview(state);
+      expect(ids.indexOf("inspectComments")).toBeGreaterThan(ids.indexOf("publish"));
+      expect(okSteps(state, "publish").map(headsOf)).toEqual([[work.head]]);
+    },
+    GRAPH_RUN_TIMEOUT_MS,
+  );
+});
 
 describe("autoimplement GitLab CI after a second publication", () => {
   it(
