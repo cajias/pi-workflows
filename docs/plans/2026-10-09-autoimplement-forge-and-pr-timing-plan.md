@@ -1655,3 +1655,9 @@ These are out of scope for this plan.
   "opens the pull request or merge request".
 - F18: Correct `docs/WORKFLOWS.md:858`. It says that after a failed push check "a person can move
   `prTiming` to `early`". That is not possible until F2 lands.
+- F19: Re-check built-in revisions when merging upstream.
+  - The fork's built-in revision numbers (autoimplement 15, monitor 14, change-verification 3,
+    autodoc 4, plan-change 2) equal upstream's next numbers.
+  - If upstream reuses them for different content, mixed fork and upstream installs would silently
+    accept each other's runs.
+  - Re-check revisions when merging upstream.

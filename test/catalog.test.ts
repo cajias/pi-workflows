@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { builtinWorkflowCatalog } from "../src/builtins/catalog.js";
+import { BUILTIN_WORKFLOW_METADATA } from "../src/builtins/metadata.js";
 import { BuiltinWorkflowCatalog } from "../src/workflows/catalog.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { BuiltinWorkflowRevisionChangedError } from "../src/workflows/errors.js";
@@ -17,12 +18,22 @@ describe("BuiltinWorkflowCatalog", () => {
   it("ships stable built-in revisions", () => {
     expect(builtinWorkflowCatalog.get("plain-summary")?.revision).toBe("3");
     expect(builtinWorkflowCatalog.get("autoplan")?.revision).toBe("6");
-    expect(builtinWorkflowCatalog.get("autodoc")?.revision).toBe("3");
+    expect(builtinWorkflowCatalog.get("autodoc")?.revision).toBe("4");
     expect(builtinWorkflowCatalog.get("autoimplement")?.revision).toBe("15");
     expect(builtinWorkflowCatalog.get("monitor")?.revision).toBe("14");
-    expect(builtinWorkflowCatalog.get("change-verification")?.revision).toBe("2");
+    expect(builtinWorkflowCatalog.get("change-verification")?.revision).toBe("3");
     expect(builtinWorkflowCatalog.get("plan-approval")?.revision).toBe("4");
     expect(builtinWorkflowCatalog.get("sanity-check")?.revision).toBe("7");
+    expect(builtinWorkflowCatalog.get("plan-change")?.revision).toBe("2");
+    expect(builtinWorkflowCatalog.get("workspace-preparation")?.revision).toBe("1");
+  });
+
+  it("lists the same discoverable built-ins and revisions as the extension metadata", () => {
+    expect(
+      builtinWorkflowCatalog
+        .listDiscoverable()
+        .map((entry) => ({ id: entry.id, revision: entry.revision })),
+    ).toEqual(BUILTIN_WORKFLOW_METADATA.map((entry) => ({ ...entry })));
   });
 
   it("rejects unfinished Sanity Check revision 3 with restart guidance", () => {

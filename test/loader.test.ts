@@ -153,11 +153,11 @@ describe("resolveWorkflowRef", () => {
         }),
         expect.objectContaining({
           workflowName: "change-verification",
-          source: { kind: "builtin", id: "change-verification", revision: "2" },
+          source: { kind: "builtin", id: "change-verification", revision: "3" },
         }),
         expect.objectContaining({
           workflowName: "plan-change",
-          source: { kind: "builtin", id: "plan-change", revision: "1" },
+          source: { kind: "builtin", id: "plan-change", revision: "2" },
         }),
       ]),
     );

@@ -13,19 +13,19 @@ import workspacePreparationWorkflow from "./workspace-preparation.workflow.js";
 export const builtinWorkflowCatalog = new BuiltinWorkflowCatalog([
   { id: "plain-summary", revision: "3", definition: plainSummaryWorkflow },
   { id: "autoplan", revision: "6", definition: autoplanWorkflow },
-  { id: "autodoc", revision: "3", definition: autodocWorkflow },
+  { id: "autodoc", revision: "4", definition: autodocWorkflow },
   { id: "autoimplement", revision: "15", definition: autoimplementWorkflow },
   { id: "plan-approval", revision: "4", definition: planApprovalWorkflow },
   { id: "sanity-check", revision: "7", definition: sanityCheckWorkflow },
   {
     id: "change-verification",
-    revision: "2",
+    revision: "3",
     definition: changeVerificationWorkflow,
     discoverable: false,
   },
   {
     id: "plan-change",
-    revision: "1",
+    revision: "2",
     definition: planChangeWorkflow,
     discoverable: false,
   },
