@@ -351,6 +351,7 @@ describe.each(["src", "dist"] as const)(
           FAKE_PI_ARGV_FILE: argvFile,
           FAKE_AGENT_GROUP_SCENARIO: "success",
           FAKE_AGENT_GROUP_TEXT: JSON.stringify(review),
+          PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR: sandbox,
         });
         expect(result.code, result.stderr).toBe(0);
         const output = JSON.parse(result.stdout) as {

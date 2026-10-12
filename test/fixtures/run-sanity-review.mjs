@@ -15,12 +15,15 @@ const { HeadlessPiAgentGroupLauncher } = await load("server/agent-group-launcher
 const { default: sanityCheck } = await load("builtins/sanity-check.workflow");
 
 const pids = [];
-const launcher = new HeadlessPiAgentGroupLauncher({
-  cwd: process.cwd(),
-  piBin: process.env.FAKE_PI_BIN,
-  abortGraceMs: 1_000,
-  registry: { register: (pid) => pids.push(pid), unregister: () => undefined },
-});
+const launcher = new HeadlessPiAgentGroupLauncher(
+  {
+    cwd: process.cwd(),
+    piBin: process.env.FAKE_PI_BIN,
+    abortGraceMs: 1_000,
+    registry: { register: (pid) => pids.push(pid), unregister: () => undefined },
+  },
+  { diagnosticsDirectory: process.env.PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR },
+);
 setPiAgentGroupLauncher(launcher.run);
 
 const text = { text: "", truncated: false };
@@ -48,13 +51,20 @@ try {
       recovery: "manual",
     },
     publishUpdate: async (update) => {
-      updates.push({ key: update.key, status: update.data.status, label: update.data.label });
+      updates.push({
+        key: update.key,
+        status: update.data.status,
+        phase: update.data.phase,
+        label: update.data.label,
+        at: Date.now(),
+      });
       // The label names the model once the child session exists.
       if (
         cancelWhenRunning &&
         update.data.status === "running" &&
         update.data.label?.includes(" · ")
       ) {
+        output.abortedAt ??= Date.now();
         controller.abort(new Error("test cancellation"));
       }
       return { updateId: "u", seq: updates.length, at: "", type: update.type, key: update.key };

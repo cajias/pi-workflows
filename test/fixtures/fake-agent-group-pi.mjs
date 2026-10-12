@@ -16,8 +16,13 @@ if (process.env.FAKE_PI_ARGV_FILE) {
 }
 if (scenario === "ignore-cancel") process.on("SIGTERM", () => undefined);
 
+// The same framing as the bridge: a leading newline ends any partial line written first.
+function encode(event) {
+  return `\n${PREFIX}${JSON.stringify({ schema: SCHEMA, ...event })}\n`;
+}
+
 function emit(event) {
-  process.stderr.write(`${PREFIX}${JSON.stringify({ schema: SCHEMA, ...event })}\n`);
+  process.stderr.write(encode(event));
 }
 
 function respond(id, response) {
@@ -72,31 +77,70 @@ const runScenarios = {
   "handled-without-result"(_command, id) {
     respond(id, { success: true, data: { disposition: "handled" } });
   },
-  "exit-mid-run"() {
+  "exit-mid-run"(command) {
+    lifecycle(command.groupId, command.requests[0], "running");
     process.stderr.write("provider crashed\n");
     process.exit(5);
+  },
+  noisy(command, id) {
+    // Extension output without a trailing newline, right before every bridge event.
+    process.stderr.write("extension output without newline");
+    for (const request of command.requests) lifecycle(command.groupId, request, "running");
+    process.stderr.write("more partial output");
+    runScenarios.success(command, id);
+  },
+  large(command, id) {
+    // Pi answers the prompt first; the large final event then arrives in many odd-sized
+    // chunks that split multi-byte characters, more slowly than the result wait in total.
+    respond(id, { success: true, data: { disposition: "handled" } });
+    const bytes = Buffer.from(
+      encode({ type: "completed", groupId: command.groupId, results: results(command) }),
+    );
+    let offset = 0;
+    const next = () => {
+      if (offset >= bytes.length) return;
+      process.stderr.write(bytes.subarray(offset, offset + 4_093));
+      offset += 4_093;
+      setTimeout(next, Number(process.env.FAKE_AGENT_GROUP_CHUNK_DELAY_MS ?? "0"));
+    };
+    next();
   },
   hang(command) {
     for (const request of command.requests) lifecycle(command.groupId, request, "running");
   },
-  "ignore-cancel"(command) {
+  "partial-settle"(command) {
     runScenarios.hang(command);
   },
+  "ignore-cancel"(command) {
+    // The first request starts; the rest stay queued.
+    lifecycle(command.groupId, command.requests[0], "running");
+  },
 };
+
+function resultText(request) {
+  const unit = process.env.FAKE_AGENT_GROUP_TEXT ?? `result ${request.id}`;
+  return unit.repeat(Number(process.env.FAKE_AGENT_GROUP_TEXT_REPEAT ?? "1"));
+}
 
 function results(command) {
   return command.requests.map((request) => ({
     id: request.id,
-    text: process.env.FAKE_AGENT_GROUP_TEXT ?? `result ${request.id}`,
+    text: resultText(request),
     model: "fixture/model",
     thinkingLevel: "high",
     durationMs: 1,
   }));
 }
 
+let running;
+
+// "hang" settles every session; "partial-settle" confirms only the first one and then stops
+// reporting; "ignore-cancel" never answers.
 function cancel(command) {
+  if (running === undefined || !["hang", "partial-settle"].includes(scenario)) return;
+  const settled = scenario === "hang" ? running.requests : running.requests.slice(0, 1);
+  for (const request of settled) lifecycle(command.groupId, request, "cancelled");
   if (scenario !== "hang") return;
-  lifecycle(command.groupId, { id: "review", role: "Review" }, "cancelled");
   emit({
     type: "failed",
     groupId: command.groupId,
@@ -113,8 +157,12 @@ function onLine(line) {
   if (process.env.FAKE_PI_COMMANDS_FILE) {
     fs.appendFileSync(process.env.FAKE_PI_COMMANDS_FILE, `${JSON.stringify(command)}\n`);
   }
-  if (command.type === "cancel") cancel(command);
-  else runScenarios[scenario]?.(command, message.id);
+  if (command.type === "cancel") {
+    cancel(command);
+    return;
+  }
+  running = command;
+  runScenarios[scenario]?.(command, message.id);
 }
 
 if (scenario === "exit-before-ready") {

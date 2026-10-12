@@ -7,6 +7,7 @@ import {
   type PiAgentResult,
 } from "../builtins/pi-agent-launch.js";
 import { errorMessage } from "../workflows/errors.js";
+import { AgentLifecycleLedger, PiStderrLog } from "./agent-group-diagnostics.js";
 import {
   decodeAgentGroupEvent,
   encodeAgentGroupPrompt,
@@ -15,7 +16,6 @@ import {
   type AgentGroupRunOptions,
 } from "./agent-group-protocol.js";
 import {
-  abortGraceMs,
   describeHeadlessPiExit,
   HeadlessPiProcess,
   packagedExtensionPath,
@@ -24,11 +24,43 @@ import {
 } from "./headless-pi.js";
 
 const BRIDGE_PATH = packagedExtensionPath(import.meta.url, "agent-group-bridge") ?? null;
-// Pi startup failures are diagnosed from the last stderr lines. The complete stream is not
-// retained, so a long run cannot grow memory without bound.
-const DIAGNOSTIC_LINES = 20;
+/**
+ * How long a cancelled group may take to settle before the launcher stops pi. Settling aborts
+ * each child's provider request and disposes its runtime, which runs every admitted provider
+ * extension's `session_shutdown`. Children settle concurrently, so the bound does not grow
+ * with group size. The real-Pi end-to-end test settles in well under one second; ten seconds
+ * leaves room for an extension that closes network clients or saves refreshed credentials.
+ * The engine stops waiting for an aborted action at once, so this wait never delays a run.
+ */
+export const CANCEL_SETTLE_MS = 10_000;
+/**
+ * After pi reports that the bridge command returned, how long stderr may stay silent before
+ * the missing result is an error. The bridge writes its final event before the command
+ * returns, but stdout and stderr are separate pipes. Each stderr chunk restarts the wait, so
+ * a large result still in transit is never misreported. Five seconds exceeds the one-second
+ * process stop grace that the workflow runner uses.
+ */
+export const RESULT_IDLE_MS = 5_000;
 const LAUNCH_HINT =
   "The workflow runner starts agent groups with the same `pi` command, arguments, and environment as headless workflow steps; check that this command runs on the workflow server";
+
+export type HeadlessPiAgentGroupSettings = {
+  /** The bridge extension; `null` reports a broken installation. */
+  bridgePath?: string | null;
+  /** Parent of each group's private stderr log directory; defaults to the OS temp directory. */
+  diagnosticsDirectory?: string;
+  /** Name prefix of each stderr log directory, for example one that names the run. */
+  diagnosticsPrefix?: string;
+  cancelSettleMs?: number;
+  resultIdleMs?: number;
+};
+
+type ResolvedSettings = {
+  diagnosticsDirectory: string | undefined;
+  diagnosticsPrefix: string | undefined;
+  cancelSettleMs: number;
+  resultIdleMs: number;
+};
 
 type Outcome = { results: PiAgentResult[] } | { error: Error };
 
@@ -39,12 +71,22 @@ type Outcome = { results: PiAgentResult[] } | { error: Error };
  */
 export class HeadlessPiAgentGroupLauncher {
   private readonly active = new Set<HeadlessPiProcess>();
+  private readonly bridgePath: string | null;
+  private readonly settings: ResolvedSettings;
   private closed = false;
 
   constructor(
     private readonly options: HeadlessPiOptions,
-    private readonly bridgePath: string | null = BRIDGE_PATH,
-  ) {}
+    settings: HeadlessPiAgentGroupSettings = {},
+  ) {
+    this.bridgePath = settings.bridgePath === undefined ? BRIDGE_PATH : settings.bridgePath;
+    this.settings = {
+      diagnosticsDirectory: settings.diagnosticsDirectory,
+      diagnosticsPrefix: settings.diagnosticsPrefix,
+      cancelSettleMs: settings.cancelSettleMs ?? CANCEL_SETTLE_MS,
+      resultIdleMs: settings.resultIdleMs ?? RESULT_IDLE_MS,
+    };
+  }
 
   readonly run = async (
     requests: PiAgentRequest[],
@@ -61,13 +103,20 @@ export class HeadlessPiAgentGroupLauncher {
         "the pi-workflows agent group bridge is missing from this installation",
       );
     }
-    const call = new AgentGroupCall(this.bridgePath, this.options, requests, options);
+    const call = new AgentGroupCall(
+      this.bridgePath,
+      this.options,
+      this.settings,
+      requests,
+      options,
+    );
     this.active.add(call.child);
     try {
       return await call.run();
     } finally {
       await call.child.close();
       this.active.delete(call.child);
+      await call.finishStderrLog();
     }
   };
 
@@ -82,20 +131,28 @@ class AgentGroupCall {
   readonly child: HeadlessPiProcess;
   private readonly groupId = randomUUID();
   private readonly outcome = deferred<PiAgentResult[]>();
-  private readonly diagnostics: string[] = [];
+  private readonly stderrLog: PiStderrLog;
+  private readonly ledger: AgentLifecycleLedger;
   private lifecycleWork: Promise<void> = Promise.resolve();
   private ready = false;
   private cancelling = false;
   private settled = false;
-  private timer: NodeJS.Timeout | undefined;
+  /** The group failed to run, so its stderr log is kept and named in the error. */
+  private keepStderrLog = false;
+  private cancelTimer: NodeJS.Timeout | undefined;
+  private resultTimer: NodeJS.Timeout | undefined;
 
   constructor(
     bridgePath: string,
-    private readonly launch: HeadlessPiOptions,
+    launch: HeadlessPiOptions,
+    private readonly settings: ResolvedSettings,
     private readonly requests: PiAgentRequest[],
     private readonly options: PiAgentGroupLaunchOptions,
   ) {
+    this.stderrLog = new PiStderrLog(settings.diagnosticsDirectory, settings.diagnosticsPrefix);
+    this.ledger = new AgentLifecycleLedger(requests);
     this.child = new HeadlessPiProcess(bridgePath, launch, {
+      onStderrChunk: (chunk) => this.onStderrChunk(chunk),
       onStderrLine: (line) => this.onStderrLine(line),
       onStdoutLine: (line) => this.onStdoutLine(line),
       onExit: (exit) => this.onExit(exit),
@@ -106,6 +163,7 @@ class AgentGroupCall {
     const onAbort = () => this.cancel();
     this.options.signal.addEventListener("abort", onAbort, { once: true });
     try {
+      await this.stderrLog.open();
       try {
         await this.child.start();
       } catch (error) {
@@ -117,19 +175,25 @@ class AgentGroupCall {
       return await this.outcome.promise;
     } finally {
       this.options.signal.removeEventListener("abort", onAbort);
-      clearTimeout(this.timer);
+      this.clearTimers();
     }
+  }
+
+  /** Call after the child exits, so the kept log holds its complete stderr. */
+  async finishStderrLog(): Promise<void> {
+    if (this.keepStderrLog) await this.stderrLog.keep();
+    else await this.stderrLog.discard();
+  }
+
+  private onStderrChunk(chunk: Buffer): void {
+    this.stderrLog.write(chunk);
+    if (this.resultTimer !== undefined) this.startResultTimer();
   }
 
   private onStderrLine(line: string): void {
     const event = decodeAgentGroupEvent(line);
-    if (event === undefined) {
-      this.remember(line);
-    } else if (event.type === "ready") {
-      this.sendRun();
-    } else if (event.groupId === this.groupId) {
-      this.acceptGroupEvent(event);
-    }
+    if (event?.type === "ready") this.sendRun();
+    else if (event !== undefined && event.groupId === this.groupId) this.acceptGroupEvent(event);
   }
 
   private acceptGroupEvent(event: Exclude<AgentGroupEvent, { type: "ready" }>): void {
@@ -143,19 +207,13 @@ class AgentGroupCall {
     const response = promptResponse(line, this.groupId);
     if (response === undefined || this.settled) return;
     if (response.error !== undefined) {
-      this.finish({ error: runFailure(`pi rejected the agent group command: ${response.error}`) });
+      this.failToRun(`pi rejected the agent group command: ${response.error}`);
     } else if (response.disposition !== "handled") {
-      this.finish({
-        error: runFailure(
-          `pi did not route the agent group command to its bridge (disposition ${String(response.disposition)})`,
-        ),
-      });
-    } else {
-      // The bridge writes its final event before its command returns, but stderr and
-      // stdout are separate pipes. Allow the event to arrive before declaring it missing.
-      this.restartTimer(() =>
-        this.finish({ error: runFailure("the agent group bridge returned without a result") }),
+      this.failToRun(
+        `pi did not route the agent group command to its bridge (disposition ${String(response.disposition)})`,
       );
+    } else {
+      this.startResultTimer();
     }
   }
 
@@ -164,7 +222,7 @@ class AgentGroupCall {
     const stage = this.ready
       ? "headless pi exited before the agent group finished"
       : "headless pi exited before the agent group bridge loaded";
-    this.finish({ error: runFailure(`${stage} (${describeHeadlessPiExit(exit)})`) });
+    this.failToRun(`${stage} (${describeHeadlessPiExit(exit)})`);
   }
 
   private sendRun(): void {
@@ -183,12 +241,13 @@ class AgentGroupCall {
     });
   }
 
-  /** Ask the bridge to abort and settle its sessions, then give up after the grace period. */
+  /** Ask the bridge to abort and settle its sessions, then stop waiting after the settle grace. */
   private cancel(): void {
     if (this.settled || this.cancelling) return;
     this.cancelling = true;
+    const cancelled = () => this.finishUnconfirmed(cancellationError(this.options.signal.reason));
     if (!this.ready) {
-      this.finish({ error: cancellationError(this.options.signal.reason) });
+      cancelled();
       return;
     }
     this.child.write({
@@ -199,10 +258,37 @@ class AgentGroupCall {
         reason: cancellationReason(this.options.signal.reason),
       }),
     });
-    this.restartTimer(() => this.finish({ error: cancellationError(this.options.signal.reason) }));
+    this.cancelTimer = setTimeout(cancelled, this.settings.cancelSettleMs);
+  }
+
+  private failToRun(detail: string): void {
+    // A cancelled group reports cancellation, so nothing would name the log.
+    this.keepStderrLog = !this.options.signal.aborted;
+    this.finishUnconfirmed(
+      new PiAgentGroupError(
+        "group",
+        "could not run",
+        `${detail}. ${this.stderrLog.describe()}. ${LAUNCH_HINT}`,
+      ),
+    );
+  }
+
+  /**
+   * Settle a group whose bridge did not report its outcome. Every request without a terminal
+   * fact gets one first, so its progress track ends.
+   */
+  private finishUnconfirmed(error: PiAgentGroupError): void {
+    if (this.settled) return;
+    const cancelled = this.cancelling || this.options.signal.aborted;
+    const unsettled = cancelled
+      ? this.ledger.unsettled("cancelled", "headless pi did not report that the session settled")
+      : this.ledger.unsettled("failed", "headless pi stopped before the session finished");
+    for (const event of unsettled) this.forward(event);
+    this.finish({ error });
   }
 
   private forward(event: PiAgentLifecycleEvent): void {
+    this.ledger.record(event);
     const onLifecycle = this.options.onLifecycle;
     if (onLifecycle === undefined) return;
     this.lifecycleWork = this.lifecycleWork
@@ -214,26 +300,29 @@ class AgentGroupCall {
   private finish(outcome: Outcome): void {
     if (this.settled) return;
     this.settled = true;
-    clearTimeout(this.timer);
+    this.clearTimers();
     const final: Outcome = this.options.signal.aborted
       ? { error: cancellationError(this.options.signal.reason) }
       : outcome;
     void this.lifecycleWork.then(() => {
       if ("results" in final) this.outcome.resolve(final.results);
-      else this.outcome.reject(withDiagnostics(final.error, this.diagnostics));
+      else this.outcome.reject(final.error);
     });
   }
 
-  private restartTimer(onTimeout: () => void): void {
-    clearTimeout(this.timer);
-    this.timer = setTimeout(onTimeout, abortGraceMs(this.launch));
+  private startResultTimer(): void {
+    clearTimeout(this.resultTimer);
+    this.resultTimer = setTimeout(
+      () => this.failToRun("the agent group bridge returned without a result"),
+      this.settings.resultIdleMs,
+    );
   }
 
-  private remember(line: string): void {
-    const text = line.trim();
-    if (text.length === 0) return;
-    this.diagnostics.push(text);
-    if (this.diagnostics.length > DIAGNOSTIC_LINES) this.diagnostics.shift();
+  private clearTimers(): void {
+    clearTimeout(this.cancelTimer);
+    clearTimeout(this.resultTimer);
+    this.cancelTimer = undefined;
+    this.resultTimer = undefined;
   }
 }
 
@@ -268,25 +357,6 @@ function failureError(failure: AgentGroupFailure): Error {
     return new PiAgentGroupError(failure.agentId, failure.code, failure.detail);
   }
   return new Error(failure.message);
-}
-
-function runFailure(detail: string): PiAgentGroupError {
-  return new PiAgentGroupError("group", "could not run", `${detail}. ${LAUNCH_HINT}`);
-}
-
-function withDiagnostics(error: Error, diagnostics: string[]): Error {
-  if (
-    !(error instanceof PiAgentGroupError) ||
-    error.code !== "could not run" ||
-    diagnostics.length === 0
-  ) {
-    return error;
-  }
-  return new PiAgentGroupError(
-    error.agentId,
-    error.code,
-    `${error.detail}. pi stderr: ${diagnostics.join(" | ")}`,
-  );
 }
 
 function cancellationError(reason: unknown): PiAgentGroupError {
