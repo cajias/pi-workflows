@@ -963,7 +963,7 @@ describe("autoimplement reviewed publication validator", () => {
     const first = "https://example.test/pr/1";
     const context = fixtureContext([earlierPublish(first), ...gate()]);
     await expect(validate(pushed({ pr: "https://example.test/pr/2" }), context)).rejects.toThrow(
-      `publication repositories[0].pr must be the pull request this run already published: ${first}`,
+      `publication repositories[0].pr must be the pull request this run already published: ${first}. If that pull request was closed or merged outside this run, do not open another one; report the change to the controller, which should choose blocked.`,
     );
     await expect(validate(pushed(), context)).resolves.toMatchObject({
       repositories: [{ pr: first }],
@@ -987,7 +987,7 @@ describe("autoimplement reviewed publication validator", () => {
         onGitLab,
       ),
     ).rejects.toThrow(
-      `publication repositories[0].pr must be the merge request this run already published: ${mergeRequest}`,
+      `publication repositories[0].pr must be the merge request this run already published: ${mergeRequest}. If that merge request was closed or merged outside this run, do not open another one;`,
     );
   });
 

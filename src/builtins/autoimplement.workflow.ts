@@ -1463,7 +1463,7 @@ function assertReusesPublishedRequest(
     const pr = requests.get(repository.id);
     if (pr !== undefined && pr !== repository.pr) {
       throw new Error(
-        `publication repositories[${index}].pr must be the ${request} this run already published: ${pr}`,
+        `publication repositories[${index}].pr must be the ${request} this run already published: ${pr}. If that ${request} was closed or merged outside this run, do not open another one; report the change to the controller, which should choose blocked.`,
       );
     }
   });
