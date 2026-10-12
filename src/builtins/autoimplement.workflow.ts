@@ -40,6 +40,7 @@ import {
   GITHUB_CI_BINDING,
   parseAutoimplementConcurrency,
   parseCiInspectionBatch,
+  parseGitLabHeadPipeline,
   parseLocalCommitRepositories,
   parsePublishedRepositories,
   reviewerCommand,
@@ -47,6 +48,7 @@ import {
   type CandidateRepository,
   type CiForgeBinding,
   type CiInspectionBatch,
+  type GitLabHeadPipeline,
   type LocalCommitRepositories,
   type PublishedRepositories,
 } from "./autoimplement-command-batches.js";
@@ -1728,9 +1730,10 @@ function parseCiInspectionForPublished(
   value: unknown,
   context: WorkflowNodeContext,
 ): CiInspectionBatch {
+  const forge = forgeFor(context);
   const inspected = parseCiInspectionBatch(
     value,
-    forgeFor(context) === "github"
+    forge === "github"
       ? () => GITHUB_CI_BINDING
       : gitlabCiBinding(currentPublishedRepositories(context)),
   );
@@ -1755,7 +1758,62 @@ function parseCiInspectionForPublished(
   if (expected.size > 0) {
     throw new Error(`CI inspection is missing repository ids: ${[...expected.keys()].join(", ")}`);
   }
-  return inspected;
+  return forge === "gitlab" ? withInspectedHeadPipelines(value, inspected) : inspected;
+}
+
+/** Adds the reported GitLab head pipeline to every inspected target and checks green against it. */
+function withInspectedHeadPipelines(
+  value: unknown,
+  inspected: CiInspectionBatch,
+): CiInspectionBatch {
+  const raw = requireRecord(value, "CI inspection").targets as unknown[];
+  return {
+    ...inspected,
+    targets: inspected.targets.map((target, index) => ({
+      ...target,
+      headPipeline: parseGitLabHeadPipeline(
+        requireRecord(raw[index], `CI targets[${index}]`).headPipeline,
+        target.route,
+        target.headRevision,
+        `CI targets[${index}]`,
+      ),
+    })),
+  };
+}
+
+type TrackedCiTarget = {
+  id: string;
+  route: string;
+  reason: string;
+  headPipeline?: GitLabHeadPipeline | null;
+};
+
+/**
+ * Adds the reported GitLab head pipeline to every tracked target. A target is green only when the
+ * merge request's head pipeline ran for the published head of that target and succeeded.
+ */
+function withTrackedHeadPipelines(
+  raw: readonly unknown[],
+  targets: readonly TrackedCiTarget[],
+  context: WorkflowNodeContext,
+): TrackedCiTarget[] {
+  const heads = new Map(
+    currentPublishedRepositories(context).repositories.map(
+      (repository) => [repository.id, repository.headRevision] as const,
+    ),
+  );
+  return targets.map((target, index) => {
+    const headRevision = heads.get(target.id);
+    if (headRevision === undefined) {
+      throw new Error(`tracked CI assessment target is not a published repository: ${target.id}`);
+    }
+    const label = `tracked CI assessment targets[${index}]`;
+    const pipeline = requireRecord(raw[index], label).headPipeline;
+    return {
+      ...target,
+      headPipeline: parseGitLabHeadPipeline(pipeline, target.route, headRevision, label),
+    };
+  });
 }
 
 function parseTrackedCiAssessment(
@@ -1796,6 +1854,10 @@ function parseTrackedCiAssessment(
       `tracked CI assessment targets must exactly cover watched ids; missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"}`,
     );
   }
+  const assessed =
+    forgeFor(context) === "gitlab"
+      ? withTrackedHeadPipelines(result.targets, targets, context)
+      : targets;
   const trackedRoutes = new Map(targets.map((target) => [target.id, target.route] as const));
   const routes = inspected.targets.map((target) => trackedRoutes.get(target.id) ?? target.route);
   const route = routes.includes("failed")
@@ -1812,7 +1874,7 @@ function parseTrackedCiAssessment(
     ...result,
     route,
     reason: requireString(result.reason, "tracked CI assessment reason"),
-    targets,
+    targets: assessed,
     relatedFailures: requireStringArray(
       result.relatedFailures ?? [],
       "tracked CI assessment relatedFailures",
@@ -2522,6 +2584,7 @@ export const autoimplementWorkflow = defineWorkflow({
         const execution = latestOutput<BatchExecution>(context, ["trackCi"]);
         return [
           ...promptText(context).assessTrackedCi,
+          ...mergeRequestCoordinates(context),
           `Initial inspection: ${JSON.stringify(inspected)}`,
           `Tracking results: ${JSON.stringify(execution.batch)}`,
         ].join("\n");

@@ -145,12 +145,28 @@ export function reviewOf(
   };
 }
 
+export type ScenarioForge = "github" | "gitlab";
+
+/**
+ * The head pipeline a GitLab CI target reports for `headRevision`: successful when green, running
+ * otherwise. GitHub targets report none.
+ */
+export function headPipelineFields(
+  forge: ScenarioForge,
+  route: string,
+  headRevision: string,
+): { headPipeline?: { sha: string; status: string } } {
+  if (forge === "github") return {};
+  return { headPipeline: { sha: headRevision, status: route === "green" ? "success" : "running" } };
+}
+
 export function ciInspection(
   repository: string,
   route: "green" | "failed" | "pending" | "unavailable",
   headRevision = "abc123",
   pr = "https://example.test/pr/1",
   trackingCommand?: { command: string; args: string[] },
+  forge: ScenarioForge = "github",
 ) {
   return {
     targets: [
@@ -162,6 +178,7 @@ export function ciInspection(
         reason: route,
         relatedFailures: [],
         unrelatedFailures: [],
+        ...headPipelineFields(forge, route, headRevision),
         ...(route === "pending"
           ? {
               trackingCommand: {
@@ -249,7 +266,9 @@ export function verificationPlan(repository: string, id = "verify") {
 /** Answers every node from implementation through local verification with a passing result. */
 export function implementationExecutor(
   repository: string,
-  decide: (request: AgentStepRequest) => AgentStepSubmission = chooseFirstControlRoute,
+  decide: (
+    request: AgentStepRequest,
+  ) => Promise<AgentStepSubmission> | AgentStepSubmission = chooseFirstControlRoute,
 ): ScriptedExecutor {
   return summaryExecutor()
     .respond("decide", decide)
@@ -328,12 +347,24 @@ const NO_ACTIONABLE_COMMENTS = {
   output: { route: "ci", summary: "no actionable comments", evidence: [] },
 };
 
+/**
+ * Full commit ids for GitLab scenarios. A GitLab target is green only when the merge request's head
+ * pipeline ran for the full published head revision.
+ */
+export const GITLAB_SCENARIO_HEADS = ["1".repeat(40), "2".repeat(40)] as const;
+
+function scenarioHeads(forge: ScenarioForge): readonly [string, string] {
+  return forge === "gitlab" ? GITLAB_SCENARIO_HEADS : ["abc123", "def456"];
+}
+
 /** One P2-only review, addressed and verified without a second reviewer run, then merged. */
 export function p2PathScenario(
   repository: string,
   pr = "https://example.test/pr/1",
+  forge: ScenarioForge = "github",
 ): AutoimplementScenario {
-  const executor = commonExecutor(repository, published(repository, "abc123", pr))
+  const [first, second] = scenarioHeads(forge);
+  const executor = commonExecutor(repository, published(repository, first, pr))
     .respond("assessReview", { output: reviewOf(repository, { p2: ["simplify one branch"] }) })
     .respond("addressP2", { output: { addressed: ["simplified branch"], skipped: [] } })
     .respond("verifyP2", {
@@ -341,11 +372,13 @@ export function p2PathScenario(
         passed: true,
         commands: [{ command: "npm test", outcome: "passed" }],
         pushed: true,
-        repositories: published(repository, "def456", pr).repositories,
+        repositories: published(repository, second, pr).repositories,
       },
     })
     .respond("inspectComments", NO_ACTIONABLE_COMMENTS)
-    .respond("inspectCi", { output: ciInspection(repository, "green", "def456", pr) })
+    .respond("inspectCi", {
+      output: ciInspection(repository, "green", second, pr, undefined, forge),
+    })
     .respond("finalizeDelivery", completedDelivery(pr, true));
   return { executor, input: scenarioInput(repository, true) };
 }
@@ -386,18 +419,27 @@ export function pendingCiScenario(
   repository: string,
   pr = "https://example.test/pr/1",
   trackingCommand?: { command: string; args: string[] },
+  forge: ScenarioForge = "github",
 ): AutoimplementScenario {
-  const executor = commonExecutor(repository, published(repository, "abc123", pr))
+  const [head] = scenarioHeads(forge);
+  const executor = commonExecutor(repository, published(repository, head, pr))
     .respond("assessReview", { output: reviewOf(repository) })
     .respond("inspectComments", NO_ACTIONABLE_COMMENTS)
     .respond("inspectCi", {
-      output: ciInspection(repository, "pending", "abc123", pr, trackingCommand),
+      output: ciInspection(repository, "pending", head, pr, trackingCommand, forge),
     })
     .respond("assessTrackedCi", {
       output: {
         route: "green",
         reason: "checks passed",
-        targets: [{ id: repositoryId(repository), route: "green", reason: "checks passed" }],
+        targets: [
+          {
+            id: repositoryId(repository),
+            route: "green",
+            reason: "checks passed",
+            ...headPipelineFields(forge, "green", head),
+          },
+        ],
         relatedFailures: [],
         unrelatedFailures: [],
       },

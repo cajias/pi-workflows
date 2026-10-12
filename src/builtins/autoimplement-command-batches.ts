@@ -35,6 +35,9 @@ export type LocalCommitRepositories = {
   repositories: CandidateRepository[];
 };
 
+/** The merge request's `head_pipeline` as a GitLab CI target reports it. */
+export type GitLabHeadPipeline = { sha: string; status: string };
+
 export type CiTargetInspection = {
   id: string;
   repository: string;
@@ -45,6 +48,8 @@ export type CiTargetInspection = {
   relatedFailures: string[];
   unrelatedFailures: string[];
   trackingCommand?: CommandBatchItem;
+  /** GitLab only: the merge request's head pipeline, or null when it has none. */
+  headPipeline?: GitLabHeadPipeline | null;
 };
 
 export type CiInspectionBatch = {
@@ -380,6 +385,41 @@ function parseGitLabCiCommand(
     throw new Error("CI tracking command repository must be the merge request project");
   }
   return { ...command, args: gitlabCiWatchArgs(branch, mergeRequest.projectUrl) };
+}
+
+/**
+ * Reads the `head_pipeline` that a GitLab CI target reports, null when the merge request has none.
+ *
+ * The source-branch watch follows the newest pipeline of the branch, which can belong to another
+ * commit or differ from the merge request's own pipeline. So a target is green only when the merge
+ * request's head pipeline ran for the published head and succeeded.
+ */
+export function parseGitLabHeadPipeline(
+  value: unknown,
+  route: string,
+  headRevision: string,
+  label: string,
+): GitLabHeadPipeline | null {
+  if (value === undefined) {
+    throw new Error(
+      `${label}.headPipeline must report the merge request head_pipeline sha and status, or null when it has none`,
+    );
+  }
+  const pipeline = value === null ? null : headPipelineRecord(value, `${label}.headPipeline`);
+  if (route === "green" && (pipeline?.sha !== headRevision || pipeline.status !== "success")) {
+    throw new Error(
+      `${label} can be green only when the merge request head_pipeline has sha ${headRevision} and status success; reported ${JSON.stringify(pipeline)}`,
+    );
+  }
+  return pipeline;
+}
+
+function headPipelineRecord(value: unknown, label: string): GitLabHeadPipeline {
+  const record = requireRecord(value, label);
+  return {
+    sha: requireString(record.sha, `${label}.sha`),
+    status: requireString(record.status, `${label}.status`),
+  };
 }
 
 /** The one GitLab watch form the workflow runs: a live status with the branch and project explicit. */

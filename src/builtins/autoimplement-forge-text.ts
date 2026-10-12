@@ -190,13 +190,25 @@ const GITHUB_TEXT: ForgeText = {
 const GITLAB_COORDINATES_RULE =
   "Take <hostname>, <apiProject>, <iid>, and <projectUrl> for each merge request from the GitLab API coordinates line.";
 
+/**
+ * How GitLab CI is judged. The source-branch watch follows the newest pipeline of the branch, which
+ * can belong to an older commit or differ from the merge request's own pipeline, so only the merge
+ * request's `head_pipeline` decides a route.
+ */
+const GITLAB_HEAD_PIPELINE_RULES = [
+  "A target is green only when head_pipeline.sha equals the target's published headRevision and head_pipeline.status is success.",
+  "When head_pipeline names another sha, or its status is created, waiting_for_resource, preparing, pending, running, or scheduled, return pending, because the pipeline of the published head has not finished. When the merge request has no head_pipeline, return unavailable.",
+  'Report it on every target as headPipeline {"sha": "<head_pipeline.sha>", "status": "<head_pipeline.status>"}, or as headPipeline null when the merge request has no head_pipeline. The workflow rejects a green target without a successful head pipeline for its published head.',
+] as const;
+
 const GITLAB_INSPECT_CI = [
   "Inspect every published merge request once without waiting for completion.",
   "Return one target per repository and current MR head.",
   CI_ROUTES,
   "Read each merge request with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and use its head_pipeline id, status, and sha. For a failed pipeline, list its jobs with glab api --hostname <hostname> projects/<apiProject>/pipelines/<pipelineId>/jobs and read a failed job log with glab api --hostname <hostname> projects/<apiProject>/jobs/<jobId>/trace.",
+  ...GITLAB_HEAD_PIPELINE_RULES,
   "When pending, set trackingCommand to exactly the canonical glab tracking command listed for that target. The workflow accepts only glab ci status with --live or --wait, the published source branch, and the merge request project, with timeoutMs at most 300000 and maxOutputChars at most 1000000.",
-  "The expected-output example shows both command forms. On this GitLab run use only the glab form.",
+  "The expected-output example shows both command forms and omits headPipeline. On this GitLab run use only the glab form and add headPipeline to every target.",
   CI_FAILURES,
   GITLAB_COORDINATES_RULE,
 ] as const;
@@ -271,7 +283,11 @@ const GITLAB_TEXT: ForgeText = {
     CI_ASSESS_NO_WAIT,
     "Return one target result for every watched MR and an aggregate route of green, failed, pending, or unavailable.",
     CI_ASSESS_PENDING,
-    "glab ci status exits 0 for canceled, skipped, and manual pipelines, so judge each pipeline by the status in its watch output, not by the exit code.",
+    "glab ci status exits 0 for canceled, skipped, and manual pipelines, so never judge a pipeline by the exit code of its watch.",
+    "The watch follows the newest pipeline of the source branch, so its output can show another pipeline than the merge request's. Before you return any target route, including green and failed, read the merge request with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid> and judge its head_pipeline, not the watch output.",
+    ...GITLAB_HEAD_PIPELINE_RULES,
+    "The expected-output example omits headPipeline. On this GitLab run add it to every target.",
+    GITLAB_COORDINATES_RULE,
   ],
   finalizeDelivery: (merge) => [
     merge
