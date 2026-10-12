@@ -197,6 +197,9 @@ class AgentGroupCall {
   }
 
   private acceptGroupEvent(event: Exclude<AgentGroupEvent, { type: "ready" }>): void {
+    // A settled group's outcome and terminal facts are final. Late events stay only in the
+    // stderr log.
+    if (this.settled) return;
     if (event.type === "lifecycle") this.forward(event.event);
     else if (event.type === "completed") this.finish({ results: event.results });
     else this.finish({ error: failureError(event.error) });
@@ -207,8 +210,10 @@ class AgentGroupCall {
     const response = promptResponse(line, this.groupId);
     if (response === undefined || this.settled) return;
     if (response.error !== undefined) {
+      this.recordRpcResponse(line);
       this.failToRun(`pi rejected the agent group command: ${response.error}`);
     } else if (response.disposition !== "handled") {
+      this.recordRpcResponse(line);
       this.failToRun(
         `pi did not route the agent group command to its bridge (disposition ${String(response.disposition)})`,
       );
@@ -261,14 +266,24 @@ class AgentGroupCall {
     this.cancelTimer = setTimeout(cancelled, this.settings.cancelSettleMs);
   }
 
-  private failToRun(detail: string): void {
+  /** Keep Pi's complete answer in the log, because the error message bounds the cause. */
+  private recordRpcResponse(line: string): void {
+    this.stderrLog.write(Buffer.from(`\n[pi-workflows] pi RPC response on stdout: ${line}\n`));
+  }
+
+  /**
+   * The bounded cause can quote Pi. The log location and launch hint follow it in full, so
+   * the message always names the complete diagnostics.
+   */
+  private failToRun(cause: string): void {
     // A cancelled group reports cancellation, so nothing would name the log.
     this.keepStderrLog = !this.options.signal.aborted;
     this.finishUnconfirmed(
       new PiAgentGroupError(
         "group",
         "could not run",
-        `${detail}. ${this.stderrLog.describe()}. ${LAUNCH_HINT}`,
+        cause,
+        `${this.stderrLog.describe()}. ${LAUNCH_HINT}`,
       ),
     );
   }
@@ -287,7 +302,9 @@ class AgentGroupCall {
     this.finish({ error });
   }
 
+  /** Forward one fact. A request's first terminal fact is its last, real or reported here. */
   private forward(event: PiAgentLifecycleEvent): void {
+    if (this.ledger.isTerminal(event.id)) return;
     this.ledger.record(event);
     const onLifecycle = this.options.onLifecycle;
     if (onLifecycle === undefined) return;
