@@ -384,11 +384,9 @@ function parseInput(value: unknown): AutoimplementInput {
       "autoimplement verificationUntested",
     ).map((item, index) => requireString(item, `autoimplement verificationUntested[${index}]`));
   }
-  const forge = parseForgeRequest(input.forge, "autoimplement forge");
-  const prTiming = parsePrTiming(input.prTiming, "autoimplement prTiming");
-  // A fully explicit input never reads the defaults file, so parsing a parsed input is idempotent.
-  const defaults = forge === undefined || prTiming === undefined ? loadAutoimplementDefaults() : {};
-  return {
+  // The upstream fields are read first, so their errors come before any forge, timing, or defaults
+  // file error, in the upstream order.
+  const upstream: AutoimplementInput = {
     task: requireString(input.task, "autoimplement task"),
     ...(input.plan !== undefined ? { plan: input.plan } : {}),
     ...(input.scope !== undefined ? { scope: requireString(input.scope, "scope") } : {}),
@@ -411,6 +409,13 @@ function parseInput(value: unknown): AutoimplementInput {
       ? {}
       : { verificationChecks: input.verificationChecks as VerificationCheck[] }),
     ...(verificationUntested === undefined ? {} : { verificationUntested }),
+  };
+  const forge = parseForgeRequest(input.forge, "autoimplement forge");
+  const prTiming = parsePrTiming(input.prTiming, "autoimplement prTiming");
+  // A fully explicit input never reads the defaults file, so parsing a parsed input is idempotent.
+  const defaults = forge === undefined || prTiming === undefined ? loadAutoimplementDefaults() : {};
+  return {
+    ...upstream,
     forge: forge ?? defaults.forge ?? "auto",
     prTiming: prTiming ?? defaults.prTiming ?? "early",
   };

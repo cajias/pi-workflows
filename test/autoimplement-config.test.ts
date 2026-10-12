@@ -168,6 +168,22 @@ describe("autoimplement input defaults", () => {
     await expect(parse({})).rejects.toThrow(`autoimplement defaults file ${defaultsFile()}`);
   });
 
+  it("reports the upstream input errors before forge, timing, and defaults file errors", async () => {
+    await writeDefaults("{ not json");
+    await expect(parse({ task: " ", forge: "bitbucket" })).rejects.toThrow(
+      "autoimplement task must be a non-empty string",
+    );
+    await expect(parse({ repository: "relative", prTiming: "later" })).rejects.toThrow(
+      "repository must be absolute",
+    );
+    await expect(parse({ baseBranch: "" })).rejects.toThrow(
+      "baseBranch must be a non-empty string",
+    );
+    await expect(parse({ forge: "bitbucket", prTiming: "later" })).rejects.toThrow(
+      "autoimplement forge must be auto, github, or gitlab",
+    );
+  });
+
   it("throws synchronously for an invalid defaults file", async () => {
     await writeDefaults({ schema: AUTOIMPLEMENT_DEFAULTS_SCHEMA, prTiming: "late" });
     const parseInput = autoimplementWorkflow.input;
