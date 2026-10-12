@@ -15,10 +15,10 @@ import {
 import { extractJsonValue } from "../workflows/json.js";
 import type { WorkflowActionContext, WorkflowProgressStatus } from "../workflows/types.js";
 import {
-  runPiAgentGroup,
+  launchPiAgentGroup,
   type PiAgentLifecycleEvent,
   type PiAgentRequest,
-} from "./pi-agent-group.js";
+} from "./pi-agent-launch.js";
 import plainSummaryWorkflow, { type PlainSummaryInput } from "./plain-summary.workflow.js";
 
 const REVIEW_TIMEOUT_MS = 20 * 60_000;
@@ -378,7 +378,7 @@ async function runReviews(context: WorkflowActionContext): Promise<SanityCheckRe
   const requests = buildReviewRequests(config.mode, evidence);
   const progress = await createAgentProgress(context, "review", requests);
   try {
-    const results = await runPiAgentGroup(agentRequests(requests, evidence.repository), {
+    const results = await launchPiAgentGroup(agentRequests(requests, evidence.repository), {
       maxConcurrency: config.mode === "parallel" ? 4 : 1,
       signal: context.signal,
       onLifecycle: progress.onLifecycle,
@@ -403,7 +403,7 @@ async function verifyReviews(context: WorkflowActionContext): Promise<SanityChec
   const requests = [buildVerificationRequest(evidence, reviews)];
   const progress = await createAgentProgress(context, "verification", requests);
   try {
-    const [result] = await runPiAgentGroup(agentRequests(requests, evidence.repository), {
+    const [result] = await launchPiAgentGroup(agentRequests(requests, evidence.repository), {
       maxConcurrency: 1,
       signal: context.signal,
       onLifecycle: progress.onLifecycle,

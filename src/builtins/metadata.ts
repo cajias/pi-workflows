@@ -4,6 +4,6 @@ export const BUILTIN_WORKFLOW_METADATA = [
   { id: "autodoc", revision: "3" },
   { id: "autoimplement", revision: "14" },
   { id: "plan-approval", revision: "4" },
-  { id: "sanity-check", revision: "6" },
+  { id: "sanity-check", revision: "7" },
   { id: "monitor", revision: "13" },
 ] as const;

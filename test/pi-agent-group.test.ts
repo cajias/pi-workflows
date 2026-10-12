@@ -4,12 +4,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createEphemeralCredentialStore,
   createEphemeralModelStore,
-  PiAgentGroupError,
   runPiAgentGroup,
-  type PiAgentLifecycleEvent,
-  type PiAgentRequest,
   type PiAgentSessionFactory,
 } from "../src/builtins/pi-agent-group.js";
+import {
+  PiAgentGroupError,
+  type PiAgentLifecycleEvent,
+  type PiAgentRequest,
+} from "../src/builtins/pi-agent-launch.js";
 import { startMockOpenAiServer } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
 

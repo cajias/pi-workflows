@@ -19,7 +19,20 @@ import {
   type ResolvedResource,
 } from "@earendil-works/pi-coding-agent";
 import { PROMPT_CEILING_CHARS } from "../workflows/prompt-evidence.js";
+import {
+  boundedErrorText,
+  PiAgentGroupError,
+  type PiAgentGroupLaunchOptions,
+  type PiAgentLifecycleEvent,
+  type PiAgentLifecycleState,
+  type PiAgentRequest,
+  type PiAgentResult,
+  type PiAgentThinkingLevel,
+  type PiAgentTool,
+} from "./pi-agent-launch.js";
 
+// This module imports packages that only Pi supplies. Only processes that Pi starts may load
+// it: the agent group bridge that the workflow runner starts inside headless Pi, and tests.
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const MAX_AGENTS = 8;
 const MAX_CONCURRENCY = 8;
@@ -27,7 +40,6 @@ const DEFAULT_FINAL_CHARS = 256_000;
 const MAX_FINAL_CHARS = 1_000_000;
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 const MAX_TIMEOUT_MS = 60 * 60_000;
-const MAX_ERROR_CHARS = 2_000;
 const MAX_PHASE_UPDATES = 64;
 const MIN_PHASE_INTERVAL_MS = 250;
 const BUILTIN_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -43,40 +55,6 @@ const RESERVED_EXTENSION_NAMES = new Set([
   "workflow-cancel",
 ]);
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-
-export type PiAgentTool = "read" | "grep" | "find" | "ls";
-export type PiAgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-export type PiAgentRequest = {
-  id: string;
-  role: string;
-  prompt: string;
-  cwd: string;
-  tools: PiAgentTool[];
-  timeoutMs?: number;
-  model?: { provider: string; id: string };
-  thinkingLevel?: PiAgentThinkingLevel;
-};
-
-export type PiAgentResult = {
-  id: string;
-  text: string;
-  model: string;
-  thinkingLevel: PiAgentThinkingLevel;
-  durationMs: number;
-};
-
-export type PiAgentLifecycleState = "running" | "completed" | "failed" | "cancelled";
-
-export type PiAgentLifecycleEvent = {
-  id: string;
-  role: string;
-  state: PiAgentLifecycleState;
-  phase: string;
-  elapsedMs: number;
-  model?: string;
-  thinkingLevel?: PiAgentThinkingLevel;
-};
 
 type PiAgentEvent = Record<string, unknown>;
 
@@ -103,27 +81,10 @@ export type PiAgentSessionFactory = (
   context: { signal: AbortSignal },
 ) => Promise<PiAgentSession>;
 
-export type PiAgentGroupOptions = {
-  maxConcurrency: number;
-  signal: AbortSignal;
-  failFast?: boolean;
-  maxFinalChars?: number;
-  onLifecycle?: (event: PiAgentLifecycleEvent) => void | Promise<void>;
+export type PiAgentGroupOptions = PiAgentGroupLaunchOptions & {
   sessionFactory?: PiAgentSessionFactory;
-  behaviorExtensionPaths?: string[];
   now?: () => number;
 };
-
-export class PiAgentGroupError extends Error {
-  constructor(
-    readonly agentId: string,
-    readonly code: string,
-    message: string,
-  ) {
-    super(`Pi agent ${agentId} ${code}: ${bounded(message)}`);
-    this.name = "PiAgentGroupError";
-  }
-}
 
 export async function runPiAgentGroup(
   input: PiAgentRequest[],
@@ -1379,7 +1340,7 @@ function cancellationReason(reason: unknown): string {
 }
 
 function abortSuffix(error: unknown): string {
-  return error === undefined ? "" : `; abort failed: ${bounded(errorMessage(error))}`;
+  return error === undefined ? "" : `; abort failed: ${boundedErrorText(errorMessage(error))}`;
 }
 
 function modelName(model: { provider: string; id: string } | undefined): string {
@@ -1411,11 +1372,6 @@ function nonEmpty(value: unknown, label: string, max: number): asserts value is 
   if (typeof value !== "string" || value.trim().length === 0 || value.length > max) {
     throw new Error(`${label} must be a non-empty string with at most ${max} characters`);
   }
-}
-
-function bounded(value: string): string {
-  const text = value.trim() || "unknown failure";
-  return text.length <= MAX_ERROR_CHARS ? text : `${text.slice(0, MAX_ERROR_CHARS)}…`;
 }
 
 function errorMessage(error: unknown): string {

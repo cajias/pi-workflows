@@ -3,7 +3,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  setPiAgentGroupLauncher,
+  type PiAgentGroupLaunchOptions,
+  type PiAgentRequest,
+  type PiAgentResult,
+} from "../src/builtins/pi-agent-launch.js";
 import sanityCheckWorkflow, {
   buildDetailedSanityCheckPrompt,
   buildReviewRequests,
@@ -17,9 +23,13 @@ import sanityCheckWorkflow, {
   parseSanityCheckResult,
   type ContributionEvidence,
   type SanityCheckArea,
+  type SanityCheckMode,
   type SanityCheckReview,
   type SanityCheckVerdict,
 } from "../src/builtins/sanity-check.workflow.js";
+import { compute, defineWorkflow } from "../src/workflows/definition.js";
+import { WorkflowEngine } from "../src/workflows/engine.js";
+import { makeStateDatabasePath, ScriptedExecutor } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 const areas: SanityCheckArea[] = ["necessity", "duplication", "contracts", "scope_tests"];
@@ -74,7 +84,126 @@ function finalResult(verdict: SanityCheckVerdict) {
   };
 }
 
+type HostCall = { requests: PiAgentRequest[]; options: PiAgentGroupLaunchOptions };
+
+/** Answer every request like the real launcher: lifecycle facts first, then final text. */
+function installFakeHost(answer: (request: PiAgentRequest) => string | Error): HostCall[] {
+  const calls: HostCall[] = [];
+  setPiAgentGroupLauncher(async (requests, options) => {
+    calls.push({ requests, options });
+    const results: PiAgentResult[] = [];
+    for (const request of requests) {
+      const base = { id: request.id, role: request.role, elapsedMs: 1, model: "fixture/model" };
+      await options.onLifecycle?.({ ...base, state: "running", phase: "thinking" });
+      const text = answer(request);
+      if (text instanceof Error) {
+        await options.onLifecycle?.({ ...base, state: "failed", phase: "failed" });
+        throw text;
+      }
+      await options.onLifecycle?.({ ...base, state: "completed", phase: "completed" });
+      results.push({
+        id: request.id,
+        text,
+        model: "fixture/model",
+        thinkingLevel: "high",
+        durationMs: 1,
+      });
+    }
+    return results;
+  });
+  return calls;
+}
+
+/** The review and verification actions of Sanity Check, after fixed evidence. */
+function agentProbe(mode: SanityCheckMode) {
+  return defineWorkflow({
+    name: "sanity-check-agents",
+    startAt: "prepare",
+    nodes: {
+      prepare: compute({ run: () => ({ mode }) }),
+      collectEvidence: compute({ run: () => evidence() }),
+      review: sanityCheckWorkflow.nodes.review,
+      verify: sanityCheckWorkflow.nodes.verify,
+    },
+    edges: [
+      { from: "prepare", to: "collectEvidence" },
+      { from: "collectEvidence", to: "review" },
+      { from: "review", to: "verify" },
+    ],
+  });
+}
+
+async function runAgentProbe(mode: SanityCheckMode) {
+  return await new WorkflowEngine({
+    executor: new ScriptedExecutor(),
+    databasePath: await makeStateDatabasePath("sanity-check-agents"),
+  }).run(agentProbe(mode), {});
+}
+
+afterEach(() => setPiAgentGroupLauncher(undefined));
+
 describe("sanity-check workflow", () => {
+  it("runs serial review and verification sessions through the Pi agent group launcher", async () => {
+    const calls = installFakeHost((request) =>
+      JSON.stringify(request.id === "verification" ? finalResult("keep") : review()),
+    );
+    const result = await runAgentProbe("serial");
+
+    expect(result.state.status).toBe("completed");
+    expect(result.state.outputs.review).toEqual([review()]);
+    expect(result.state.outputs.verify).toEqual(finalResult("keep"));
+    expect(calls.map((call) => call.options.maxConcurrency)).toEqual([1, 1]);
+    expect(calls.map((call) => call.requests.map((request) => request.id))).toEqual([
+      ["review"],
+      ["verification"],
+    ]);
+    for (const request of calls.flatMap((call) => call.requests)) {
+      expect(request).toMatchObject({
+        cwd: "/tmp/repository",
+        tools: ["read", "grep", "find", "ls"],
+        timeoutMs: 20 * 60_000,
+      });
+    }
+    const progress = new Map(
+      (result.state.updates ?? []).map((update) => [update.key, update.data.status]),
+    );
+    expect(progress.get("agents/review")).toBe("completed");
+    expect(progress.get("agents/review/review")).toBe("completed");
+    expect(progress.get("agents/verification")).toBe("completed");
+    expect(progress.get("agents/verification/verification")).toBe("completed");
+  });
+
+  it("runs four focused reviews concurrently in parallel mode", async () => {
+    const calls = installFakeHost((request) =>
+      JSON.stringify(
+        request.id === "verification"
+          ? finalResult("simplify")
+          : review([request.id as SanityCheckArea]),
+      ),
+    );
+    const result = await runAgentProbe("parallel");
+
+    expect(result.state.status).toBe("completed");
+    expect(result.state.outputs.review).toEqual(areas.map((area) => review([area])));
+    expect(calls[0]?.options.maxConcurrency).toBe(4);
+    expect(calls[0]?.requests.map((request) => request.id)).toEqual(areas);
+  });
+
+  it("fails the review action with the launcher error and marks its progress failed", async () => {
+    installFakeHost(() => new Error("Pi agent review failed: provider unavailable"));
+    const result = await runAgentProbe("serial");
+
+    expect(result.state.status).toBe("failed");
+    expect(JSON.stringify(result.state.results.review)).toContain(
+      "Pi agent review failed: provider unavailable",
+    );
+    const progress = new Map(
+      (result.state.updates ?? []).map((update) => [update.key, update.data.status]),
+    );
+    expect(progress.get("agents/review")).toBe("failed");
+    expect(progress.get("agents/review/review")).toBe("failed");
+  });
+
   it("bounds malformed agent output errors without retaining model text", () => {
     const privateOutput = `PRIVATE_REPOSITORY_TEXT_${"x".repeat(100_000)}`;
     let error: unknown;

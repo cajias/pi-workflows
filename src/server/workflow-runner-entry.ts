@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { builtinWorkflowCatalog } from "../builtins/catalog.js";
+import { setPiAgentGroupLauncher } from "../builtins/pi-agent-launch.js";
 import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
 import { compositionMetadata } from "../workflows/composition.js";
 import { WorkflowEngine } from "../workflows/engine.js";
@@ -22,6 +23,8 @@ import type {
   WorkflowMountedSource,
   WorkflowSource,
 } from "../workflows/types.js";
+import { HeadlessPiAgentGroupLauncher } from "./agent-group-launcher.js";
+import type { HeadlessPiOptions } from "./headless-pi.js";
 import { RpcStepExecutor } from "./rpc-executor.js";
 import type { WorkflowRunnerLaunchEnvelope } from "./state.js";
 import { materializeRunnerContent } from "./workflow-runner-content.js";
@@ -359,40 +362,23 @@ export async function runWorkflowRunner(): Promise<number> {
       return 1;
     }
     const store = new ServerBackedWorkflowStore(launch.runId, transport, ready.revision ?? 0);
+    const headlessPi = headlessPiOptions(launch, bootstrap, transport);
+    // Built-in actions that need Pi agent sessions run them in headless pi children
+    // started exactly like headless agent steps, because this process is plain Node.
+    const agentGroups = new HeadlessPiAgentGroupLauncher(headlessPi);
+    setPiAgentGroupLauncher(agentGroups.run);
     let executor: AgentStepExecutor;
-    let closeExecutor: (() => Promise<void>) | undefined;
+    let closeExecutor: () => Promise<void>;
     if (bootstrap.originSessionId !== null) {
       executor = new InteractiveExecutor(store, bootstrap.candidateInteraction);
+      closeExecutor = async () => await agentGroups.close();
     } else {
-      const rpc = new RpcStepExecutor({
-        cwd: launch.projectPath,
-        processGroup: "own",
-        abortGraceMs: 1_000,
-        registry: {
-          register: async (pid) => {
-            await transport.request({
-              messageId: randomUUID(),
-              operation: "process.register",
-              kind: "runner.progress",
-              expectedRevision: 0,
-              payload: { pid },
-            });
-          },
-          unregister: async (pid) => {
-            await transport.request({
-              messageId: randomUUID(),
-              operation: "process.unregister",
-              kind: "runner.progress",
-              expectedRevision: 0,
-              payload: { pid },
-            });
-          },
-        },
-        ...(bootstrap.piArgs === undefined ? {} : { piArgs: bootstrap.piArgs }),
-      });
-      const closeRpc = async () => await rpc.close();
+      const rpc = new RpcStepExecutor(headlessPi);
+      const closeHeadlessPi = async () => {
+        await Promise.all([rpc.close(), agentGroups.close()]);
+      };
       const onShutdown = () => {
-        void closeRpc().catch((error: unknown) => {
+        void closeHeadlessPi().catch((error: unknown) => {
           process.stderr.write(`Headless pi shutdown failed: ${errorMessage(error)}\n`);
         });
       };
@@ -402,7 +388,7 @@ export async function runWorkflowRunner(): Promise<number> {
       closeExecutor = async () => {
         process.removeListener("SIGTERM", onShutdown);
         process.removeListener("SIGINT", onShutdown);
-        await closeRpc();
+        await closeHeadlessPi();
       };
     }
     const engine = new WorkflowEngine({
@@ -426,11 +412,42 @@ export async function runWorkflowRunner(): Promise<number> {
       });
       return 0;
     } finally {
-      await closeExecutor?.();
+      setPiAgentGroupLauncher(undefined);
+      await closeExecutor();
     }
   } finally {
     transport.close();
   }
+}
+
+/** One launch configuration for every headless pi child that this runner starts. */
+function headlessPiOptions(
+  launch: WorkflowRunnerLaunchEnvelope,
+  bootstrap: WorkflowRunnerBootstrap,
+  transport: StdioRunnerTransport,
+): HeadlessPiOptions {
+  const processRequest = async (
+    operation: "process.register" | "process.unregister",
+    pid: number,
+  ) => {
+    await transport.request({
+      messageId: randomUUID(),
+      operation,
+      kind: "runner.progress",
+      expectedRevision: 0,
+      payload: { pid },
+    });
+  };
+  return {
+    cwd: launch.projectPath,
+    processGroup: "own",
+    abortGraceMs: 1_000,
+    registry: {
+      register: async (pid) => await processRequest("process.register", pid),
+      unregister: async (pid) => await processRequest("process.unregister", pid),
+    },
+    ...(bootstrap.piArgs === undefined ? {} : { piArgs: bootstrap.piArgs }),
+  };
 }
 
 type WorkflowRunnerSources = {
