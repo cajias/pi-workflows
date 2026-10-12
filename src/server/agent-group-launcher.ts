@@ -197,8 +197,8 @@ class AgentGroupCall {
   }
 
   private acceptGroupEvent(event: Exclude<AgentGroupEvent, { type: "ready" }>): void {
-    // A settled group's outcome and terminal facts are final. Late events stay only in the
-    // stderr log.
+    // A settled group's outcome and terminal facts are final. Late events are ignored; when the
+    // group's stderr log is kept (failures where pi could not run the group), they remain in it.
     if (this.settled) return;
     if (event.type === "lifecycle") this.forward(event.event);
     else if (event.type === "completed") this.finish({ results: event.results });
