@@ -602,7 +602,7 @@ describe("autoimplement end-timing prompts", () => {
       await renderPrompt("publish", endPromptContext("github", END_PROMPT_STEPS))
     ).split("\n");
     expect(lines[0]).toBe(
-      "Push exactly the reviewed local head local123 to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
+      "Push exactly the reviewed local head local123 to the task branch with git push -u <remote> <task branch> and without force, so the workflow can check the pushed head. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
     );
     expect(lines[1]).toBe(
       "If the local HEAD is not local123, do not push. Report the difference instead.",
@@ -822,6 +822,13 @@ describe("autoimplement reviewed publication validator", () => {
       routed("publishReviewed"),
     ];
   };
+  /** Commits a reviewed change on the task branch and returns its head. */
+  const reviewedCommit = async (): Promise<string> => {
+    await fs.writeFile(path.join(fixture.repository, "reviewed.txt"), "reviewed\n");
+    await git(fixture.repository, ["add", "reviewed.txt"]);
+    await git(fixture.repository, ["commit", "-m", "reviewed"]);
+    return await git(fixture.repository, ["rev-parse", "HEAD"]);
+  };
   const earlierPublish = (pr: string, outcome: WorkflowNodeOutcome = "ok") =>
     step("publish", { repositories: [fixtureCandidate("0".repeat(40), { pr })] }, outcome);
 
@@ -884,10 +891,7 @@ describe("autoimplement reviewed publication validator", () => {
     await git(remote, ["init", "--bare", "-b", "main"]);
     await git(fixture.repository, ["remote", "add", "origin", remote]);
     await git(fixture.repository, ["push", "-q", "-u", "origin", "feat/demo"]);
-    await fs.writeFile(path.join(fixture.repository, "reviewed.txt"), "reviewed\n");
-    await git(fixture.repository, ["add", "reviewed.txt"]);
-    await git(fixture.repository, ["commit", "-m", "reviewed"]);
-    const head = await git(fixture.repository, ["rev-parse", "HEAD"]);
+    const head = await reviewedCommit();
     const context = fixtureContext(gate({}, head));
     await expect(validate(pushed({ headRevision: head }), context)).rejects.toThrow(
       `publication repositories[0].headRevision must be the pushed head, but refs/remotes/origin/feat/demo is ${fixture.baseRevision}`,
@@ -896,7 +900,7 @@ describe("autoimplement reviewed publication validator", () => {
     await expect(validate(pushed({ headRevision: head }), context)).resolves.toMatchObject({
       repositories: [{ headRevision: head }],
     });
-    // A push destination with another branch name is not a reliable tracking ref, so it is skipped.
+    // Git's push destination names another branch, so the task branch ref of that remote decides.
     await git(fixture.repository, [
       "push",
       "-q",
@@ -910,6 +914,45 @@ describe("autoimplement reviewed publication validator", () => {
       "update-ref",
       "refs/remotes/origin/feat/demo",
       fixture.baseRevision,
+    ]);
+    await expect(validate(pushed({ headRevision: head }), context)).rejects.toThrow(
+      `but refs/remotes/origin/feat/demo is ${fixture.baseRevision}`,
+    );
+  });
+
+  it("checks a reviewed push without an upstream against the sole remote", async () => {
+    const remote = await makeTempDir("autoimplement-reviewed-push-no-upstream");
+    await git(remote, ["init", "--bare", "-b", "main"]);
+    await git(fixture.repository, ["remote", "add", "origin", remote]);
+    const head = await reviewedCommit();
+    const context = fixtureContext(gate({}, head));
+    // A claimed push that never happened leaves the mapped tracking ref absent.
+    await expect(validate(pushed({ headRevision: head }), context)).rejects.toThrow(
+      "publication repositories[0] was not pushed: refs/remotes/origin/feat/demo is absent, although a push of feat/demo creates it",
+    );
+    await git(fixture.repository, [
+      "push",
+      "-q",
+      "origin",
+      `${fixture.baseRevision}:refs/heads/feat/demo`,
+    ]);
+    await expect(validate(pushed({ headRevision: head }), context)).rejects.toThrow(
+      `but refs/remotes/origin/feat/demo is ${fixture.baseRevision}`,
+    );
+    await git(fixture.repository, ["push", "-q", "origin", "feat/demo"]);
+    // The push set no upstream, so Git's own push destination is unknown.
+    await expect(
+      git(fixture.repository, ["config", "--get", "branch.feat/demo.remote"]),
+    ).rejects.toThrow();
+    await expect(validate(pushed({ headRevision: head }), context)).resolves.toMatchObject({
+      repositories: [{ headRevision: head }],
+    });
+    // A refspec that does not map the branch makes the destination unknown, so nothing is checked.
+    await git(fixture.repository, ["update-ref", "-d", "refs/remotes/origin/feat/demo"]);
+    await git(fixture.repository, [
+      "config",
+      "remote.origin.fetch",
+      "+refs/heads/main:refs/remotes/origin/main",
     ]);
     await expect(validate(pushed({ headRevision: head }), context)).resolves.toMatchObject({
       repositories: [{ headRevision: head }],

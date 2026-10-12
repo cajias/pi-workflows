@@ -69,7 +69,7 @@ const PUBLISH_DEPENDENCY_FINGERPRINT =
 /** The push of a reviewed local head. This exact head passed the review gate, so nothing may change it. */
 function reviewedPushLines(headRevision: string): string[] {
   return [
-    `Push exactly the reviewed local head ${headRevision} to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.`,
+    `Push exactly the reviewed local head ${headRevision} to the task branch with git push -u <remote> <task branch> and without force, so the workflow can check the pushed head. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.`,
     `If the local HEAD is not ${headRevision}, do not push. Report the difference instead.`,
   ];
 }

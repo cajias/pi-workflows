@@ -4,10 +4,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  commitTimeSeconds,
   inspectWorkspace,
   parsePreparedWorkspace,
   parseWorkspacePreparationInput,
   prepareWorkspace,
+  pushTrackingHead,
   validateBranchName,
   workspacePreparationWorkflow,
   type WorkspacePreparationInput,
@@ -419,5 +421,113 @@ describe("workspace preparation", () => {
       route: "blocked",
       reason: "The supplied prepared workspace is stale or unavailable.",
     });
+  });
+});
+
+describe("push tracking head", () => {
+  /** A task branch with one bare remote and nothing pushed yet. */
+  async function taskBranch(name: string): Promise<{ repo: string; head: string; bare: string }> {
+    const repo = await repository(name);
+    const bare = await makeTempDir(`${name}-remote`);
+    await git(bare, ["init", "--bare", "-b", "main"]);
+    await git(repo, ["switch", "-c", "feat/x"]);
+    await git(repo, ["remote", "add", "origin", bare]);
+    return { repo, head: await git(repo, ["rev-parse", "HEAD"]), bare };
+  }
+
+  it("reads the push destination that Git names for a branch with an upstream", async () => {
+    const { repo, head } = await taskBranch("tracking-upstream");
+    await git(repo, ["push", "-q", "-u", "origin", "feat/x"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: head,
+    });
+  });
+
+  it("uses the sole remote after a push without an upstream", async () => {
+    const { repo, head } = await taskBranch("tracking-sole-remote");
+    // The fetch refspec maps the branch, so a push would create the ref.
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: null,
+    });
+    await git(repo, ["push", "-q", "origin", "feat/x"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: head,
+    });
+  });
+
+  it("follows pushRemote, then pushDefault, then the branch remote", async () => {
+    const { repo, head, bare } = await taskBranch("tracking-configured-remote");
+    await git(repo, ["remote", "add", "fork", bare]);
+    await git(repo, ["remote", "add", "mirror", bare]);
+    // Several remotes and no configuration: the destination is unknown.
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await git(repo, ["config", "branch.feat/x.remote", "origin"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
+      ref: "refs/remotes/origin/feat/x",
+    });
+    await git(repo, ["config", "remote.pushDefault", "mirror"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
+      ref: "refs/remotes/mirror/feat/x",
+    });
+    await git(repo, ["config", "branch.feat/x.pushRemote", "fork"]);
+    await git(repo, ["push", "-q", "fork", "feat/x"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/fork/feat/x",
+      headRevision: head,
+    });
+    // A push remote that names no configured remote, such as a URL, gives no tracking ref.
+    await git(repo, ["config", "branch.feat/x.pushRemote", bare]);
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+  });
+
+  it("checks the task branch ref when Git's push destination has another name", async () => {
+    const { repo, head } = await taskBranch("tracking-other-name");
+    await git(repo, ["push", "-q", "origin", "feat/x:main"]);
+    await git(repo, ["fetch", "-q", "origin"]);
+    await git(repo, ["branch", "--set-upstream-to", "origin/main"]);
+    await git(repo, ["config", "push.default", "upstream"]);
+    expect(await git(repo, ["rev-parse", "--symbolic-full-name", "feat/x@{push}"])).toBe(
+      "refs/remotes/origin/main",
+    );
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: null,
+    });
+    await git(repo, ["push", "-q", "origin", "feat/x:feat/x"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: head,
+    });
+  });
+
+  it("gives no tracking ref when the fetch refspec does not map the branch", async () => {
+    const { repo } = await taskBranch("tracking-refspec");
+    const fetchSpecs = async (...specs: string[]) => {
+      await git(repo, ["config", "--unset-all", "remote.origin.fetch"]);
+      for (const spec of specs) await git(repo, ["config", "--add", "remote.origin.fetch", spec]);
+    };
+    await fetchSpecs("+refs/heads/main:refs/remotes/origin/main");
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await fetchSpecs("refs/heads/*", "+refs/heads/*:refs/remotes/origin/*", "^refs/heads/feat/*");
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await fetchSpecs("+refs/heads/feat/x:refs/remotes/origin/feat/x");
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({ headRevision: null });
+    await fetchSpecs("+refs/heads/*/x:refs/remotes/origin/*/x");
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({ headRevision: null });
+    await fetchSpecs("+refs/heads/feature-*:refs/remotes/origin/*", "+refs/heads/*/y:refs/x/*");
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await fetchSpecs("+refs/heads/feat/x/*:refs/remotes/origin/*");
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+  });
+
+  it("gives no tracking ref without a remote and reads commit times", async () => {
+    const repo = await repository("tracking-no-remote");
+    expect(await pushTrackingHead(repo, "main")).toBeUndefined();
+    const time = await commitTimeSeconds(repo, "HEAD");
+    expect(Number.isInteger(time)).toBe(true);
+    expect(time).toBeLessThanOrEqual(Math.ceil(Date.now() / 1000));
   });
 });

@@ -144,7 +144,7 @@ describe("reviewed publication text", () => {
   it("pushes exactly the reviewed head and reuses the one pull request on GitHub", () => {
     const lines = forgeText("github").publish.reviewed("abc123");
     expect(lines.slice(0, 2)).toEqual([
-      "Push exactly the reviewed local head abc123 to the task branch without force. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
+      "Push exactly the reviewed local head abc123 to the task branch with git push -u <remote> <task branch> and without force, so the workflow can check the pushed head. This head passed the review gate, so create no new commits and do not amend or rewrite any commit.",
       "If the local HEAD is not abc123, do not push. Report the difference instead.",
     ]);
     expect(lines).toContain(

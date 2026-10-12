@@ -1470,15 +1470,22 @@ function assertReusesPublishedRequest(
 }
 
 /**
- * When Git names the remote-tracking ref that a push of the branch updates, that local ref must
- * record the reviewed head. This reads local refs only and makes no network call.
+ * When the push destination of the branch is known, its remote-tracking ref must record the
+ * reviewed head. A ref that is absent although the remote's fetch refspec maps the branch to it
+ * means the claimed push did not happen. This reads local refs only and makes no network call.
  */
 async function assertPushedTrackingHead(
   repository: CandidateRepository,
   label: string,
 ): Promise<void> {
   const pushed = await pushTrackingHead(repository.repository, repository.branch);
-  if (pushed !== undefined && pushed.headRevision !== repository.headRevision) {
+  if (pushed === undefined) return;
+  if (pushed.headRevision === null) {
+    throw new Error(
+      `${label} was not pushed: ${pushed.ref} is absent, although a push of ${repository.branch} creates it`,
+    );
+  }
+  if (pushed.headRevision !== repository.headRevision) {
     throw new Error(
       `${label}.headRevision must be the pushed head, but ${pushed.ref} is ${pushed.headRevision}`,
     );

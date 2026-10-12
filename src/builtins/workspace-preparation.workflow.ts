@@ -184,32 +184,131 @@ export async function inspectLocalHead(repository: string): Promise<LocalHead> {
   return { branch, headRevision, changedPaths: await changedPaths(repository) };
 }
 
-/** A remote-tracking ref and the revision it records. */
-export type TrackingHead = { ref: string; headRevision: string };
+/**
+ * The remote-tracking ref that a push of a branch updates, and the revision it records. The
+ * revision is null when the ref is absent although the remote's fetch refspec maps the branch to
+ * it, so a push of the branch would have created it.
+ */
+export type TrackingHead = { ref: string; headRevision: string | null };
 
 const REMOTE_TRACKING_PREFIX = "refs/remotes/";
 
+/** Runs a read-only Git query whose failure means only that the value is not set. */
+async function optionalGit(cwd: string, args: string[]): Promise<string | undefined> {
+  try {
+    return await git(cwd, args);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * The remote-tracking ref that `git push` updates for `branch`, read from local refs only. It is
- * undefined when Git does not name one reliably: no push destination is configured, its tracking
- * ref is missing, or the destination branch has another name.
+ * The remote-tracking ref of the push destination of `branch`, read from local refs and
+ * configuration only. Git's own `<branch>@{push}` wins when it names `refs/remotes/<remote>/<branch>`.
+ * Otherwise the remote is the first one set among `branch.<branch>.pushRemote`, `remote.pushDefault`,
+ * and `branch.<branch>.remote`, or else the only remote. The result is undefined when no remote is
+ * known, or when the ref is absent and the remote's fetch refspec does not map the branch to it.
  */
 export async function pushTrackingHead(
   repository: string,
   branch: string,
 ): Promise<TrackingHead | undefined> {
-  let ref: string;
-  try {
-    ref = await git(repository, ["rev-parse", "--symbolic-full-name", `${branch}@{push}`]);
-  } catch {
-    return undefined;
+  const pushed = await optionalGit(repository, [
+    "rev-parse",
+    "--symbolic-full-name",
+    `${branch}@{push}`,
+  ]);
+  if (pushed !== undefined && trackingRemote(pushed, branch) !== undefined) {
+    return {
+      ref: pushed,
+      headRevision: await git(repository, ["rev-parse", "--verify", `${pushed}^{commit}`]),
+    };
   }
-  const remote =
-    ref.startsWith(REMOTE_TRACKING_PREFIX) && ref.endsWith(`/${branch}`)
-      ? ref.slice(REMOTE_TRACKING_PREFIX.length, -branch.length - 1)
-      : "";
-  if (remote.length === 0) return undefined;
-  return { ref, headRevision: await git(repository, ["rev-parse", "--verify", `${ref}^{commit}`]) };
+  const remote = await pushRemote(repository, branch);
+  if (remote === undefined) return undefined;
+  const ref = `${REMOTE_TRACKING_PREFIX}${remote}/${branch}`;
+  const headRevision = await optionalGit(repository, [
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${ref}^{commit}`,
+  ]);
+  if (headRevision !== undefined) return { ref, headRevision };
+  return (await fetchRefspecTracks(repository, remote, branch))
+    ? { ref, headRevision: null }
+    : undefined;
+}
+
+/** The remote of a `refs/remotes/<remote>/<branch>` ref, or undefined for any other ref. */
+function trackingRemote(ref: string, branch: string): string | undefined {
+  if (!ref.startsWith(REMOTE_TRACKING_PREFIX) || !ref.endsWith(`/${branch}`)) return undefined;
+  const remote = ref.slice(REMOTE_TRACKING_PREFIX.length, -branch.length - 1);
+  return remote.length === 0 ? undefined : remote;
+}
+
+/** The configured push remote of a branch, or the only remote. A value that names no remote is unknown. */
+async function pushRemote(repository: string, branch: string): Promise<string | undefined> {
+  const remotes = ((await optionalGit(repository, ["remote"])) ?? "")
+    .split(/\r?\n/)
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  for (const key of [
+    `branch.${branch}.pushRemote`,
+    "remote.pushDefault",
+    `branch.${branch}.remote`,
+  ]) {
+    const configured = await optionalGit(repository, ["config", "--get", key]);
+    if (configured !== undefined && configured.length > 0) {
+      return remotes.includes(configured) ? configured : undefined;
+    }
+  }
+  return remotes.length === 1 ? remotes[0] : undefined;
+}
+
+/**
+ * True when a fetch refspec of `remote` maps `refs/heads/<branch>` to `refs/remotes/<remote>/<branch>`
+ * and no negative refspec excludes the branch. Git updates that ref on a successful push.
+ */
+async function fetchRefspecTracks(
+  repository: string,
+  remote: string,
+  branch: string,
+): Promise<boolean> {
+  const specs = (
+    (await optionalGit(repository, ["config", "--get-all", `remote.${remote}.fetch`])) ?? ""
+  )
+    .split(/\r?\n/)
+    .map((spec) => spec.trim())
+    .filter((spec) => spec.length > 0);
+  const source = `refs/heads/${branch}`;
+  const target = `${REMOTE_TRACKING_PREFIX}${remote}/${branch}`;
+  if (
+    specs.some(
+      (spec) => spec.startsWith("^") && mapRefspec(spec.slice(1), "", source) !== undefined,
+    )
+  ) {
+    return false;
+  }
+  return specs.some((spec) => {
+    const [from, to] = spec.replace(/^\+/, "").split(":", 2);
+    return to !== undefined && mapRefspec(from ?? "", to, source) === target;
+  });
+}
+
+/** Maps `name` through one refspec side pair. A side has at most one `*`, as Git requires. */
+function mapRefspec(from: string, to: string, name: string): string | undefined {
+  const star = from.indexOf("*");
+  if (star < 0) return from === name ? to : undefined;
+  const prefix = from.slice(0, star);
+  const suffix = from.slice(star + 1);
+  if (name.length < prefix.length + suffix.length) return undefined;
+  if (!name.startsWith(prefix) || !name.endsWith(suffix)) return undefined;
+  return to.replace("*", name.slice(prefix.length, name.length - suffix.length));
+}
+
+/** The committer time of a commit, in seconds since the epoch. */
+export async function commitTimeSeconds(repository: string, revision: string): Promise<number> {
+  return Number(await git(repository, ["show", "-s", "--format=%ct", `${revision}^{commit}`]));
 }
 
 function workspaceScope(input: WorkspacePreparationInput): string {
