@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   FORGE_RESOLUTION_SCHEMA,
   defaultForgeIo,
+  defaultsFileForgeResolution,
   detectForge,
   ghHostsFile,
   glabConfigFiles,
@@ -235,6 +236,19 @@ describe("autoimplement forge detection", () => {
         host: "gitlab.com",
         remoteUrl,
         reason: "remote host altssh.gitlab.com, the GitLab.com SSH host on port 443",
+      });
+    }
+  });
+
+  it("records a forge from the defaults file with its own reason", () => {
+    for (const forge of ["github", "gitlab"] as const) {
+      expect(defaultsFileForgeResolution(forge)).toEqual({
+        schema: FORGE_RESOLUTION_SCHEMA,
+        requested: forge,
+        forge,
+        host: null,
+        remoteUrl: null,
+        reason: "Autoimplement defaults file",
       });
     }
   });

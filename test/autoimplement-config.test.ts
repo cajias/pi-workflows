@@ -9,6 +9,7 @@ import {
   parseAutoimplementDefaults,
   parsePrTiming,
 } from "../src/builtins/autoimplement-config.js";
+import { FORGE_RESOLUTION_SCHEMA } from "../src/builtins/autoimplement-forge.js";
 import autoimplementWorkflow from "../src/builtins/autoimplement.workflow.js";
 import monitorWorkflow from "../src/builtins/monitor.workflow.js";
 import { decisionConfigDir } from "../src/channels/config.js";
@@ -44,6 +45,21 @@ async function parse(value: Record<string, unknown>): Promise<Record<string, unk
     string,
     unknown
   >;
+}
+
+/** Runs the `resolveForge` action of Autoimplement for a normalized input. */
+async function resolveForgeNode(input: Record<string, unknown>): Promise<unknown> {
+  const node = autoimplementWorkflow.nodes.resolveForge;
+  if (node?.nodeType !== "action" || !("run" in node)) {
+    throw new Error("resolveForge must be a function action");
+  }
+  return await node.run({
+    input,
+    outputs: {},
+    results: {},
+    signal: new AbortController().signal,
+    publishUpdate: async () => {},
+  } as never);
 }
 
 describe("autoimplement defaults file", () => {
@@ -155,6 +171,43 @@ describe("autoimplement input defaults", () => {
     });
     await writeDefaults({ schema: AUTOIMPLEMENT_DEFAULTS_SCHEMA, prTiming: "end" });
     expect(await parse({})).toMatchObject({ forge: "auto", prTiming: "end" });
+  });
+
+  it("records that the forge came from the file and resolves it with that reason", async () => {
+    await writeDefaults({ schema: AUTOIMPLEMENT_DEFAULTS_SCHEMA, forge: "gitlab" });
+    const fromFile = await parse({});
+    expect(fromFile).toMatchObject({ forge: "gitlab", forgeSource: "defaults" });
+    expect(await parse(fromFile)).toEqual(fromFile);
+    expect(await parse({ forge: "gitlab" })).not.toHaveProperty("forgeSource");
+    expect(await parse({ prTiming: "end" })).toMatchObject({ forgeSource: "defaults" });
+    expect(await resolveForgeNode(fromFile)).toEqual({
+      schema: FORGE_RESOLUTION_SCHEMA,
+      requested: "gitlab",
+      forge: "gitlab",
+      host: null,
+      remoteUrl: null,
+      reason: "Autoimplement defaults file",
+    });
+    expect(await resolveForgeNode(await parse({ forge: "gitlab" }))).toMatchObject({
+      reason: "explicit input",
+    });
+    await writeDefaults({ schema: AUTOIMPLEMENT_DEFAULTS_SCHEMA, forge: "auto" });
+    const detected = await parse({ repository: await makeTempDir("defaults-auto-repo") });
+    expect(detected).toMatchObject({ forge: "auto", forgeSource: "defaults" });
+    expect(await resolveForgeNode(detected)).toMatchObject({
+      requested: "auto",
+      forge: "github",
+      reason: expect.stringContaining("using GitHub (upstream default)"),
+    });
+  });
+
+  it("accepts forgeSource only as the defaults marker of a parsed forge", async () => {
+    await expect(parse({ forge: "gitlab", forgeSource: "input" })).rejects.toThrow(
+      "autoimplement forgeSource must be defaults",
+    );
+    await expect(parse({ forgeSource: "defaults" })).rejects.toThrow(
+      "autoimplement forgeSource requires forge",
+    );
   });
 
   it("rejects invalid input values before it reads the file", async () => {

@@ -59,6 +59,7 @@ import {
   type ForgeText,
 } from "./autoimplement-forge-text.js";
 import {
+  defaultsFileForgeResolution,
   parseForgeRequest,
   parseForgeResolution,
   parseGitLabMergeRequestUrl,
@@ -124,6 +125,8 @@ export type AutoimplementInput = {
   verificationUntested?: string[];
   /** Always present after input parsing: the input, else the defaults file, else `auto`. */
   forge?: ForgeRequest;
+  /** Set by input parsing when `forge` came from the defaults file. Callers omit it. */
+  forgeSource?: "defaults";
   /** Always present after input parsing: the input, else the defaults file, else `early`. */
   prTiming?: PrTiming;
 };
@@ -411,14 +414,27 @@ function parseInput(value: unknown): AutoimplementInput {
     ...(verificationUntested === undefined ? {} : { verificationUntested }),
   };
   const forge = parseForgeRequest(input.forge, "autoimplement forge");
+  const forgeSource = parseForgeSource(input.forgeSource, forge);
   const prTiming = parsePrTiming(input.prTiming, "autoimplement prTiming");
   // A fully explicit input never reads the defaults file, so parsing a parsed input is idempotent.
   const defaults = forge === undefined || prTiming === undefined ? loadAutoimplementDefaults() : {};
+  const forgeFromDefaults = forge === undefined && defaults.forge !== undefined;
   return {
     ...upstream,
     forge: forge ?? defaults.forge ?? "auto",
+    ...(forgeSource === "defaults" || forgeFromDefaults
+      ? { forgeSource: "defaults" as const }
+      : {}),
     prTiming: prTiming ?? defaults.prTiming ?? "early",
   };
+}
+
+/** Input parsing records `defaults` when the forge came from the defaults file. */
+function parseForgeSource(value: unknown, forge: ForgeRequest | undefined): "defaults" | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "defaults") throw new Error("autoimplement forgeSource must be defaults");
+  if (forge === undefined) throw new Error("autoimplement forgeSource requires forge");
+  return value;
 }
 
 function requiredSetting<T>(value: T | undefined, message: string): T {
@@ -2133,7 +2149,10 @@ export const autoimplementWorkflow = defineWorkflow({
       statusDetail: "resolving the code forge",
       run: async ({ input }) => {
         const request = input as AutoimplementInput;
-        return await resolveForge(request.forge ?? "auto", forgeDirectory(request));
+        const requested = request.forge ?? "auto";
+        return request.forgeSource === "defaults" && requested !== "auto"
+          ? defaultsFileForgeResolution(requested)
+          : await resolveForge(requested, forgeDirectory(request));
       },
     }),
     observe: compute({

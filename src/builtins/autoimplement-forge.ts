@@ -215,6 +215,11 @@ export function detectForge(requested: ForgeRequest, facts: ForgeFacts): ForgeRe
   return detectRemoteForge(facts, remote.host, facts.remoteUrl);
 }
 
+/** The resolution of a forge that the Autoimplement defaults file names. It does no IO. */
+export function defaultsFileForgeResolution(forge: Forge): ForgeResolution {
+  return resolution(forge, forge, null, null, "Autoimplement defaults file");
+}
+
 /** GitLab.com serves SSH over port 443 on this host. Its web and API host is `gitlab.com`. */
 const GITLAB_COM_ALT_SSH_HOST = "altssh.gitlab.com";
 
