@@ -14,7 +14,11 @@ if (process.env.FAKE_PI_ARGV_FILE) {
     JSON.stringify({ argv: process.argv.slice(2), env: process.env.FAKE_PI_MARKER ?? null }),
   );
 }
-if (scenario === "ignore-cancel") process.on("SIGTERM", () => undefined);
+// These scenarios outlive SIGTERM until SIGKILL, so late output can race the stop.
+if (["ignore-cancel", "late-settle", "late-complete"].includes(scenario)) {
+  process.on("SIGTERM", () => undefined);
+}
+const lateMs = Number(process.env.FAKE_AGENT_GROUP_LATE_MS ?? "0");
 
 // The same framing as the bridge: a leading newline ends any partial line written first.
 function encode(event) {
@@ -73,6 +77,22 @@ const runScenarios = {
   },
   rejected(_command, id) {
     respond(id, { success: false, error: "Unknown command" });
+  },
+  "rejected-long"(_command, id) {
+    respond(id, { success: false, error: `${"x".repeat(10_000)} END OF REJECTION` });
+  },
+  "late-settle"(command) {
+    runScenarios.hang(command);
+  },
+  "late-complete"(command, id) {
+    // The result arrives only after the launcher stopped waiting for it.
+    lifecycle(command.groupId, command.requests[0], "running");
+    respond(id, { success: true, data: { disposition: "handled" } });
+    setTimeout(() => {
+      lifecycle(command.groupId, command.requests[0], "completed");
+      emit({ type: "completed", groupId: command.groupId, results: results(command) });
+      markLate();
+    }, lateMs);
   },
   "handled-without-result"(_command, id) {
     respond(id, { success: true, data: { disposition: "handled" } });
@@ -136,7 +156,26 @@ let running;
 
 // "hang" settles every session; "partial-settle" confirms only the first one and then stops
 // reporting; "ignore-cancel" never answers.
+function markLate() {
+  if (process.env.FAKE_PI_COMMANDS_FILE) {
+    fs.appendFileSync(process.env.FAKE_PI_COMMANDS_FILE, `${JSON.stringify({ type: "late" })}\n`);
+  }
+}
+
 function cancel(command) {
+  if (running !== undefined && scenario === "late-settle") {
+    // Settles only after the launcher stopped waiting for it.
+    setTimeout(() => {
+      for (const request of running.requests) lifecycle(command.groupId, request, "cancelled");
+      emit({
+        type: "failed",
+        groupId: command.groupId,
+        error: { message: "late", agentId: "group", code: "cancelled", detail: command.reason },
+      });
+      markLate();
+    }, lateMs);
+    return;
+  }
   if (running === undefined || !["hang", "partial-settle"].includes(scenario)) return;
   const settled = scenario === "hang" ? running.requests : running.requests.slice(0, 1);
   for (const request of settled) lifecycle(command.groupId, request, "cancelled");

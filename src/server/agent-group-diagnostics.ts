@@ -13,11 +13,13 @@ const TERMINAL_STATES = new Set<PiAgentLifecycleState>(["completed", "failed", "
 const QUEUED_PHASE = "cancelled: the session did not start";
 
 /**
- * The complete stderr stream of one headless pi child, in a private temporary file.
+ * The complete stderr stream of one headless pi child, in a private temporary file:
+ * `<tmp>/<prefix>XXXXXX/pi-stderr.log`, with a `0700` directory and a `0600` file.
  *
  * Pi's stderr can carry text from provider extensions, so it never enters workflow state:
  * Sanity Check keeps only bounded results and safe operational facts. A group that pi fails
- * to run keeps the file and names it in its error. Every other group removes it.
+ * to run keeps the file and names it in its error; the operator deletes it. Every other group
+ * removes it. A runner that is killed with SIGKILL during a group leaves its directory behind.
  */
 export class PiStderrLog {
   private directory: string | undefined;
@@ -99,6 +101,11 @@ export class AgentLifecycleLedger {
 
   record(event: PiAgentLifecycleEvent): void {
     this.latest.set(event.id, { event, seenAt: this.now() });
+  }
+
+  isTerminal(id: string): boolean {
+    const state = this.latest.get(id)?.event.state;
+    return state !== undefined && TERMINAL_STATES.has(state);
   }
 
   /**

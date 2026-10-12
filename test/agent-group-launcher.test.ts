@@ -20,6 +20,8 @@ const SETTLE_MS = 400;
 const UNSETTLED_CANCEL = "cancelled: headless pi did not report that the session settled";
 const UNFINISHED_RUN = "failed: headless pi stopped before the session finished";
 const NEVER_STARTED = "cancelled: the session did not start";
+const LAUNCH_HINT =
+  "The workflow runner starts agent groups with the same `pi` command, arguments, and environment as headless workflow steps; check that this command runs on the workflow server";
 
 function request(id: string): PiAgentRequest {
   return { id, role: `Role ${id}`, prompt: `Prompt ${id}`, cwd: "/repo", tools: ["read"] };
@@ -111,11 +113,15 @@ async function commands(file: string): Promise<Array<Record<string, unknown>>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-/** The stderr log that an error names, which the launcher keeps after a failed run. */
-async function namedStderrLog(error: unknown): Promise<string> {
-  const match = /complete pi stderr: (\S+pi-stderr\.log)/u.exec((error as Error).message);
+/** The stderr log path that an error names; the launcher keeps that log after a failed run. */
+function namedStderrLogPath(error: unknown): string {
+  const match = /complete pi stderr: (\S+pi-stderr\.log)\. /u.exec((error as Error).message);
   if (match?.[1] === undefined) throw new Error(`no stderr log in: ${(error as Error).message}`);
-  return await fs.readFile(match[1], "utf8");
+  return match[1];
+}
+
+async function namedStderrLog(error: unknown): Promise<string> {
+  return await fs.readFile(namedStderrLogPath(error), "utf8");
 }
 
 function states(events: PiAgentLifecycleEvent[]): string[] {
@@ -436,18 +442,107 @@ describe("headless pi agent group launcher", () => {
   it("fails clearly when pi cannot start", async () => {
     const setup = await harness("success");
     const missing = path.join(setup.dir, "missing-pi");
-    await expect(
-      new HeadlessPiAgentGroupLauncher({ ...setup.options, piBin: missing }, setup.settings).run(
-        [request("a")],
-        {
-          maxConcurrency: 1,
-          signal: new AbortController().signal,
-        },
-      ),
-    ).rejects.toThrow(
-      new RegExp(`bridge loaded \\(spawn ${missing.replaceAll("/", "\\/")} ENOENT\\)`, "u"),
-    );
+    const error = await new HeadlessPiAgentGroupLauncher(
+      { ...setup.options, piBin: missing },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toContain(`bridge loaded (spawn ${missing} ENOENT)`);
+    expect(await namedStderrLog(error)).toBe("");
   });
+
+  it("names the complete log path after a long pi rejection, beyond the message cap", async () => {
+    const setup = await harness("rejected-long");
+    // A log directory whose path alone is longer than the 2,000-character cause cap.
+    const deep = path.join(
+      setup.logs,
+      ...Array.from({ length: 9 }, (_, index) => `${index}`.repeat(240)),
+    );
+    await fs.mkdir(deep, { recursive: true });
+    const error = await new HeadlessPiAgentGroupLauncher(setup.options, {
+      ...setup.settings,
+      diagnosticsDirectory: deep,
+    })
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+
+    const message = (error as Error).message;
+    // Pi's rejection is bounded in the message; the complete text is in the log.
+    expect(message).toMatch(
+      /^Pi agent group could not run: pi rejected the agent group command: x+…\. complete pi stderr: /u,
+    );
+    expect(message).not.toContain("END OF REJECTION");
+    const logPath = namedStderrLogPath(error);
+    expect(logPath.startsWith(`${deep}${path.sep}`)).toBe(true);
+    expect(logPath.length).toBeGreaterThan(2_000);
+    expect(message.endsWith(`complete pi stderr: ${logPath}. ${LAUNCH_HINT}`)).toBe(true);
+    const log = await namedStderrLog(error);
+    expect(log).toContain('[pi-workflows] pi RPC response on stdout: {"id"');
+    expect(log).toContain("END OF REJECTION");
+  });
+
+  it("ignores a bridge's settlement that arrives after the launcher ended the tracks", async () => {
+    const setup = await harness(
+      "late-settle",
+      { abortGraceMs: 1_500 },
+      { FAKE_AGENT_GROUP_LATE_MS: String(SETTLE_MS + 200) },
+    );
+    const abort = new AbortController();
+    const seen: PiAgentLifecycleEvent[] = [];
+    await expect(
+      setup.launcher().run([request("a"), request("b")], {
+        maxConcurrency: 2,
+        signal: abort.signal,
+        onLifecycle: (event) => {
+          seen.push(event);
+          if (event.id === "b" && event.state === "running") abort.abort(new Error("stop"));
+        },
+      }),
+    ).rejects.toThrow("Pi agent group cancelled: stop");
+    // The bridge's own cancelled facts arrived while pi was stopping, and were dropped.
+    expect((await commands(setup.commandsFile)).map((command) => command.type)).toEqual([
+      "run",
+      "cancel",
+      "late",
+    ]);
+    expect(states(seen)).toEqual([
+      "a:running:running",
+      "b:running:running",
+      `a:cancelled:${UNSETTLED_CANCEL}`,
+      `b:cancelled:${UNSETTLED_CANCEL}`,
+    ]);
+  }, 15_000);
+
+  it("keeps a reported failure when the result arrives after the result wait", async () => {
+    const setup = await harness(
+      "late-complete",
+      { abortGraceMs: 1_500 },
+      { FAKE_AGENT_GROUP_LATE_MS: "800" },
+    );
+    const seen: PiAgentLifecycleEvent[] = [];
+    const error = await setup
+      .launcher()
+      .run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          seen.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect((error as Error).message).toMatch(
+      /^Pi agent group could not run: the agent group bridge returned without a result\. complete pi stderr: /u,
+    );
+    expect((await commands(setup.commandsFile)).map((command) => command.type)).toEqual([
+      "run",
+      "late",
+    ]);
+    // The late completed fact cannot replace the reported failure; only the log keeps it.
+    expect(states(seen)).toEqual(["a:running:running", `a:failed:${UNFINISHED_RUN}`]);
+    expect(await namedStderrLog(error)).toContain('"state":"completed"');
+  }, 15_000);
 
   it("names a log it could not create instead of failing the group", async () => {
     const setup = await harness("exit-before-ready");

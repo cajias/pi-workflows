@@ -64,8 +64,15 @@ export class PiAgentGroupError extends Error {
     readonly code: string,
     /** Unbounded cause text; the message bounds it. Launchers send it to rebuild the same error. */
     readonly detail: string,
+    /**
+     * Text from Pi Workflows itself that follows the bounded cause in full, such as the path
+     * of a diagnostic log. It never quotes provider or Pi output.
+     */
+    readonly notice?: string,
   ) {
-    super(`Pi agent ${agentId} ${code}: ${boundedErrorText(detail)}`);
+    super(
+      `Pi agent ${agentId} ${code}: ${boundedErrorText(detail)}${notice === undefined ? "" : `. ${notice}`}`,
+    );
     this.name = "PiAgentGroupError";
   }
 }
