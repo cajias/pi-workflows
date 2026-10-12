@@ -435,6 +435,19 @@ function validProjectPath(projectPath: string): boolean {
  * least two segments of `[A-Za-z0-9_.-]` that do not start with `-` and are not only dots. The iid is
  * positive without a leading zero. A query, fragment, or trailing segment is rejected.
  */
+/**
+ * True when a merge request is on the detected forge host. Hostnames compare without case and
+ * without a port, so a `host:port` hosts key matches its web URLs.
+ */
+export function onForgeHost(mergeRequest: GitLabMergeRequest, host: string): boolean {
+  return hostnameOf(mergeRequest.host) === hostnameOf(host);
+}
+
+/** A full Git commit id: 40 hexadecimal characters, or 64 in a SHA-256 repository. */
+export function isFullCommitId(value: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+}
+
 export function parseGitLabMergeRequestUrl(value: unknown, label: string): GitLabMergeRequest {
   const match = typeof value === "string" ? MERGE_REQUEST_URL.exec(value) : null;
   const host = match?.[1];

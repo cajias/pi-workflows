@@ -1072,14 +1072,22 @@ describe("autoimplement GitLab prompts", () => {
       'glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>"',
     );
     expect(prompt).toContain(
-      "glab mr create --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes",
+      "glab mr create --repo https://<hostname>/<project path> --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes",
     );
-    expect(prompt).toContain("glab mr update <iid> --description <description> --yes");
+    expect(prompt).toContain(
+      "glab mr update <iid> --repo https://<hostname>/<project path> --description <description> --yes",
+    );
+    expect(prompt).toContain(
+      "<project path> is the project path of that remote, such as group/sub/project, and <apiProject> is that path URL-encoded",
+    );
+    expect(prompt).toContain("and full 40-character pushed head revision.");
     expect(prompt).toContain("create a second merge request for the same source and target branch");
     expect(prompt).toContain(
       "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
     );
-    expect(prompt).toContain("https://<hostname>/<project path>/-/merge_requests/<iid> as pr.");
+    expect(prompt).toContain(
+      "Report as pr the merge request web_url exactly as glab mr create or the merge request API returned it, of the form https://<hostname>/<project path>/-/merge_requests/<iid>. Do not build the URL yourself. When the forge resolution names a host, the URL must be on that host.",
+    );
     const base = lines.indexOf("Requested base branch: main.");
     expect(lines[base + 1]).toBe(`Forge resolution: ${JSON.stringify(DETECTED_GITLAB)}`);
     expect(lines.at(-1)).toBe("Do not merge yet.");
@@ -1209,17 +1217,94 @@ describe("autoimplement GitLab publication validation", () => {
     const validate = node.validate;
     return await validate(value, syntheticAutoimplementContext({ outputs }));
   };
-  const publication = (pr: string) => ({
+  const FULL_HEAD = "a".repeat(40);
+  const publication = (pr: string, extra: Record<string, unknown> = {}) => ({
     repositories: [
       {
         repository: "/golden/repository",
         branch: "feat/golden",
         baseBranch: "main",
-        headRevision: "abc123",
+        headRevision: FULL_HEAD,
         pr,
         pushed: true,
+        ...extra,
       },
     ],
+  });
+
+  it("requires the merge request on the detected host, ignoring case and port", async () => {
+    await expect(
+      validatePublish(
+        publication("https://other.example.test/group/sub/project/-/merge_requests/7"),
+        {
+          resolveForge: DETECTED_GITLAB,
+        },
+      ),
+    ).rejects.toThrow(
+      "publication repositories[0].pr must be a merge request on the detected GitLab host gitlab.example.test",
+    );
+    const onPort = "https://GitLab.Example.Test:8443/group/sub/project/-/merge_requests/7";
+    await expect(
+      validatePublish(publication(onPort), { resolveForge: DETECTED_GITLAB }),
+    ).resolves.toMatchObject({ repositories: [{ pr: onPort }] });
+    await expect(
+      validatePublish(publication(GITLAB_MR), {
+        resolveForge: { ...DETECTED_GITLAB, host: "gitlab.example.test:8443" },
+      }),
+    ).resolves.toMatchObject({ repositories: [{ pr: GITLAB_MR }] });
+    const anywhere = "https://elsewhere.example/group/project/-/merge_requests/1";
+    await expect(
+      validatePublish(publication(anywhere), { resolveForge: resolution("gitlab", "gitlab") }),
+    ).resolves.toMatchObject({ repositories: [{ pr: anywhere }] });
+  });
+
+  it("requires the prepared task branch and the full head revision on GitLab", async () => {
+    await expect(
+      validatePublish(publication(GITLAB_MR, { branch: "main" }), {
+        resolveForge: DETECTED_GITLAB,
+      }),
+    ).rejects.toThrow(
+      "publication repositories[0].branch must be the prepared task branch: feat/golden",
+    );
+    for (const headRevision of ["abc123", "A".repeat(40), "a".repeat(41)]) {
+      await expect(
+        validatePublish(publication(GITLAB_MR, { headRevision }), {
+          resolveForge: DETECTED_GITLAB,
+        }),
+      ).rejects.toThrow(
+        `publication repositories[0].headRevision must be the full commit SHA of the pushed head: ${headRevision}`,
+      );
+    }
+    await expect(
+      validatePublish(publication(GITLAB_MR, { headRevision: "b".repeat(64) }), {
+        resolveForge: DETECTED_GITLAB,
+      }),
+    ).resolves.toMatchObject({ repositories: [{ headRevision: "b".repeat(64) }] });
+  });
+
+  it("requires the full head revision of a GitLab P2 push", async () => {
+    const node = autoimplementWorkflow.nodes.verifyP2;
+    if (node?.nodeType !== "agent" || node.validate === undefined) {
+      throw new Error("verifyP2 must be a validated agent node");
+    }
+    const validate = node.validate;
+    const context = syntheticAutoimplementContext({
+      pr: GITLAB_MR,
+      outputs: { resolveForge: DETECTED_GITLAB },
+    });
+    const verification = (headRevision: string) => ({
+      passed: true,
+      pushed: true,
+      repositories: publication(GITLAB_MR, { headRevision }).repositories,
+    });
+    await expect(
+      Promise.resolve().then(() => validate(verification("def456"), context)),
+    ).rejects.toThrow(
+      "P2 verification repositories[0].headRevision must be the full commit SHA of the pushed head: def456",
+    );
+    await expect(
+      Promise.resolve().then(() => validate(verification(FULL_HEAD), context)),
+    ).resolves.toMatchObject({ repositories: [{ headRevision: FULL_HEAD }] });
   });
 
   it("requires a merge request URL on GitLab and keeps the reported string", async () => {
@@ -1241,11 +1326,17 @@ describe("autoimplement GitLab publication validation", () => {
     ).resolves.toMatchObject({ repositories: [{ id: GOLDEN_ID, pr: GITLAB_MR }] });
   });
 
-  it("leaves GitHub publication URLs unchecked", async () => {
+  it("leaves GitHub publication URLs, branches, and heads unchecked under early", async () => {
     for (const outputs of [{}, { resolveForge: resolution("github") }]) {
       await expect(
         validatePublish(publication("https://example.test/pr/1"), outputs),
       ).resolves.toMatchObject({ repositories: [{ pr: "https://example.test/pr/1" }] });
+      await expect(
+        validatePublish(
+          publication("https://example.test/pr/1", { branch: "other", headRevision: "abc123" }),
+          outputs,
+        ),
+      ).resolves.toMatchObject({ repositories: [{ branch: "other", headRevision: "abc123" }] });
     }
   });
 });
@@ -1473,7 +1564,9 @@ describe("autoimplement GitLab early runs", () => {
     const publish = scenario.executor.requests.find(
       (request) => request.contract.nodeId === "publish",
     );
-    expect(publish?.prompt).toContain("glab mr create --source-branch <branch>");
+    expect(publish?.prompt).toContain(
+      "glab mr create --repo https://<hostname>/<project path> --source-branch <branch>",
+    );
   });
 
   it("detects GitLab from the remote and normalizes a --wait watch", async () => {

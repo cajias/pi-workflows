@@ -604,7 +604,9 @@ describe("autoimplement end-timing prompts", () => {
     ).split("\n");
     expect(gitlab[0]).toBe(lines[0]);
     expect(gitlab).toContain(`Forge resolution: ${JSON.stringify(GITLAB_RESOLUTION)}`);
-    expect(gitlab.join("\n")).toContain("glab mr create --source-branch <branch>");
+    expect(gitlab.join("\n")).toContain(
+      "glab mr create --repo https://<hostname>/<project path> --source-branch <branch>",
+    );
   });
 
   it.each(END_PROMPT_NODES)(
@@ -820,7 +822,6 @@ describe("autoimplement reviewed publication validator", () => {
     ).resolves.toMatchObject({ repositories: [{ dependencyFingerprint: "sha" }] });
     for (const extra of [
       { headRevision: "other" },
-      { branch: "feat/other" },
       { baseBranch: "develop" },
       { dependencyFingerprint: "sha" },
     ]) {
@@ -828,6 +829,11 @@ describe("autoimplement reviewed publication validator", () => {
         "publication must push exactly the reviewed head",
       );
     }
+    await expect(
+      validate(pushed({ branch: "feat/other" }), fixtureContext(gate())),
+    ).rejects.toThrow(
+      "publication repositories[0].branch must be the prepared task branch: feat/demo",
+    );
     const elsewhere = [
       step("commitLocal", {
         repositories: [{ ...fixtureCandidate("reviewed"), id: "other-id", repository: "/other" }],

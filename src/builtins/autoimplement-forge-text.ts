@@ -228,11 +228,12 @@ const GITLAB_DELIVERY_RULES = [
 
 /** How GitLab publication finds, reuses, or creates the one merge request, and what it reports. */
 const GITLAB_PUBLISH_REQUEST = [
-  'Look up an open merge request for this source and target branch with glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>". <hostname> is the host in the forge resolution, or the glab host of the work repository\'s Git remote when that is null. <apiProject> is the URL-encoded project path, such as group%2Fsub%2Fproject.',
-  "Reuse that merge request when one exists, and update a stale description with glab mr update <iid> --description <description> --yes. Otherwise run glab in the prepared workspace to create one with glab mr create --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes.",
+  'Look up an open merge request for this source and target branch with glab api --hostname <hostname> "projects/<apiProject>/merge_requests?state=opened&source_branch=<branch>&target_branch=<base>". <hostname> is the host in the forge resolution, or the glab host of the work repository\'s Git remote when that is null. <project path> is the project path of that remote, such as group/sub/project, and <apiProject> is that path URL-encoded, such as group%2Fsub%2Fproject.',
+  "Reuse that merge request when one exists, and update a stale description with glab mr update <iid> --repo https://<hostname>/<project path> --description <description> --yes. Otherwise run glab in the prepared workspace to create one with glab mr create --repo https://<hostname>/<project path> --source-branch <branch> --target-branch <base> --title <title> --description <description> --yes.",
   "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
   "Inspect the complete public diff before every push or MR mutation.",
-  "Report every repository that received a pushed merge request with its absolute repository path, branch, base branch, pushed head revision, and the MR web URL https://<hostname>/<project path>/-/merge_requests/<iid> as pr.",
+  "Report every repository that received a pushed merge request with its absolute repository path, branch, base branch, and full 40-character pushed head revision.",
+  "Report as pr the merge request web_url exactly as glab mr create or the merge request API returned it, of the form https://<hostname>/<project path>/-/merge_requests/<iid>. Do not build the URL yourself. When the forge resolution names a host, the URL must be on that host.",
   PUBLISH_DEPENDENCY_FINGERPRINT,
 ] as const;
 
@@ -256,7 +257,7 @@ const GITLAB_TEXT: ForgeText = {
     P2_VERIFY,
     P2_HEADS,
     P2_NO_REVIEW,
-    "Re-observe every published merge request after the push with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid>, and return its current repository, branch, base branch, head revision, MR URL as pr, pushed status, and unchanged dependency fingerprint.",
+    "Re-observe every published merge request after the push with glab api --hostname <hostname> projects/<apiProject>/merge_requests/<iid>, and return its current repository, branch, base branch, full 40-character head revision, MR URL as pr, pushed status, and unchanged dependency fingerprint.",
     REPORT_COMMANDS,
     GITLAB_COORDINATES_RULE,
   ],

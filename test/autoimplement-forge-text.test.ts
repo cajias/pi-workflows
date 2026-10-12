@@ -177,7 +177,9 @@ describe("reviewed publication text", () => {
       "Inspect the branch, local and remote heads, and matching merge requests first. Never create a second merge request for the same source and target branch.",
     );
     expect(lines.slice(3)).toEqual(forgeText("gitlab").publish.early.slice(2));
-    expect(lines.join("\n")).toContain("glab mr create --source-branch <branch>");
+    expect(lines.join("\n")).toContain(
+      "glab mr create --repo https://<hostname>/<project path> --source-branch <branch>",
+    );
   });
 });
 

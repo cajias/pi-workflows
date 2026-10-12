@@ -51,6 +51,7 @@ import {
   type GitLabHeadPipeline,
   type LocalCommitRepositories,
   type PublishedRepositories,
+  type PublishedRepository,
 } from "./autoimplement-command-batches.js";
 import { loadAutoimplementDefaults, parsePrTiming, type PrTiming } from "./autoimplement-config.js";
 import {
@@ -62,6 +63,8 @@ import {
 } from "./autoimplement-forge-text.js";
 import {
   defaultsFileForgeResolution,
+  isFullCommitId,
+  onForgeHost,
   parseForgeRequest,
   parseForgeResolution,
   parseGitLabMergeRequestUrl,
@@ -1402,23 +1405,64 @@ function parsePublishedForContext(
   context: WorkflowNodeContext,
 ): PublishedRepositories {
   const result = parsePublishedRepositories(value);
-  const expected = preparedWorkPath(preparedWorkspace(context));
+  const workspace = preparedWorkspace(context);
+  const expected = preparedWorkPath(workspace);
   if (result.repositories[0]?.repository !== expected) {
     throw new Error(`publication repository must match the prepared workspace: ${expected}`);
   }
   if (result.repositories.some((repository) => repository.repository !== expected)) {
     throw new Error("publication cannot include an unprepared repository");
   }
-  if (forgeFor(context) === "gitlab") {
+  const gitlab = forgeFor(context) === "gitlab";
+  if (gitlab) {
+    const host = forgeResolution(context)?.host ?? null;
     result.repositories.forEach((repository, index) =>
-      parseGitLabMergeRequestUrl(repository.pr, `publication repositories[${index}].pr`),
+      assertGitLabPublication(repository, host, `publication repositories[${index}]`),
     );
   }
   const reviewed = reviewedPublicationHead(context);
+  // The program-run GitLab watch and the reviewed push both name this branch.
+  if (gitlab || reviewed !== undefined) {
+    result.repositories.forEach((repository, index) =>
+      assertTaskBranch(repository, workspace, `publication repositories[${index}]`),
+    );
+  }
   if (reviewed !== undefined) {
     for (const repository of result.repositories) assertPushesReviewedHead(repository, reviewed);
   }
   return result;
+}
+
+/**
+ * GitLab publication facts that later program-run commands rely on: the merge request URL, its
+ * host, and the full head revision that the head pipeline and `glab mr merge --sha` must match.
+ */
+function assertGitLabPublication(
+  repository: PublishedRepository,
+  host: string | null,
+  label: string,
+): void {
+  const mergeRequest = parseGitLabMergeRequestUrl(repository.pr, `${label}.pr`);
+  if (host !== null && !onForgeHost(mergeRequest, host)) {
+    throw new Error(`${label}.pr must be a merge request on the detected GitLab host ${host}`);
+  }
+  assertFullHeadRevision(repository.headRevision, `${label}.headRevision`);
+}
+
+function assertFullHeadRevision(headRevision: string, label: string): void {
+  if (!isFullCommitId(headRevision)) {
+    throw new Error(`${label} must be the full commit SHA of the pushed head: ${headRevision}`);
+  }
+}
+
+function assertTaskBranch(
+  repository: CandidateRepository,
+  workspace: PreparedWorkspace,
+  label: string,
+): void {
+  if (repository.branch !== workspace.workBranch) {
+    throw new Error(`${label}.branch must be the prepared task branch: ${workspace.workBranch}`);
+  }
 }
 
 /** The absolute path that every publication and local commit of this run must name. */
@@ -1707,6 +1751,14 @@ function parseP2Verification(
   if (expected.size > 0) {
     throw new Error(
       `P2 verification is missing repository ids: ${[...expected.keys()].join(", ")}`,
+    );
+  }
+  if (forgeFor(context) === "gitlab") {
+    refreshed.repositories.forEach((repository, index) =>
+      assertFullHeadRevision(
+        repository.headRevision,
+        `P2 verification repositories[${index}].headRevision`,
+      ),
     );
   }
   return { ...result, repositories: refreshed.repositories };
