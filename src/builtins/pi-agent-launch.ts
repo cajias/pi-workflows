@@ -70,6 +70,11 @@ export class PiAgentGroupError extends Error {
   }
 }
 
+/**
+ * Cause text in an agent error. Sanity Check lets only bounded safe operational facts leave
+ * a child session, and agent errors can quote provider responses, so the message keeps at
+ * most 2,000 characters. `PiAgentGroupError.detail` keeps the complete cause in memory.
+ */
 export function boundedErrorText(value: string): string {
   const text = value.trim() || "unknown failure";
   return text.length <= MAX_ERROR_CHARS ? text : `${text.slice(0, MAX_ERROR_CHARS)}…`;

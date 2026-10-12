@@ -365,7 +365,9 @@ export async function runWorkflowRunner(): Promise<number> {
     const headlessPi = headlessPiOptions(launch, bootstrap, transport);
     // Built-in actions that need Pi agent sessions run them in headless pi children
     // started exactly like headless agent steps, because this process is plain Node.
-    const agentGroups = new HeadlessPiAgentGroupLauncher(headlessPi);
+    const agentGroups = new HeadlessPiAgentGroupLauncher(headlessPi, {
+      diagnosticsPrefix: `pi-workflows-${launch.runId}-agent-group-`,
+    });
     setPiAgentGroupLauncher(agentGroups.run);
     let executor: AgentStepExecutor;
     let closeExecutor: () => Promise<void>;

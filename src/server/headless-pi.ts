@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_ABORT_GRACE_MS = 3_000;
@@ -30,6 +31,8 @@ export type HeadlessPiExit = { code: number | null; signal: string | null; error
 
 export type HeadlessPiHandlers = {
   onStderrLine?: (line: string) => void;
+  /** Every raw stderr chunk, before line splitting. */
+  onStderrChunk?: (chunk: Buffer) => void;
   onStdoutLine?: (line: string) => void;
   onExit?: (exit: HeadlessPiExit) => void;
 };
@@ -62,8 +65,6 @@ export class HeadlessPiProcess {
   private exitState: HeadlessPiExit | null = null;
   private registeredPid: number | null = null;
   private closePromise: Promise<void> | null = null;
-  private stderrBuffer = "";
-  private stdoutBuffer = "";
 
   constructor(
     private readonly extensionPath: string,
@@ -111,15 +112,17 @@ export class HeadlessPiProcess {
       // Writes racing child exit surface asynchronously as EPIPE; the caller
       // fails through the exit path instead of an uncaught stream error.
     });
+    const stderr = new LineSplitter(this.handlers.onStderrLine);
     child.stderr?.on("data", (chunk: Buffer) => {
-      this.stderrBuffer = dispatchLines(this.stderrBuffer, chunk, this.handlers.onStderrLine);
+      this.handlers.onStderrChunk?.(chunk);
+      stderr.push(chunk);
     });
+    child.stderr?.on("end", () => stderr.end());
     // stdout carries the RPC event stream. It is drained even without a reader
     // so the pipe never blocks the child.
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (this.handlers.onStdoutLine === undefined) return;
-      this.stdoutBuffer = dispatchLines(this.stdoutBuffer, chunk, this.handlers.onStdoutLine);
-    });
+    const stdout = new LineSplitter(this.handlers.onStdoutLine);
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stdout?.on("end", () => stdout.end());
     await this.register(child);
   }
 
@@ -193,15 +196,41 @@ export class HeadlessPiProcess {
   }
 }
 
-function dispatchLines(
-  buffered: string,
-  chunk: Buffer,
-  onLine: ((line: string) => void) | undefined,
-): string {
-  const lines = (buffered + chunk.toString("utf8")).split("\n");
-  const rest = lines.pop() ?? "";
-  for (const line of lines) onLine?.(line);
-  return rest;
+/**
+ * Split a byte stream into UTF-8 lines. Only each new chunk is scanned for newlines, so one
+ * long line costs time linear in its length, and characters split across chunks stay intact.
+ */
+class LineSplitter {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending: string[] = [];
+
+  constructor(private readonly onLine: ((line: string) => void) | undefined) {}
+
+  push(chunk: Buffer): void {
+    if (this.onLine === undefined) return;
+    this.split(this.decoder.write(chunk));
+  }
+
+  /** Report a final line that has no newline. */
+  end(): void {
+    if (this.onLine === undefined) return;
+    this.split(this.decoder.end());
+    const rest = this.pending.join("");
+    this.pending = [];
+    if (rest.length > 0) this.onLine(rest);
+  }
+
+  private split(text: string): void {
+    let start = 0;
+    for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n", start)) {
+      this.pending.push(text.slice(start, newline));
+      const line = this.pending.join("");
+      this.pending = [];
+      this.onLine?.(line);
+      start = newline + 1;
+    }
+    if (start < text.length) this.pending.push(text.slice(start));
+  }
 }
 
 function killGroup(pid: number, signal: NodeJS.Signals): void {

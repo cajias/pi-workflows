@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
+import { CANCEL_SETTLE_MS } from "../../src/server/agent-group-launcher.js";
 import { makeTempDir, waitUntil } from "../helpers.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -66,7 +67,8 @@ export default function reviewProvider(pi) {
 type ReviewOutput = {
   reviews?: unknown[];
   error?: string;
-  updates: Array<{ key: string; status: string; label?: string }>;
+  updates: Array<{ key: string; status: string; phase?: string; label?: string; at: number }>;
+  abortedAt?: number;
   pids: number[];
 };
 
@@ -98,6 +100,7 @@ async function runReview(env: Record<string, string> = {}): Promise<ReviewOutput
     PI_WORKFLOWS_TEST_FORM_ROOT: packageSource,
     PI_WORKFLOWS_TEST_FORM_EXTENSION: ".ts",
     FAKE_PI_BIN: path.join(root, "bin", "pi"),
+    PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR: path.join(root, "logs"),
     ...env,
   };
   delete childEnv.NODE_PATH;
@@ -160,7 +163,7 @@ beforeAll(async () => {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.symlink(path.join(REPO_ROOT, "node_modules", name), target, "dir");
   }
-  for (const name of ["home", "project", "bin", "config", "agent", "fixtures"]) {
+  for (const name of ["home", "project", "bin", "config", "agent", "fixtures", "logs"]) {
     await fs.mkdir(path.join(root, name), { recursive: true });
   }
   const provider = path.join(root, "fixtures", "review-provider.ts");
@@ -224,11 +227,14 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
 
     expect(output.error).toBeUndefined();
     expect(output.reviews).toEqual([REVIEW]);
-    expect(output.updates).toContainEqual({
-      key: "agents/review/review",
-      status: "completed",
-      label: "Combined review · fixture-review/fixture-model",
-    });
+    expect(output.updates).toContainEqual(
+      expect.objectContaining({
+        key: "agents/review/review",
+        status: "completed",
+        phase: "completed",
+        label: "Combined review · fixture-review/fixture-model",
+      }),
+    );
     expect(output.updates.at(-1)).toMatchObject({ key: "agents/review", status: "completed" });
     expect(output.pids).toHaveLength(1);
     await waitUntil(() => output.pids.every(processGone), 10_000);
@@ -241,12 +247,17 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
     });
 
     expect(output.error).toBe("Pi agent group cancelled: test cancellation");
-    // The bridge aborted the live child session and reported its final state.
-    expect(output.updates).toContainEqual(
-      expect.objectContaining({ key: "agents/review/review", status: "cancelled" }),
-    );
+    // The bridge aborted the live child session and confirmed its final state within the
+    // settle grace, so the launcher reported nothing on its behalf.
+    const settled = output.updates.filter((update) => update.key === "agents/review/review").at(-1);
+    expect(settled).toMatchObject({ status: "cancelled", phase: "cancelled" });
+    const settleMs = (settled?.at ?? Number.POSITIVE_INFINITY) - (output.abortedAt ?? 0);
+    process.stdout.write(`real-Pi cancellation settled in ${settleMs} ms\n`);
+    expect(settleMs).toBeLessThan(CANCEL_SETTLE_MS);
     expect(output.updates.at(-1)).toMatchObject({ key: "agents/review", status: "cancelled" });
     expect(output.pids).toHaveLength(1);
     await waitUntil(() => output.pids.every(processGone), 10_000);
+    // Neither group failed to run, so no stderr log remains.
+    expect(await fs.readdir(path.join(root, "logs"))).toEqual([]);
   }, 120_000);
 });
