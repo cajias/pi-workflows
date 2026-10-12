@@ -81,6 +81,7 @@ import {
   reviewCandidate,
   reviewGatePassed,
   reviewedHeadAwaitsPush,
+  revisionPassesGate,
 } from "./autoimplement-review-gate.js";
 import changeVerificationWorkflow, {
   CHANGE_VERIFICATION_SCHEMA,
@@ -1638,7 +1639,7 @@ function lastPublishedHead(context: WorkflowNodeContext, id: string): string | u
   return recordedHeads(step).find((repository) => repository.id === id)?.headRevision;
 }
 
-/** Steps that may push: each attempt's time window excuses the pushes made during it. */
+/** Steps whose accepted records name pushed heads. */
 const PUSHING_NODES: ReadonlySet<string> = new Set(["publish", "verifyP2"]);
 
 const PUSH_BEFORE_GATE_GUIDANCE =
@@ -1658,24 +1659,41 @@ function secondOverlaps(seconds: number, from: number, to: number): boolean {
 }
 
 /**
- * True when a push logged in this clone belongs to this run's publication: it happened during a
- * `publish` or `verifyP2` attempt, which may have failed after pushing, or it pushed a head that an
- * accepted publication recorded, such as one pushed by an attempt that a runner restart replaced.
+ * True when a push logged in this clone exposes no work that skipped the review gate:
+ *
+ * - it pushed a commit that passed the review gate, whichever step pushed it, so a `publish` attempt
+ *   that pushed the reviewed head and then failed, timed out, or was lost to a runner restart is
+ *   excused;
+ * - it pushed a head that an accepted `publish` or `verifyP2` recorded; or
+ * - it happened during a `verifyP2` attempt, which may have failed after pushing. P2 work is pushed
+ *   without another review, so only its attempt window identifies it.
+ *
+ * A `publish` attempt's window alone excuses nothing, because a reviewed publication must push only
+ * the reviewed head.
  */
-function publicationPush(context: WorkflowNodeContext, update: RefUpdate): boolean {
-  return context.state.steps.some(
-    (step) =>
-      PUSHING_NODES.has(step.nodeId) &&
-      (secondOverlaps(update.seconds, Date.parse(step.startedAt), Date.parse(step.finishedAt)) ||
-        (step.outcome === "ok" &&
-          recordedHeads(step).some((head) => head.headRevision === update.headRevision))),
+function publicationPush(context: WorkflowNodeContext, id: string, update: RefUpdate): boolean {
+  const steps = context.state.steps;
+  return (
+    revisionPassesGate(steps, id, update.headRevision) ||
+    steps.some(
+      (step) =>
+        PUSHING_NODES.has(step.nodeId) &&
+        ((step.outcome === "ok" &&
+          recordedHeads(step).some((head) => head.headRevision === update.headRevision)) ||
+          (step.nodeId === "verifyP2" &&
+            secondOverlaps(
+              update.seconds,
+              Date.parse(step.startedAt),
+              Date.parse(step.finishedAt),
+            ))),
+    )
   );
 }
 
 /**
  * Under `prTiming: end`, nothing is pushed before the review gate passes. The evidence is the reflog
  * of the push destination's remote-tracking ref in this clone: an `update by push` entry written
- * after the run started must belong to a publication of this run. Fetch and pull entries are
+ * after the run started must be excused by {@link publicationPush}. Fetch and pull entries are
  * ignored, so commits that someone else added on the forge do not block the run. Without a reflog
  * the ref value decides: it must record the newest head this run published, or, before any
  * publication, a commit made before the run started. Local refs only.
@@ -1694,11 +1712,11 @@ async function assertNotPushedBeforeGate(
       (update) =>
         update.message === "update by push" &&
         secondOverlaps(update.seconds, start, Number.POSITIVE_INFINITY) &&
-        !publicationPush(context, update),
+        !publicationPush(context, repository.id, update),
     );
     if (stray === undefined) return;
     throw new Error(
-      `${label}: this clone pushed ${stray.headRevision} to ${tracking.ref} at ${new Date(stray.seconds * 1000).toISOString()}, outside every publication of this run. ${PUSH_BEFORE_GATE_GUIDANCE}`,
+      `${label}: this clone pushed ${stray.headRevision} to ${tracking.ref} at ${new Date(stray.seconds * 1000).toISOString()}, a commit that did not pass the review gate and that no publication of this run recorded. ${PUSH_BEFORE_GATE_GUIDANCE}`,
     );
   }
   const published = lastPublishedHead(context, repository.id);

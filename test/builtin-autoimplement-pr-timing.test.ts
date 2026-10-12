@@ -857,8 +857,31 @@ describe.each(["github", "gitlab"] as const)(
         PUBLISH_FINISHED,
         outcome,
       );
+    /** The first step of a run, which fixes its start at 2026-01-01, before every push here. */
+    const runStarted = () => step("prepare", { task: "demo" });
+    /** A local commit of `head` and its successful review, clean unless findings are given. */
+    const cleanReview = (head: string, findings: { p1?: string[]; p2?: string[] } = {}) => {
+      const list = (items: string[] = []) =>
+        items.map((summary) => ({ severity: "P1", kind: "implementation", summary }));
+      return [
+        step("commitLocal", { repositories: [fixtureCandidate(head)] }),
+        step("assessReview", {
+          route: findings.p1 ? "critical" : findings.p2 ? "p2" : "clean",
+          repositories: [
+            {
+              ...fixtureCandidate(head),
+              invocationSucceeded: true,
+              p0: [],
+              p1: list(findings.p1),
+              p2: list(findings.p2),
+              lower: [],
+            },
+          ],
+        }),
+      ];
+    };
     const strayPush = (head: string, at: string, label = "local commit repositories[0]") =>
-      `${label}: this clone pushed ${head} to refs/remotes/origin/feat/demo at ${new Date(at).toISOString()}, outside every publication of this run. ${PUSH_GUIDANCE}`;
+      `${label}: this clone pushed ${head} to refs/remotes/origin/feat/demo at ${new Date(at).toISOString()}, a commit that did not pass the review gate and that no publication of this run recorded. ${PUSH_GUIDANCE}`;
 
     it("accepts a task branch that is not pushed or was pushed before the run", async () => {
       await addBareOrigin(fixture.repository);
@@ -872,7 +895,7 @@ describe.each(["github", "gitlab"] as const)(
       await expect(commitLocal(localCommit(during), context)).resolves.toBeDefined();
     });
 
-    it("rejects a local commit after this clone pushed outside every publication", async () => {
+    it("rejects a local commit after this clone pushed an unreviewed commit outside every publication", async () => {
       await addBareOrigin(fixture.repository);
       const during = await commitAt(fixture.repository, "during-run", DURING_RUN);
       await pushAt(fixture.repository, DURING_RUN);
@@ -904,20 +927,98 @@ describe.each(["github", "gitlab"] as const)(
       );
     });
 
-    it("excuses a push during a publication attempt that failed after pushing", async () => {
+    it("excuses a failed publication attempt's push only of a reviewed head", async () => {
       await addBareOrigin(fixture.repository);
       const pushed = await commitAt(fixture.repository, "pushed", DURING_RUN);
       await pushAt(fixture.repository, PUBLISHED_AT);
       const fix = await commitAt(fixture.repository, "repair", DURING_RUN);
-      const failed = onForge(fixtureContext([publishAttempt(pushed, "failed")]));
-      await expect(commitLocal(localCommit(fix), failed)).resolves.toBeDefined();
+      // The reviewed head was pushed, and then the publication failed.
+      const reviewedThenFailed = onForge(
+        fixtureContext([...cleanReview(pushed), publishAttempt(pushed, "failed")]),
+      );
+      await expect(commitLocal(localCommit(fix), reviewedThenFailed)).resolves.toBeDefined();
+      // An unreviewed commit pushed during that same failed attempt is not excused by its window.
+      const unreviewedThenFailed = onForge(fixtureContext([publishAttempt(pushed, "failed")]));
+      await expect(commitLocal(localCommit(fix), unreviewedThenFailed)).rejects.toThrow(
+        strayPush(pushed, PUBLISHED_AT),
+      );
+      const reviewedWithFindings = onForge(
+        fixtureContext([
+          ...cleanReview(pushed, { p1: ["race"] }),
+          publishAttempt(pushed, "failed"),
+        ]),
+      );
+      await expect(commitLocal(localCommit(fix), reviewedWithFindings)).rejects.toThrow(
+        strayPush(pushed, PUBLISHED_AT),
+      );
+    });
+
+    it("excuses a failed P2 verification's push by its attempt window", async () => {
+      await addBareOrigin(fixture.repository);
+      const pushed = await commitAt(fixture.repository, "pushed", DURING_RUN);
+      await pushAt(fixture.repository, PUBLISHED_AT);
+      const fix = await commitAt(fixture.repository, "repair", DURING_RUN);
       const failedP2 = attemptAt("verifyP2", null, PUBLISH_STARTED, PUBLISH_FINISHED, "failed");
       await expect(
         commitLocal(localCommit(fix), onForge(fixtureContext([failedP2]))),
       ).resolves.toBeDefined();
+      const afterWindow = attemptAt(
+        "verifyP2",
+        null,
+        "2026-03-01T00:01:01.000Z",
+        "2026-03-01T00:02:00.000Z",
+        "failed",
+      );
+      await expect(
+        commitLocal(localCommit(fix), onForge(fixtureContext([runStarted(), afterWindow]))),
+      ).rejects.toThrow(strayPush(pushed, PUBLISHED_AT));
       await expect(commitLocal(localCommit(fix), onForge(fixtureContext()))).rejects.toThrow(
         strayPush(pushed, PUBLISHED_AT),
       );
+    });
+
+    it("excuses a reviewed head whose publication attempt a runner restart discarded", async () => {
+      await addBareOrigin(fixture.repository);
+      // The interrupted attempt left no step record, so no recorded window covers its push.
+      const reviewed = await commitAt(fixture.repository, "reviewed", DURING_RUN);
+      await pushAt(fixture.repository, PUBLISHED_AT);
+      const fix = await commitAt(fixture.repository, "repair", DURING_RUN);
+      const replacement = attemptAt(
+        "publish",
+        null,
+        "2026-06-02T00:00:00.000Z",
+        "2026-06-02T00:01:00.000Z",
+        "failed",
+      );
+      await expect(
+        commitLocal(
+          localCommit(fix),
+          onForge(fixtureContext([...cleanReview(reviewed), replacement])),
+        ),
+      ).resolves.toBeDefined();
+      await expect(
+        commitLocal(localCommit(fix), onForge(fixtureContext([runStarted(), replacement]))),
+      ).rejects.toThrow(strayPush(reviewed, PUBLISHED_AT));
+    });
+
+    it("excuses a P2-verified local head that a publication pushed before it was lost", async () => {
+      await addBareOrigin(fixture.repository);
+      const parent = await commitAt(fixture.repository, "parent", DURING_RUN);
+      const verified = await commitAt(fixture.repository, "p2", DURING_RUN);
+      await pushAt(fixture.repository, PUBLISHED_AT);
+      const fix = await commitAt(fixture.repository, "repair", DURING_RUN);
+      const history = [
+        ...cleanReview(parent, { p2: ["tidy"] }),
+        step("addressP2", { addressed: ["tidy"], skipped: [] }),
+        step("verifyP2Local", {
+          passed: true,
+          pushed: false,
+          repositories: [fixtureCandidate(verified)],
+        }),
+      ];
+      await expect(
+        commitLocal(localCommit(fix), onForge(fixtureContext(history))),
+      ).resolves.toBeDefined();
     });
 
     it("excuses a push of a head that an accepted publication recorded", async () => {
@@ -1853,7 +1954,9 @@ describe.each(["github", "gitlab"] as const)(
         expect(errors[0]).toContain(
           `local commit repositories[0]: this clone pushed ${leaked} to refs/remotes/origin/feat/demo at `,
         );
-        expect(errors[0]).toContain(`, outside every publication of this run. ${PUSH_GUIDANCE}`);
+        expect(errors[0]).toContain(
+          `, a commit that did not pass the review gate and that no publication of this run recorded. ${PUSH_GUIDANCE}`,
+        );
         const ids = nodeIdsOf(state);
         expect(ids).not.toContain("publish");
         expect(ids).not.toContain("runReview");
@@ -1916,6 +2019,73 @@ describe.each(["github", "gitlab"] as const)(
           .slice(state.steps.indexOf(commits[1]!), secondPublish)
           .filter((entry) => entry.nodeId === "assessReview");
         expect(reviewBefore).toHaveLength(1);
+      },
+      GRAPH_RUN_TIMEOUT_MS,
+    );
+  },
+);
+
+describe.each(["github", "gitlab"] as const)(
+  "autoimplement %s × end repair after a runner restart during the reviewed push",
+  (forge) => {
+    it(
+      "accepts the reviewed head that the lost attempt pushed and publishes the repair",
+      async () => {
+        await addBareOrigin(fixture.repository);
+        const databasePath = await makeStateDatabasePath(`autoimplement-${forge}-restart-publish`);
+        let engine: WorkflowEngine | undefined;
+        let attempts = 0;
+        let repaired = false;
+        let reviewedHead = "";
+        const scenario = timingScenario({
+          forge,
+          prTiming: "end",
+          publish: async (request, local) => {
+            attempts += 1;
+            if (attempts === 1) {
+              // The runner stops after the push. Parking never records the attempt, so its time
+              // window is lost, as after a restart. The push is dated after every later attempt
+              // starts, so no window of another attempt covers it either.
+              reviewedHead = local.head;
+              await pushAt(fixture.repository, "2099-01-01T00:00:00Z");
+              engine?.park();
+              return await new Promise<AgentStepSubmission>(() => {});
+            }
+            // The replacement finds the head already pushed, then reports another head and fails.
+            const reported = attempts === 2 ? fixture.baseRevision : local.head;
+            await git(fixture.repository, ["push", "-q", "-u", "origin", "feat/demo"]);
+            const result = await request.accept(
+              published(fixture.repository, reported, prFor(forge)),
+            );
+            if (!result.ok) throw new Error(result.error);
+            return { output: result.value };
+          },
+          decide: (request) => {
+            const latest = observationOf(request).latestAttempt;
+            if (latest?.nodeId === "publish" && latest.outcome === "failed" && !repaired) {
+              repaired = true;
+              return controlDecision("repair", "Repair before the next publication.");
+            }
+            return chooseFirstControlRoute(request);
+          },
+        });
+        engine = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const parked = await engine.run(autoimplementWorkflow, scenario.input);
+        expect(parked.state.status).toBe("running");
+        expect(parked.state.steps.some((entry) => entry.nodeId === "publish")).toBe(false);
+        const resumed = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const { state } = await resumed.resumeRun(autoimplementWorkflow, parked.runId);
+        expect(state.status, state.error).toBe("completed");
+        expect(attempts).toBe(3);
+        const publishes = state.steps.filter((entry) => entry.nodeId === "publish");
+        expect(publishes.map((entry) => entry.outcome)).toEqual(["failed", "ok"]);
+        const commits = state.steps.filter((entry) => entry.nodeId === "commitLocal");
+        expect(commits.map((entry) => entry.outcome)).toEqual(["ok", "ok"]);
+        expect(headsOf(commits[0]!)).toEqual([reviewedHead]);
+        const ids = nodeIdsOf(state);
+        expect(ids.indexOf("fix")).toBeGreaterThan(state.steps.indexOf(publishes[0]!));
+        expect(okSteps(state, "publish").map(headsOf)).toEqual([[scenario.work.head]]);
+        expect(scenario.work.head).not.toBe(reviewedHead);
       },
       GRAPH_RUN_TIMEOUT_MS,
     );

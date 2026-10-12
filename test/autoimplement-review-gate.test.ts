@@ -10,6 +10,7 @@ import {
   reviewGatePassed,
   reviewOf,
   reviewedHeadAwaitsPush,
+  revisionPassesGate,
 } from "../src/builtins/autoimplement-review-gate.js";
 import type { WorkflowNodeOutcome, WorkflowStepRecord } from "../src/workflows/types.js";
 
@@ -263,6 +264,32 @@ describe("autoimplement review gate predicates", () => {
       recorded("verifyP2Local", "h1", { passed: true, pushed: false }),
     ];
     expect(reviewGatePassed(unchanged)).toBe(true);
+  });
+
+  it("finds whether a commit passed the gate under any recorded identity", () => {
+    const reviewedClean = [recorded("commitLocal", "h1"), review("h1")];
+    expect(revisionPassesGate(reviewedClean, ID, "h1")).toBe(true);
+    expect(revisionPassesGate(reviewedClean, "other-id", "h1")).toBe(false);
+    expect(revisionPassesGate(reviewedClean, ID, "h2")).toBe(false);
+    // A later edit does not undo a clean review of that exact commit.
+    expect(revisionPassesGate([...reviewedClean, edit("fix")], ID, "h1")).toBe(true);
+    expect(
+      revisionPassesGate([recorded("commitLocal", "h1"), review("h1", { p1: ["race"] })], ID, "h1"),
+    ).toBe(false);
+    expect(revisionPassesGate([recorded("commitLocal", "h1")], ID, "h1")).toBe(false);
+    // A review without a recorded head, or a failed record, gives no identity to check.
+    expect(revisionPassesGate([review("h1")], ID, "h1")).toBe(false);
+    expect(
+      revisionPassesGate([recorded("commitLocal", "h1", {}, "failed"), review("h1")], ID, "h1"),
+    ).toBe(false);
+    const p2 = [
+      recorded("commitLocal", "h1"),
+      review("h1", { p2: ["tidy"] }),
+      edit("addressP2"),
+      recorded("verifyP2Local", "h2", { passed: true }),
+    ];
+    expect(revisionPassesGate(p2, ID, "h2")).toBe(true);
+    expect(revisionPassesGate(p2, ID, "h1")).toBe(false);
   });
 
   it("reports only publish and verifyP2 as pushed heads", () => {

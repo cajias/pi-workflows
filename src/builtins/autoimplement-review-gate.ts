@@ -121,6 +121,21 @@ export function headPassesGate(steps: Steps, head: HeadIdentity): boolean {
 }
 
 /**
+ * True when a commit of repository `id` passed the review gate: a recorded head with that revision
+ * passes, with whatever dependency fingerprint it was recorded and reviewed with.
+ */
+export function revisionPassesGate(steps: Steps, id: string, headRevision: string): boolean {
+  return steps.some(
+    (step) =>
+      isHeadRecord(step) &&
+      recordedHeads(step).some(
+        (head) =>
+          head.id === id && head.headRevision === headRevision && headPassesGate(steps, head),
+      ),
+  );
+}
+
+/**
  * True when the newest local work has passed the review gate: the newest work event is a head
  * record, it is not a failed P2 verification, and every head it records passes the gate.
  */
