@@ -189,6 +189,21 @@ describe("endTimingText", () => {
     expect(text.verifyP2Local.at(-1)).toBe("Report exact commands and outcomes.");
   });
 
+  it("asks a later reviewed push to check the published requests before it pushes", () => {
+    const github = endTimingText("github");
+    expect(github.alreadyPublished(["https://example.test/pr/1"])).toBe(
+      "This run already published https://example.test/pr/1. Check it first. If it is closed or merged, do not push and do not open another pull request; report that it is no longer open so the controller can choose blocked. Otherwise push to it.",
+    );
+    const plural = (count: number) =>
+      Array.from({ length: count }, (_, index) => `https://example.test/pr/${index + 1}`);
+    expect(github.alreadyPublished(plural(2))).toBe(
+      "This run already published https://example.test/pr/1 and https://example.test/pr/2. Check each of them first. If any of them is closed or merged, do not push and do not open another pull request; report which one is no longer open so the controller can choose blocked. Otherwise push to each of them.",
+    );
+    expect(endTimingText("gitlab").alreadyPublished(plural(3))).toBe(
+      "This run already published https://example.test/pr/1, https://example.test/pr/2, and https://example.test/pr/3. Check each of them first. If any of them is closed or merged, do not push and do not open another merge request; report which one is no longer open so the controller can choose blocked. Otherwise push to each of them.",
+    );
+  });
+
   it("names the merge request on GitLab and shares every other line", () => {
     const github = endTimingText("github");
     const gitlab = endTimingText("gitlab");

@@ -316,6 +316,23 @@ const LOCAL_COMMIT_INSPECT =
 const LOCAL_COMMIT_CHECKED =
   "Commit every task-related change. The workflow checks that the reported head is the checked-out HEAD of the task branch and that only changes that existed before the run stay uncommitted.";
 
+/** Joins names as `a`, `a and b`, or `a, b, and c`. */
+function listOf(items: readonly string[]): string {
+  if (items.length <= 2) return items.join(" and ");
+  return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
+}
+
+/**
+ * The request a later reviewed push must reuse. The model checks it before pushing, because a push
+ * to the branch of a merged request whose branch was deleted would recreate that branch.
+ */
+function alreadyPublishedLine(requests: readonly string[], request: string): string {
+  if (requests.length === 1) {
+    return `This run already published ${requests[0]}. Check it first. If it is closed or merged, do not push and do not open another ${request}; report that it is no longer open so the controller can choose blocked. Otherwise push to it.`;
+  }
+  return `This run already published ${listOf(requests)}. Check each of them first. If any of them is closed or merged, do not push and do not open another ${request}; report which one is no longer open so the controller can choose blocked. Otherwise push to each of them.`;
+}
+
 export function endTimingText(forge: Forge): EndTimingText {
   const { request } = forgeTerms(forge);
   return {
@@ -329,8 +346,7 @@ export function endTimingText(forge: Forge): EndTimingText {
       "Report the absolute repository path, task branch, base branch, full local HEAD revision, and committed true.",
       PUBLISH_DEPENDENCY_FINGERPRINT,
     ],
-    alreadyPublished: (requests) =>
-      `This run already published ${requests.join(", ")}. Push to it. If it is closed or merged, do not open another ${request}; report that it is no longer open.`,
+    alreadyPublished: (requests) => alreadyPublishedLine(requests, request),
     verifyP2Local: [
       "Run focused verification for the P2 changes, then commit the verified result locally on the task branch.",
       `Never push, never open or update a ${request}, and never amend or rewrite a commit that was already pushed. Publication follows this verification.`,
