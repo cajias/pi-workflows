@@ -462,15 +462,17 @@ describe("push tracking head", () => {
     const { repo, head, bare } = await taskBranch("tracking-configured-remote");
     await git(repo, ["remote", "add", "fork", bare]);
     await git(repo, ["remote", "add", "mirror", bare]);
-    // Several remotes and no configuration: the destination is unknown.
-    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
-    await git(repo, ["config", "branch.feat/x.remote", "origin"]);
+    // Several remotes and no configuration: Git pushes to origin by default.
     expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
       ref: "refs/remotes/origin/feat/x",
     });
-    await git(repo, ["config", "remote.pushDefault", "mirror"]);
+    await git(repo, ["config", "branch.feat/x.remote", "mirror"]);
     expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
       ref: "refs/remotes/mirror/feat/x",
+    });
+    await git(repo, ["config", "remote.pushDefault", "origin"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
+      ref: "refs/remotes/origin/feat/x",
     });
     await git(repo, ["config", "branch.feat/x.pushRemote", "fork"]);
     await git(repo, ["push", "-q", "fork", "feat/x"]);
@@ -481,6 +483,17 @@ describe("push tracking head", () => {
     // A push remote that names no configured remote, such as a URL, gives no tracking ref.
     await git(repo, ["config", "branch.feat/x.pushRemote", bare]);
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+  });
+
+  it("gives no push destination with several remotes, none of them origin", async () => {
+    const { repo, bare } = await taskBranch("tracking-no-origin");
+    await git(repo, ["remote", "rename", "origin", "fork"]);
+    await git(repo, ["remote", "add", "upstream", bare]);
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await git(repo, ["remote", "remove", "upstream"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toMatchObject({
+      ref: "refs/remotes/fork/feat/x",
+    });
   });
 
   it("checks the task branch ref when Git's push destination has another name", async () => {
@@ -511,6 +524,10 @@ describe("push tracking head", () => {
     };
     await fetchSpecs("+refs/heads/main:refs/remotes/origin/main");
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    // A stale ref that a push never updates is not trusted either.
+    await git(repo, ["update-ref", "refs/remotes/origin/feat/x", "HEAD"]);
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    await git(repo, ["update-ref", "-d", "refs/remotes/origin/feat/x"]);
     await fetchSpecs("refs/heads/*", "+refs/heads/*:refs/remotes/origin/*", "^refs/heads/feat/*");
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
     await fetchSpecs("+refs/heads/feat/x:refs/remotes/origin/feat/x");

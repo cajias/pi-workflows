@@ -206,8 +206,9 @@ async function optionalGit(cwd: string, args: string[]): Promise<string | undefi
  * The remote-tracking ref of the push destination of `branch`, read from local refs and
  * configuration only. Git's own `<branch>@{push}` wins when it names `refs/remotes/<remote>/<branch>`.
  * Otherwise the remote is the first one set among `branch.<branch>.pushRemote`, `remote.pushDefault`,
- * and `branch.<branch>.remote`, or else the only remote. The result is undefined when no remote is
- * known, or when the ref is absent and the remote's fetch refspec does not map the branch to it.
+ * and `branch.<branch>.remote`, else `origin`, else the only remote. That remote's ref counts only
+ * when the remote's fetch refspec maps the branch to it, because only then does a push update it.
+ * The result is undefined when no remote is known or the refspec does not map the branch.
  */
 export async function pushTrackingHead(
   repository: string,
@@ -225,7 +226,9 @@ export async function pushTrackingHead(
     };
   }
   const remote = await pushRemote(repository, branch);
-  if (remote === undefined) return undefined;
+  if (remote === undefined || !(await fetchRefspecTracks(repository, remote, branch))) {
+    return undefined;
+  }
   const ref = `${REMOTE_TRACKING_PREFIX}${remote}/${branch}`;
   const headRevision = await optionalGit(repository, [
     "rev-parse",
@@ -233,10 +236,7 @@ export async function pushTrackingHead(
     "--quiet",
     `${ref}^{commit}`,
   ]);
-  if (headRevision !== undefined) return { ref, headRevision };
-  return (await fetchRefspecTracks(repository, remote, branch))
-    ? { ref, headRevision: null }
-    : undefined;
+  return { ref, headRevision: headRevision ?? null };
 }
 
 /** The remote of a `refs/remotes/<remote>/<branch>` ref, or undefined for any other ref. */
@@ -246,7 +246,10 @@ function trackingRemote(ref: string, branch: string): string | undefined {
   return remote.length === 0 ? undefined : remote;
 }
 
-/** The configured push remote of a branch, or the only remote. A value that names no remote is unknown. */
+/**
+ * The configured push remote of a branch, else `origin`, which Git pushes to by default, else the
+ * only remote. A configured value that names no remote is unknown.
+ */
 async function pushRemote(repository: string, branch: string): Promise<string | undefined> {
   const remotes = ((await optionalGit(repository, ["remote"])) ?? "")
     .split(/\r?\n/)
@@ -260,6 +263,7 @@ async function pushRemote(repository: string, branch: string): Promise<string | 
     const configured = await optionalGit(repository, ["config", "--get", key]);
     if (configured !== undefined) return remotes.includes(configured) ? configured : undefined;
   }
+  if (remotes.includes("origin")) return "origin";
   return remotes.length === 1 ? remotes[0] : undefined;
 }
 
