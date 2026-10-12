@@ -1495,6 +1495,13 @@ function assertGitLabPublication(
   label: string,
 ): void {
   const mergeRequest = parseGitLabMergeRequestUrl(repository.pr, `${label}.pr`);
+  // Every GitLab prompt reaches the REST API through `glab api --hostname <host>`, and glab rejects
+  // a hostname with a port, so such a merge request could never be inspected or delivered.
+  if (mergeRequest.host.includes(":")) {
+    throw new Error(
+      `${label}.pr names the port of ${mergeRequest.host}, which this workflow does not support on GitLab because glab api --hostname rejects a hostname with a port`,
+    );
+  }
   if (host !== null && !onForgeHost(mergeRequest, host)) {
     throw new Error(`${label}.pr must be a merge request on the detected GitLab host ${host}`);
   }

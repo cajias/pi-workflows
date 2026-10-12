@@ -1124,7 +1124,9 @@ describe("autoimplement GitLab prompts", () => {
     expect(prompt).toContain(
       "<project path> is the project path of that remote, such as group/sub/project, and <apiProject> is that path URL-encoded",
     );
-    expect(prompt).toContain("and full 40-character pushed head revision.");
+    expect(prompt).toContain(
+      "and pushed head revision as the full commit SHA (40 hex characters, or 64 in a SHA-256 repository).",
+    );
     expect(prompt).toContain("create a second merge request for the same source and target branch");
     expect(prompt).toContain(
       "Write the merge request description yourself: what changed and why, how it was verified with exact commands, risks, and follow-ups.",
@@ -1293,10 +1295,10 @@ describe("autoimplement GitLab publication validation", () => {
     ).rejects.toThrow(
       "publication repositories[0].pr must be a merge request on the detected GitLab host gitlab.example.test",
     );
-    const onPort = "https://GitLab.Example.Test:8443/group/sub/project/-/merge_requests/7";
+    const upperCase = "https://GitLab.Example.Test/group/sub/project/-/merge_requests/7";
     await expect(
-      validatePublish(publication(onPort), { resolveForge: DETECTED_GITLAB }),
-    ).resolves.toMatchObject({ repositories: [{ pr: onPort }] });
+      validatePublish(publication(upperCase), { resolveForge: DETECTED_GITLAB }),
+    ).resolves.toMatchObject({ repositories: [{ pr: upperCase }] });
     await expect(
       validatePublish(publication(GITLAB_MR), {
         resolveForge: { ...DETECTED_GITLAB, host: "gitlab.example.test:8443" },
@@ -1306,6 +1308,15 @@ describe("autoimplement GitLab publication validation", () => {
     await expect(
       validatePublish(publication(anywhere), { resolveForge: resolution("gitlab", "gitlab") }),
     ).resolves.toMatchObject({ repositories: [{ pr: anywhere }] });
+  });
+
+  it("rejects a GitLab merge request URL with a port, which glab api --hostname cannot reach", async () => {
+    const onPort = "https://gitlab.example.test:8443/group/sub/project/-/merge_requests/7";
+    for (const resolveForge of [DETECTED_GITLAB, resolution("gitlab", "gitlab")]) {
+      await expect(validatePublish(publication(onPort), { resolveForge })).rejects.toThrow(
+        "publication repositories[0].pr names the port of gitlab.example.test:8443, which this workflow does not support on GitLab because glab api --hostname rejects a hostname with a port",
+      );
+    }
   });
 
   it("requires the prepared task branch and the full head revision on GitLab", async () => {
