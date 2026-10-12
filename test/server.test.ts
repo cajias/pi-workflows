@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -16,8 +17,13 @@ import {
   type ClientRequest,
   type ClientResponse,
 } from "../src/client/protocol.js";
-import { readServerLock, serverLockPath } from "../src/server/lock.js";
-import { ServerProcessRegistry } from "../src/server/processes.js";
+import {
+  probeServerServing,
+  readServerLock,
+  replaceServerLock,
+  serverLockPath,
+} from "../src/server/lock.js";
+import { ServerProcessRegistry, processStartIdentity } from "../src/server/processes.js";
 import { WorkflowServer } from "../src/server/server.js";
 import { ServerStateStore } from "../src/server/state.js";
 import {
@@ -3920,15 +3926,15 @@ export { default } from ${JSON.stringify(path.resolve("examples/workflows/echo.w
       holderPid = holder?.pid;
       expect(typeof holderPid).toBe("number");
       // Extend the holder's lease while it is still running, then freeze it:
-      // a second starter passes the lock probe (the frozen holder does not
+      // a second starter passes the serving probe (the frozen holder does not
       // answer) but must lose the claim.
       const store = new ServerStateStore(databasePath);
       await updateServerLease(store, Date.now() + 60_000);
       process.kill(holderPid as number, "SIGSTOP");
       const second = new WorkflowServer({ databasePath });
       await expect(second.start()).rejects.toThrow(/live Pi Workflows server/);
-      // The fenced starter restores the holder's lock record.
-      expect(readServerLock(serverLockPath(databasePath))?.pid).toBe(holderPid);
+      // The fenced starter never owned the lock, so the holder's record stays.
+      expect(readServerLock(serverLockPath(databasePath))).toEqual(holder);
       // The fenced starter must leave the winner's bound socket alone.
       expect(existsSync(socketPath)).toBe(true);
       // The frozen holder wakes and keeps serving on its original socket.
@@ -4076,6 +4082,198 @@ export { default } from ${JSON.stringify(path.resolve("examples/workflows/echo.w
       await server.stop();
     }
   }, 30_000);
+
+  /** A process ID that no longer names a running process. */
+  async function exitedPid(): Promise<number> {
+    const exited = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await once(exited, "exit");
+    return exited.pid as number;
+  }
+
+  /** Call `onRelease` each time a server is about to release its epoch claim. */
+  function observeClaimRelease(onRelease: () => void): { mockRestore(): void } {
+    const releaseServer = ServerStateStore.prototype.releaseServer;
+    return vi.spyOn(ServerStateStore.prototype, "releaseServer").mockImplementation(function (
+      this: ServerStateStore,
+      ...args
+    ) {
+      onRelease();
+      return releaseServer.apply(this, args);
+    });
+  }
+
+  it("rewrites a deleted or foreign lock file while it owns the epoch", async () => {
+    const databasePath = path.join(await makeTempDir("server-lock-watchdog"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    const server = new WorkflowServer({ databasePath, runnerId: "server-owner", claimPollMs: 10 });
+    await server.start();
+    try {
+      const own = readServerLock(lockPath);
+      expect(own).toMatchObject({ pid: process.pid, serverId: "server-owner" });
+      await fs.rm(lockPath);
+      await waitUntil(() => readServerLock(lockPath)?.serverId === "server-owner");
+      // A fenced starter that ran older lock code can leave its own record behind.
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({
+          schema: "pi-workflows.server-lock.v1",
+          pid: await exitedPid(),
+          startIdentity: "platform-start:0",
+          serverId: "server-dead-loser",
+        }),
+      );
+      await waitUntil(() => readServerLock(lockPath)?.serverId === "server-owner");
+      expect(readServerLock(lockPath)).toEqual(own);
+    } finally {
+      await server.stop();
+    }
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("never rewrites the lock file after another server claims the epoch", async () => {
+    const databasePath = path.join(await makeTempDir("server-lock-superseded"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    const logs: string[] = [];
+    const server = new WorkflowServer({
+      databasePath,
+      runnerId: "server-superseded",
+      claimPollMs: 10,
+      serverRenewMs: 100,
+      serverLeaseMs: 500,
+      onLog: (message) => logs.push(message),
+    });
+    await server.start();
+    const store = new ServerStateStore(databasePath);
+    let released = false;
+    const release = observeClaimRelease(() => {
+      released = true;
+    });
+    try {
+      await waitUntil(() => store.serverStatus().live, 10_000);
+      await updateServerLease(store, Date.now() - 10_000);
+      const takeoverPid = await exitedPid();
+      store.acquireServer({
+        serverId: "server-takeover",
+        pid: takeoverPid,
+        processStartIdentity: "start-takeover",
+        leaseMs: 30_000,
+      });
+      // The new owner writes its lock right after its claim.
+      const takeover = {
+        pid: takeoverPid,
+        startIdentity: "start-takeover",
+        serverId: "server-takeover",
+      };
+      replaceServerLock(lockPath, takeover);
+      // Polls keep running every 10 ms until the next renewal fails and the
+      // superseded server stops; its stop then tries to release its claim.
+      await waitUntil(() => released, 10_000);
+      expect(logs).toContain("server claim lost: Pi Workflows server claim lost");
+      expect(logs.some((message) => message.includes("lock file"))).toBe(false);
+      expect(readServerLock(lockPath)).toEqual(takeover);
+    } finally {
+      release.mockRestore();
+      store.close();
+      await server.stop();
+    }
+  }, 30_000);
+
+  it("leaves the epoch owner's registered children alone when a starter is fenced", async () => {
+    const databasePath = path.join(await makeTempDir("server-fenced-reap"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        'process.stdin.on("data", (d) => process.stdout.write(d)); process.stdout.write("ready\\n");',
+      ],
+      { detached: true, stdio: ["pipe", "pipe", "ignore"] },
+    );
+    child.stdin.on("error", () => undefined);
+    const owner = new ServerStateStore(databasePath);
+    const starter = new WorkflowServer({ databasePath, runnerId: "server-fenced" });
+    try {
+      await once(child.stdout, "data");
+      // The live owner registered a supervised child and is not serving yet.
+      new ServerProcessRegistry(path.dirname(lockPath)).register(child.pid as number);
+      owner.acquireServer({
+        serverId: "server-owner",
+        pid: process.pid,
+        processStartIdentity: processStartIdentity(process.pid) as string,
+        leaseMs: 60_000,
+      });
+      await expect(starter.start()).rejects.toThrow(/live Pi Workflows server/);
+      // The child still answers, so the fenced starter did not reap it.
+      const answer = once(child.stdout, "data").then(([chunk]) => String(chunk));
+      const exited = once(child, "exit").then(() => "exited");
+      child.stdin.write("ping\n");
+      expect(await Promise.race([answer, exited])).toBe("ping\n");
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await starter.stop();
+      owner.close();
+      try {
+        process.kill(-(child.pid as number), "SIGKILL");
+      } catch {
+        // The child already exited.
+      }
+    }
+  });
+
+  it("removes its lock file before it releases the epoch claim on stop", async () => {
+    const databasePath = path.join(await makeTempDir("server-stop-lock-order"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    const server = new WorkflowServer({
+      databasePath,
+      runnerId: "server-stopping",
+      claimPollMs: 10,
+    });
+    await server.start();
+    expect(readServerLock(lockPath)?.serverId).toBe("server-stopping");
+    const lockAtRelease: boolean[] = [];
+    const release = observeClaimRelease(() => lockAtRelease.push(existsSync(lockPath)));
+    try {
+      await server.stop();
+    } finally {
+      release.mockRestore();
+    }
+    expect(lockAtRelease).toEqual([false]);
+    expect(existsSync(lockPath)).toBe(false);
+    const state = new ServerStateStore(databasePath, { readOnly: true });
+    try {
+      expect(state.serverStatus()).toMatchObject({ serverId: null, live: false });
+    } finally {
+      state.close();
+    }
+  });
+
+  it("refuses to start beside a serving server whose lock file is missing", async () => {
+    const databasePath = path.join(await makeTempDir("server-missing-lock"), "state.sqlite");
+    const lockPath = serverLockPath(databasePath);
+    // A long poll keeps the owner's lock watchdog out of the way.
+    const server = new WorkflowServer({
+      databasePath,
+      runnerId: "server-serving",
+      claimPollMs: 1_000_000,
+    });
+    await server.start();
+    const second = new WorkflowServer({ databasePath, runnerId: "server-second" });
+    try {
+      await fs.rm(lockPath);
+      await expect(second.start()).rejects.toThrow(/workflow server is already running on/);
+      expect(existsSync(lockPath)).toBe(false);
+      expect(await probeServerServing(server.endpoint, 1_000)).toBe(true);
+      const state = new ServerStateStore(databasePath, { readOnly: true });
+      try {
+        expect(state.serverStatus()).toMatchObject({ serverId: "server-serving", live: true });
+      } finally {
+        state.close();
+      }
+    } finally {
+      await second.stop();
+      await server.stop();
+    }
+  });
 
   it("retries an interrupted idempotent effect and adopts its durable reservation", async () => {
     const cwd = await makeTempDir("server-idempotent-effect-project");

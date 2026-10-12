@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CLIENT_PROTOCOL_SCHEMA, clientSocketPath } from "../src/client/protocol.js";
-import { readServerLock, serverLockPath, writeServerLock } from "../src/server/lock.js";
+import { readServerLock, replaceServerLock, serverLockPath } from "../src/server/lock.js";
 import { processStartIdentity } from "../src/server/processes.js";
 import { canonicalJson } from "../src/state/json.js";
 import { main, parseCliArgs } from "../src/viewer/cli.js";
@@ -144,7 +144,7 @@ describe("pi-workflows CLI server recovery", () => {
       child.once("error", reject);
     });
     const startIdentity = processStartIdentity(child.pid as number);
-    writeServerLock(serverLockPath(databasePath), {
+    replaceServerLock(serverLockPath(databasePath), {
       pid: child.pid as number,
       startIdentity: startIdentity as string,
       serverId: "server-stub",

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -29,7 +30,7 @@ export function serverLockPath(databasePath: string): string {
   return path.join(serverDirectoryPath(databasePath), "server.lock.json");
 }
 
-export function isServerLockRecord(value: unknown): value is ServerLockRecord {
+function isServerLockRecord(value: unknown): value is ServerLockRecord {
   if (typeof value !== "object" || value === null) return false;
   const record = value as {
     schema?: unknown;
@@ -61,12 +62,39 @@ export function readServerLock(lockPath: string): ServerLockRecord | undefined {
   return { pid, startIdentity, serverId };
 }
 
-export function writeServerLock(lockPath: string, record: ServerLockRecord): void {
-  fs.writeFileSync(lockPath, `${JSON.stringify({ schema: SERVER_LOCK_SCHEMA, ...record })}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-    flag: "wx",
-  });
+/** True when both records name the same server process and server ID. */
+export function sameServerLock(
+  left: ServerLockRecord | undefined,
+  right: ServerLockRecord,
+): boolean {
+  return (
+    left !== undefined &&
+    left.pid === right.pid &&
+    left.startIdentity === right.startIdentity &&
+    left.serverId === right.serverId
+  );
+}
+
+/**
+ * Replace the lock file in one atomic step: the record goes to a private
+ * temporary file in the same directory, which is then renamed over the lock.
+ * A reader therefore sees the previous record or the new one, never a partial
+ * file or a gap. Only the server that owns the current epoch calls this.
+ */
+export function replaceServerLock(lockPath: string, record: ServerLockRecord): void {
+  const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+  const { pid, startIdentity, serverId } = record;
+  try {
+    fs.writeFileSync(
+      temporary,
+      `${JSON.stringify({ schema: SERVER_LOCK_SCHEMA, pid, startIdentity, serverId })}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+    fs.renameSync(temporary, lockPath);
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
 }
 
 /** One bounded socket probe: does a server accept connections here and answer? */
@@ -98,63 +126,27 @@ export async function probeServerServing(socketPath: string, timeoutMs: number):
 }
 
 /**
- * Take the exclusive server lock for a starting server. A lock whose recorded
- * process is gone, or whose process is alive but provably not serving, is stale
- * and is removed. A holder that answers on the socket keeps the lock, and the
- * caller must not start. Fencing against a second live server stays with the
- * epoch claim, not with this file: a probe misfire costs one wasted start, and
- * the loser exits when its claim fails.
- *
- * The probe awaits, so the lock record can change while it runs. After a
- * not-serving verdict the record is re-read, and the lock is only removed when
- * it still names the same silent holder; a record another starter already
- * replaced makes this starter re-read and converge instead of clobbering the
- * newer takeover. Creation stays exclusive (`wx`), so a racing creator loses
- * and re-reads. Concurrent starters can therefore only displace a holder that
- * is provably not serving, and the epoch claim fences whichever of them wins.
- *
- * The returned `displaced` record is the live holder this start replaced, so a
- * starter whose claim is then fenced can restore the holder's lock file
- * instead of leaving the serving holder without one.
+ * Refuse to start while a server answers on the socket. The probe runs whatever
+ * the lock file says: a missing record, a dead process, or a live one. A lock
+ * can be missing while a server serves, and a live holder can be alive but
+ * silent, as during shutdown or while frozen. This check only reads. It never
+ * writes or removes the lock, because a starter does not own the lock until it
+ * wins the epoch claim. Fencing against a second live server stays with the
+ * epoch claim: a probe misfire costs one wasted start, and the loser exits when
+ * its claim fails.
  */
-export async function acquireServerLock(
+export async function assertNoServingServer(
   lockPath: string,
-  record: { pid: number; startIdentity: string; serverId: string },
   options: { socketPath: string; probeTimeoutMs?: number; probe?: ServerLockProbe },
-): Promise<{ displaced: ServerLockRecord | undefined }> {
+): Promise<void> {
   const probe = options.probe ?? probeServerServing;
-  const timeoutMs = options.probeTimeoutMs ?? 500;
-  let displaced: ServerLockRecord | undefined;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const existing = readServerLock(lockPath);
-    if (existing !== undefined && matchesProcessIdentity(existing)) {
-      if (await probe(options.socketPath, timeoutMs)) {
-        throw new Error(`A workflow server is already running with PID ${existing.pid}`);
-      }
-      const current = readServerLock(lockPath);
-      if (
-        current !== undefined &&
-        matchesProcessIdentity(current) &&
-        (current.pid !== existing.pid ||
-          current.startIdentity !== existing.startIdentity ||
-          current.serverId !== existing.serverId)
-      ) {
-        continue;
-      }
-      displaced = existing;
-    } else if (existing === undefined) {
-      displaced = undefined;
-    }
-    fs.rmSync(lockPath, { force: true });
-    try {
-      writeServerLock(lockPath, record);
-      return { displaced };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
-      // Another starter created the lock first; re-read and converge.
-    }
-  }
-  throw new Error(`Could not acquire the workflow server lock at ${lockPath}`);
+  if (!(await probe(options.socketPath, options.probeTimeoutMs ?? 500))) return;
+  const holder = readServerLock(lockPath);
+  throw new Error(
+    holder !== undefined && matchesProcessIdentity(holder)
+      ? `A workflow server is already running with PID ${holder.pid}`
+      : `A workflow server is already running on ${options.socketPath}`,
+  );
 }
 
 /**

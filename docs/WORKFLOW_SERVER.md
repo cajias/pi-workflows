@@ -73,11 +73,11 @@ pi-workflows server run
 
 `run` stays attached for direct operation and tests. `start` starts the package process on demand and waits for a ready handshake. It does not install systemd, launchd, or another persistent service.
 
-The server uses one global lock and one server epoch. Socket creation and the SQLite server claim must agree before the server accepts commands. A second live server refuses to start. After the old server lease expires, a new server increases the epoch before it handles work. Messages from an older epoch are rejected.
+The server uses one global lock file and one server epoch. The SQLite server claim decides ownership. A starting server first probes the socket and refuses to start when a server answers, even when the lock file is missing. Only the server that wins the epoch claim writes `server/server.lock.json`, atomically, and it rewrites a missing or foreign record while its claim still names it. A starter that loses the claim exits without touching the lock file, the socket, or the owner's child processes. Socket creation and the SQLite server claim must agree before the server accepts commands. A second live server refuses to start. After the old server lease expires, a new server increases the epoch before it handles work. Messages from an older epoch are rejected.
 
 The server stays alive while it has a connected client, an active runner, a scheduled wake, a pending managed resource, a pending external-channel decision, or other unsettled work. An idle server may exit after a documented idle period. A later client can start it again.
 
-A server process runs the package version it loaded at start. After a package upgrade, a client from the new version refuses to talk to a server from the old version, so the server answers no request, not even its own stop. Both `server stop` and `server start` then read `server/server.lock.json`, check the recorded process start identity, and stop that process with `SIGTERM` and a bounded `SIGKILL` after a 5-second grace. `server stop` reports the stopped process. `server start` stops the recorded server and then starts a matching one. `server status` reports the mismatch and changes nothing. The extension reports the mismatch and leaves the process alone, because two Pi installations of different versions can share one state directory.
+A server process runs the package version it loaded at start. After a package upgrade, a client from the new version refuses to talk to a server from the old version, so the server answers no request, not even its own stop. Both `server stop` and `server start` then read `server/server.lock.json`, which only the epoch owner writes, check the recorded process start identity, and stop that process with `SIGTERM` and a bounded `SIGKILL` after a 5-second grace. `server stop` reports the stopped process. `server start` stops the recorded server and then starts a matching one. `server status` reports the mismatch and changes nothing. The extension reports the mismatch and leaves the process alone, because two Pi installations of different versions can share one state directory.
 
 ## Claim rules
 
@@ -438,8 +438,8 @@ A client cannot force-cancel a live claim through the stale recovery path.
 
 At startup the server:
 
-1. Takes the global server epoch.
-2. Reaps runner records that match an exact stale process identity.
+1. Takes the global server epoch. A starter that loses the claim exits here and changes nothing on disk.
+2. Reaps runner records that match an exact stale process identity, then atomically writes its own server lock record.
 3. Finds expired running runs and active attempts.
 4. Reads managed effect state before deciding whether work can repeat.
 5. Parks uncertain effects for manual review.

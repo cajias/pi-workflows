@@ -110,10 +110,10 @@ import {
 } from "./channel-effects.js";
 import { ChannelAdapterSupervisor } from "./channel-supervisor.js";
 import {
-  acquireServerLock,
-  isServerLockRecord,
+  assertNoServingServer,
   readServerLock,
-  writeServerLock,
+  replaceServerLock,
+  sameServerLock,
   type ServerLockRecord,
 } from "./lock.js";
 import { ServerProcessRegistry, processParentPid, processStartIdentity } from "./processes.js";
@@ -278,8 +278,8 @@ export class WorkflowServer {
   private server: net.Server | null = null;
   /** The socket path this server actually bound, or null while it has not. */
   private boundSocketPath: string | null = null;
-  /** The live holder's lock record this start displaced, if any. */
-  private displacedLock: ServerLockRecord | undefined;
+  /** This process's start identity, recorded in the lock file once this server owns the epoch. */
+  private startIdentity: string | null = null;
   private claim: ServerClaim | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -367,15 +367,12 @@ export class WorkflowServer {
     if (startIdentity === undefined) {
       throw new Error("Cannot attest the workflow server process start identity");
     }
-    const { displaced } = await acquireServerLock(
-      this.lockPath,
-      { pid: process.pid, startIdentity, serverId: this.serverId },
-      { socketPath: this.socketPath },
-    );
-    this.displacedLock = displaced;
+    this.startIdentity = startIdentity;
+    // A starter owns nothing on disk until it wins the epoch claim, so this
+    // check only reads. A fenced starter can then never remove, replace, or
+    // restore the owner's lock file.
+    await assertNoServingServer(this.lockPath, { socketPath: this.socketPath });
     try {
-      const reaped = this.registry.reapOrphans();
-      if (reaped.length > 0) this.log(`reaped ${reaped.length} exact orphan process(es)`);
       const previousServer = this.serverState.serverStatus();
       this.claim = this.serverState.acquireServer({
         serverId: this.serverId,
@@ -383,6 +380,10 @@ export class WorkflowServer {
         processStartIdentity: startIdentity,
         leaseMs: this.options.serverLeaseMs ?? SERVER_LEASE_MS,
       });
+      // Only the claim owner reaps recorded children and writes the lock file.
+      const reaped = this.registry.reapOrphans();
+      if (reaped.length > 0) this.log(`reaped ${reaped.length} exact orphan process(es)`);
+      replaceServerLock(this.lockPath, this.ownLockRecord(startIdentity));
       this.recoverPreviousServer(previousServer.serverId, this.claim.epoch);
       this.serverState.recoverInactiveModelTurns();
       this.discoverMissingTerminalWorkflowMessages();
@@ -390,7 +391,6 @@ export class WorkflowServer {
       await this.listen();
       this.startTimers();
       this.started = true;
-      this.displacedLock = undefined;
       this.log(`ready on ${this.socketPath} at epoch ${this.claim.epoch}`);
       this.requestAutomaticStatePrune();
       void this.expireTimedOutDecision().finally(() => this.resumeAutomaticStatePruneIfDue());
@@ -404,18 +404,8 @@ export class WorkflowServer {
       const server = this.server;
       this.server = null;
       await this.closeServer(server);
-      let released = false;
-      if (this.claim !== null) {
-        try {
-          released = this.serverState.releaseServer(this.claim);
-        } catch {
-          // Preserve the startup error when cleanup cannot release an already-lost claim.
-        }
-      }
-      this.claim = null;
-      if (released) this.removeBoundSocket();
-      else this.restoreDisplacedLock();
-      this.releaseLock();
+      // A fenced starter holds no claim, so it leaves the lock and socket alone.
+      this.releaseOwnership("startup");
       throw error;
     }
   }
@@ -473,25 +463,47 @@ export class WorkflowServer {
       await Promise.allSettled([this.automaticStatePruneTask]);
     }
     this.registry.killAll();
-    // The explicit socket-file removal is gated on releasing this server's own
-    // claim, and closing the listener is gated the same way inside
-    // closeServer, because closing unlinks the bound path.
-    let released = false;
-    if (this.claim !== null) {
-      try {
-        released = this.serverState.releaseServer(this.claim);
-      } catch (error) {
-        this.log(`claim release failed during stop: ${errorMessage(error)}`);
-      }
-      this.claim = null;
-    }
-    if (released) this.removeBoundSocket();
-    this.releaseLock();
+    this.releaseOwnership("stop");
     this.runStore.close();
     this.queue.close();
     this.serverState.close();
     this.state.close();
     this.started = false;
+  }
+
+  /**
+   * Give up this server's lock file and epoch claim. The lock goes first, while
+   * the claim may still name this server: no other server writes the lock while
+   * this server owns the epoch, so the removal cannot race a successor's write.
+   * A superseded server removes the lock only while it still names this server;
+   * if a successor's write lands between that read and the removal, the
+   * successor's poll rewrites its record. The explicit socket-file removal is
+   * gated on releasing this server's own claim, and closing the listener is
+   * gated the same way inside closeServer, because closing unlinks the bound
+   * path.
+   */
+  private releaseOwnership(context: string): void {
+    if (this.claim === null) return;
+    this.releaseLock();
+    let released = false;
+    try {
+      released = this.serverState.releaseServer(this.claim);
+    } catch (error) {
+      this.log(`claim release failed during ${context}: ${errorMessage(error)}`);
+    }
+    this.claim = null;
+    if (released) this.removeBoundSocket();
+  }
+
+  /** True while the epoch row still names this server and its claimed epoch. */
+  private ownsCurrentEpoch(): boolean {
+    if (this.claim === null) return false;
+    const row = this.serverState.serverStatus();
+    return row.serverId === this.serverId && row.epoch === this.claim.epoch;
+  }
+
+  private ownLockRecord(startIdentity: string): ServerLockRecord {
+    return { pid: process.pid, startIdentity, serverId: this.serverId };
   }
 
   /**
@@ -503,10 +515,7 @@ export class WorkflowServer {
   private ensureSocketFile(): void {
     if (process.platform === "win32" || this.rebindingSocket) return;
     if (fs.existsSync(this.socketPath)) return;
-    const row = this.serverState.serverStatus();
-    if (row.serverId !== this.serverId || (this.claim !== null && row.epoch !== this.claim.epoch)) {
-      return;
-    }
+    if (!this.ownsCurrentEpoch()) return;
     this.rebindingSocket = true;
     this.log("the socket file disappeared; rebinding");
     const previous = this.server;
@@ -525,6 +534,26 @@ export class WorkflowServer {
         this.log(`socket rebind failed: ${errorMessage(error)}`);
         void this.stop();
       });
+  }
+
+  /**
+   * Rewrite the lock file when it is missing or names another record while
+   * this server still owns the current epoch. An outside deletion, or a
+   * starter that ran older lock code, can leave the owner without its lock. A
+   * superseded server never rewrites it, because the newer owner owns the
+   * file. A failure is logged and retried on the next poll.
+   */
+  private ensureLockFile(): void {
+    try {
+      if (this.startIdentity === null) return;
+      const own = this.ownLockRecord(this.startIdentity);
+      if (sameServerLock(readServerLock(this.lockPath), own)) return;
+      if (!this.ownsCurrentEpoch()) return;
+      replaceServerLock(this.lockPath, own);
+      this.log("the server lock file was missing or named another server; rewrote it");
+    } catch (error) {
+      this.log(`server lock file repair failed: ${errorMessage(error)}`);
+    }
   }
 
   private async closeServer(server: net.Server | null): Promise<void> {
@@ -600,6 +629,7 @@ export class WorkflowServer {
     this.pollTimer = setInterval(() => {
       try {
         this.ensureSocketFile();
+        this.ensureLockFile();
         this.serverState.syncActiveTime();
         this.recovery.sample();
         this.reconcileSubmissionReminders();
@@ -653,26 +683,6 @@ export class WorkflowServer {
     // loser that cleans up after a fenced start must leave the winner's socket
     // alone.
     this.boundSocketPath = this.socketPath;
-  }
-
-  /**
-   * Put back the lock record a fenced start displaced: the holder that kept
-   * serving must keep its lock file, or the version-mismatch stop path and
-   * later recovery lose track of it. A record another starter already wrote
-   * stays in place.
-   */
-  private restoreDisplacedLock(): void {
-    const displaced = this.displacedLock;
-    if (displaced === undefined) return;
-    this.displacedLock = undefined;
-    const current = readServerLock(this.lockPath);
-    if (current !== undefined && current.serverId !== this.serverId) return;
-    fs.rmSync(this.lockPath, { force: true });
-    try {
-      writeServerLock(this.lockPath, displaced);
-    } catch {
-      // A racing writer recreated the lock; its record is authoritative.
-    }
   }
 
   /** Remove the socket file only when this server bound it. */
@@ -5127,13 +5137,13 @@ export class WorkflowServer {
     this.log(`run ${active.record.runId} parked after runner ${outcome}`);
   }
 
+  /** Remove the lock file only while it still names this server. */
   private releaseLock(): void {
     try {
-      const current = JSON.parse(fs.readFileSync(this.lockPath, "utf8")) as unknown;
-      if (isServerLockRecord(current) && current.serverId === this.serverId)
-        fs.rmSync(this.lockPath);
-    } catch {
-      // The lock is already gone.
+      if (readServerLock(this.lockPath)?.serverId !== this.serverId) return;
+      fs.rmSync(this.lockPath, { force: true });
+    } catch (error) {
+      this.log(`server lock file removal failed: ${errorMessage(error)}`);
     }
   }
 

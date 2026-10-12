@@ -1139,17 +1139,30 @@ wake:
   so a lease that expired while the machine slept re-arms on the first
   post-wake heartbeat and the server keeps serving. The server stops only when
   its claim was genuinely superseded, meaning another server took the epoch.
-- Takeover requires the recorded holder to be provably not serving. A starting
-  server probes the holder's socket with a bounded hello check before it may
-  remove the server lock file. A holder that answers keeps the lock, and the
-  new server exits with its `already running` message. A dead holder, or a live
-  holder that is mid-shutdown or frozen and does not answer, loses the lock and
-  the new server takes over. The epoch claim row stays the fencing authority:
-  a probe misfire costs one wasted start, never two serving servers. When the
-  superseded holder's process later exits, the operating system unlinks the
-  socket path its own listener bound, which is the path the replacement now
-  serves; the replacement re-creates the socket file within one poll tick
-  while its claim still names it, and clients retry through the brief window.
+- Takeover requires the recorded holder to be provably not serving. Before its
+  epoch claim, a starting server probes the socket with a bounded hello check,
+  whatever the server lock file says: missing, naming a dead process, or naming
+  a live one. A server that answers makes the new server exit with its
+  `already running` message, even when the lock file is gone. A holder that is
+  mid-shutdown or frozen and does not answer lets the start continue to the
+  epoch claim. The epoch claim row stays the fencing authority: a probe misfire
+  costs one wasted start, never two serving servers. When the superseded
+  holder's process later exits, the operating system unlinks the socket path
+  its own listener bound, which is the path the replacement now serves; the
+  replacement re-creates the socket file within one poll tick while its claim
+  still names it, and clients retry through the brief window.
+- Only the epoch owner writes `server/server.lock.json`. The probe only reads,
+  so a starter owns nothing on disk until it wins the claim. A starter whose
+  claim is fenced exits without touching the lock file, the socket, or the
+  owner's registered child processes. This holds when many sessions respawn
+  servers at once, as during `pi-workflows server stop`. The claim winner reaps
+  exact stale child processes and then writes its own lock record atomically:
+  a private temporary file in the same directory is renamed over the lock.
+  While the claim row still names the owner and its epoch, every poll rewrites
+  a lock file that is missing or names another record. A superseded server
+  never rewrites it. On stop or failed startup, the owner removes its own
+  record before it releases the claim, so its cleanup cannot remove a
+  successor's lock.
 - Clients re-spawn failed replacements. When a spawned server exits without
   becoming ready, the client starts the next one within the same start window,
   capped at three attempts, so one lost race costs milliseconds instead of the
