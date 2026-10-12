@@ -800,7 +800,7 @@ The workflow publishes aggregate and per-agent `pi-workflows.progress.v1` tracks
 
 Serial mode still uses two child sessions, and parallel mode still uses five. Review prompts, review areas, strict result validation, verdicts, and progress stay unchanged. After verification, an assistant-message agent shows the full bounded report verbatim. A mismatch stops before summary generation. The graph then includes `plain-summary`, which shows a short plain-language explanation with the verdict and the most important next action. The detailed response always settles before the summary starts. A final compute node returns the original strict result, so presentation cannot change the verdict. Sanity Check creates no extra terminal model turn.
 
-Child sessions are not separate `pi` CLI runs. They do not use a JSON or RPC event stream, temporary prompt file, standard-output cap, subprocess fallback, shared child runtime, or blanket child-extension ban. The headless Pi process only runs the SDK runner. See [the Sanity Check plan](plans/2026-08-21-sanity-check-plan.md) for the selected implementation and test boundaries.
+Each child session is an SDK session inside the headless Pi process that runs its group, not a separate `pi` CLI run. Only the transport between the workflow runner and that process uses an RPC command and JSON events on stderr. Child sessions use no temporary prompt file, standard-output cap, subprocess fallback, shared child runtime, or blanket child-extension ban. See [the Sanity Check plan](plans/2026-08-21-sanity-check-plan.md) for the selected implementation and test boundaries.
 
 ### Built-in monitor
 
