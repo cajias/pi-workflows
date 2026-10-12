@@ -184,6 +184,34 @@ export async function inspectLocalHead(repository: string): Promise<LocalHead> {
   return { branch, headRevision, changedPaths: await changedPaths(repository) };
 }
 
+/** A remote-tracking ref and the revision it records. */
+export type TrackingHead = { ref: string; headRevision: string };
+
+const REMOTE_TRACKING_PREFIX = "refs/remotes/";
+
+/**
+ * The remote-tracking ref that `git push` updates for `branch`, read from local refs only. It is
+ * undefined when Git does not name one reliably: no push destination is configured, its tracking
+ * ref is missing, or the destination branch has another name.
+ */
+export async function pushTrackingHead(
+  repository: string,
+  branch: string,
+): Promise<TrackingHead | undefined> {
+  let ref: string;
+  try {
+    ref = await git(repository, ["rev-parse", "--symbolic-full-name", `${branch}@{push}`]);
+  } catch {
+    return undefined;
+  }
+  const remote =
+    ref.startsWith(REMOTE_TRACKING_PREFIX) && ref.endsWith(`/${branch}`)
+      ? ref.slice(REMOTE_TRACKING_PREFIX.length, -branch.length - 1)
+      : "";
+  if (remote.length === 0) return undefined;
+  return { ref, headRevision: await git(repository, ["rev-parse", "--verify", `${ref}^{commit}`]) };
+}
+
 function workspaceScope(input: WorkspacePreparationInput): string {
   return input.scope ?? `Only ${input.repository}`;
 }

@@ -56,6 +56,7 @@ import {
 import { loadAutoimplementDefaults, parsePrTiming, type PrTiming } from "./autoimplement-config.js";
 import {
   endTimingText,
+  forgeTerms,
   forgeText,
   gitlabApiCoordinates,
   type EndTimingText,
@@ -92,6 +93,7 @@ import { parsePlanApprovalPolicy, type PlanApprovalPolicy } from "./plan-approva
 import planChangeWorkflow, { type NormalizedPlanChangeInput } from "./plan-change.workflow.js";
 import workspacePreparationWorkflow, {
   inspectLocalHead,
+  pushTrackingHead,
   parsePreparedWorkspace,
   type PreparedWorkspace,
   type WorkspaceMode,
@@ -1400,10 +1402,10 @@ function parseFinding(value: unknown, severity: ReviewFinding["severity"]): Revi
   };
 }
 
-function parsePublishedForContext(
+async function parsePublishedForContext(
   value: unknown,
   context: WorkflowNodeContext,
-): PublishedRepositories {
+): Promise<PublishedRepositories> {
   const result = parsePublishedRepositories(value);
   const workspace = preparedWorkspace(context);
   const expected = preparedWorkPath(workspace);
@@ -1429,8 +1431,58 @@ function parsePublishedForContext(
   }
   if (reviewed !== undefined) {
     for (const repository of result.repositories) assertPushesReviewedHead(repository, reviewed);
+    assertReusesPublishedRequest(result, context);
+    for (const [index, repository] of result.repositories.entries()) {
+      const label = `publication repositories[${index}]`;
+      await assertLocalHead(repository, workspace, label);
+      await assertPushedTrackingHead(repository, label);
+    }
   }
   return result;
+}
+
+/**
+ * A later reviewed push goes to the pull or merge request that an earlier publication of this run
+ * reported, because the forge allows only one open request per branch and base.
+ */
+function assertReusesPublishedRequest(
+  result: PublishedRepositories,
+  context: WorkflowNodeContext,
+): void {
+  const earlier = context.state.steps.findLast(
+    (step) => step.nodeId === "publish" && step.outcome === "ok",
+  );
+  if (earlier === undefined) return;
+  const requests = new Map(
+    (earlier.output as PublishedRepositories).repositories.map(
+      (repository) => [repository.id, repository.pr] as const,
+    ),
+  );
+  const { request } = forgeTerms(forgeFor(context));
+  result.repositories.forEach((repository, index) => {
+    const pr = requests.get(repository.id);
+    if (pr !== undefined && pr !== repository.pr) {
+      throw new Error(
+        `publication repositories[${index}].pr must be the ${request} this run already published: ${pr}`,
+      );
+    }
+  });
+}
+
+/**
+ * When Git names the remote-tracking ref that a push of the branch updates, that local ref must
+ * record the reviewed head. This reads local refs only and makes no network call.
+ */
+async function assertPushedTrackingHead(
+  repository: CandidateRepository,
+  label: string,
+): Promise<void> {
+  const pushed = await pushTrackingHead(repository.repository, repository.branch);
+  if (pushed !== undefined && pushed.headRevision !== repository.headRevision) {
+    throw new Error(
+      `${label}.headRevision must be the pushed head, but ${pushed.ref} is ${pushed.headRevision}`,
+    );
+  }
 }
 
 /**

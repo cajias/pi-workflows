@@ -14,7 +14,7 @@ import type {
   WorkflowNodeOutcome,
   WorkflowStepRecord,
 } from "../src/workflows/types.js";
-import { makeStateDatabasePath } from "./helpers.js";
+import { makeStateDatabasePath, makeTempDir } from "./helpers.js";
 import {
   acceptedOutput,
   autoimplementSettingsValue,
@@ -790,29 +790,34 @@ describe("autoimplement reviewed publication validator", () => {
         repository: fixture.repository,
         branch: "feat/demo",
         baseBranch: "main",
-        headRevision: "reviewed",
+        headRevision: fixture.baseRevision,
         pr: "https://example.test/pr/1",
         pushed: true,
         ...extra,
       },
     ],
   });
-  const gate = (extra: Record<string, unknown> = {}) => {
-    const head = fixtureCandidate("reviewed", extra);
+  /** A clean review of a local commit, then the publication route that pushes it. */
+  const gate = (extra: Record<string, unknown> = {}, head = fixture.baseRevision) => {
+    const reviewedHead = fixtureCandidate(head, extra);
     const assessment = {
       route: "clean",
-      repositories: [{ ...head, invocationSucceeded: true, p0: [], p1: [], p2: [], lower: [] }],
+      repositories: [
+        { ...reviewedHead, invocationSucceeded: true, p0: [], p1: [], p2: [], lower: [] },
+      ],
     };
     return [
-      step("commitLocal", { repositories: [head] }),
+      step("commitLocal", { repositories: [reviewedHead] }),
       step("assessReview", assessment),
       routed("publishReviewed"),
     ];
   };
+  const earlierPublish = (pr: string, outcome: WorkflowNodeOutcome = "ok") =>
+    step("publish", { repositories: [fixtureCandidate("0".repeat(40), { pr })] }, outcome);
 
   it("accepts only the reviewed head under publishReviewed", async () => {
     await expect(validate(pushed(), fixtureContext(gate()))).resolves.toMatchObject({
-      repositories: [{ headRevision: "reviewed" }],
+      repositories: [{ headRevision: fixture.baseRevision }],
     });
     await expect(
       validate(
@@ -836,12 +841,100 @@ describe("autoimplement reviewed publication validator", () => {
     );
     const elsewhere = [
       step("commitLocal", {
-        repositories: [{ ...fixtureCandidate("reviewed"), id: "other-id", repository: "/other" }],
+        repositories: [
+          { ...fixtureCandidate(fixture.baseRevision), id: "other-id", repository: "/other" },
+        ],
       }),
       routed("publishReviewed"),
     ];
     await expect(validate(pushed(), fixtureContext(elsewhere))).rejects.toThrow(
       'publication must push exactly the reviewed head: {"reviewed":null,',
+    );
+  });
+
+  it("requires the reviewed head to be the clean checked-out HEAD of the task branch", async () => {
+    await fs.writeFile(path.join(fixture.repository, "after-review.txt"), "unreviewed\n");
+    await expect(validate(pushed(), fixtureContext(gate()))).rejects.toThrow(
+      "publication repositories[0] leaves task changes uncommitted: after-review.txt",
+    );
+    await git(fixture.repository, ["add", "after-review.txt"]);
+    await git(fixture.repository, ["commit", "-m", "unreviewed commit"]);
+    const unreviewed = await git(fixture.repository, ["rev-parse", "HEAD"]);
+    await expect(validate(pushed(), fixtureContext(gate()))).rejects.toThrow(
+      `publication repositories[0].headRevision must be the checked-out HEAD ${unreviewed}`,
+    );
+    await git(fixture.repository, ["switch", "-c", "feat/other", fixture.baseRevision]);
+    await expect(validate(pushed(), fixtureContext(gate()))).rejects.toThrow(
+      "publication repositories[0].branch must be the checked-out branch feat/other",
+    );
+  });
+
+  it("requires the tracking ref of the push destination to record the reviewed head", async () => {
+    const remote = await makeTempDir("autoimplement-reviewed-push-remote");
+    await git(remote, ["init", "--bare", "-b", "main"]);
+    await git(fixture.repository, ["remote", "add", "origin", remote]);
+    await git(fixture.repository, ["push", "-q", "-u", "origin", "feat/demo"]);
+    await fs.writeFile(path.join(fixture.repository, "reviewed.txt"), "reviewed\n");
+    await git(fixture.repository, ["add", "reviewed.txt"]);
+    await git(fixture.repository, ["commit", "-m", "reviewed"]);
+    const head = await git(fixture.repository, ["rev-parse", "HEAD"]);
+    const context = fixtureContext(gate({}, head));
+    await expect(validate(pushed({ headRevision: head }), context)).rejects.toThrow(
+      `publication repositories[0].headRevision must be the pushed head, but refs/remotes/origin/feat/demo is ${fixture.baseRevision}`,
+    );
+    await git(fixture.repository, ["push", "-q", "origin", "feat/demo"]);
+    await expect(validate(pushed({ headRevision: head }), context)).resolves.toMatchObject({
+      repositories: [{ headRevision: head }],
+    });
+    // A push destination with another branch name is not a reliable tracking ref, so it is skipped.
+    await git(fixture.repository, [
+      "push",
+      "-q",
+      "origin",
+      `${fixture.baseRevision}:refs/heads/main`,
+    ]);
+    await git(fixture.repository, ["fetch", "-q", "origin"]);
+    await git(fixture.repository, ["branch", "--set-upstream-to", "origin/main"]);
+    await git(fixture.repository, ["config", "push.default", "upstream"]);
+    await git(fixture.repository, [
+      "update-ref",
+      "refs/remotes/origin/feat/demo",
+      fixture.baseRevision,
+    ]);
+    await expect(validate(pushed({ headRevision: head }), context)).resolves.toMatchObject({
+      repositories: [{ headRevision: head }],
+    });
+  });
+
+  it("requires a later reviewed push to reuse the request this run already published", async () => {
+    const first = "https://example.test/pr/1";
+    const context = fixtureContext([earlierPublish(first), ...gate()]);
+    await expect(validate(pushed({ pr: "https://example.test/pr/2" }), context)).rejects.toThrow(
+      `publication repositories[0].pr must be the pull request this run already published: ${first}`,
+    );
+    await expect(validate(pushed(), context)).resolves.toMatchObject({
+      repositories: [{ pr: first }],
+    });
+    const failedEarlier = fixtureContext([earlierPublish(first, "failed"), ...gate()]);
+    await expect(
+      validate(pushed({ pr: "https://example.test/pr/2" }), failedEarlier),
+    ).resolves.toMatchObject({ repositories: [{ pr: "https://example.test/pr/2" }] });
+    const mergeRequest = "https://gitlab.example.test/group/project/-/merge_requests/7";
+    const gitlab = fixtureContext([earlierPublish(mergeRequest), ...gate()]);
+    const onGitLab = {
+      ...gitlab,
+      outputs: {
+        ...gitlab.outputs,
+        resolveForge: { ...GITLAB_RESOLUTION, requested: "gitlab", host: null, remoteUrl: null },
+      },
+    };
+    await expect(
+      validate(
+        pushed({ pr: "https://gitlab.example.test/group/project/-/merge_requests/8" }),
+        onGitLab,
+      ),
+    ).rejects.toThrow(
+      `publication repositories[0].pr must be the merge request this run already published: ${mergeRequest}`,
     );
   });
 
