@@ -1735,7 +1735,7 @@ function parseDeliveryResult(
     const repository = actual.get(path.resolve(expected.repository));
     if (repository === undefined || repository.pr !== expected.pr) {
       throw new Error(
-        `completed delivery does not match published repository and PR: ${expected.repository}`,
+        `completed delivery does not match published repository and ${forgeTerms(forgeFor(context)).short}: ${expected.repository}`,
       );
     }
     if (repository.merged !== mergeExpected) {
@@ -2440,13 +2440,15 @@ export const autoimplementWorkflow = defineWorkflow({
         ].join("\n");
       },
       expectedOutput: `{ "status": "completed" | "blocked", "committed": true | false, "pushed": true | false, "merged": false, "pr": "none", "reportComment": "summary", "reason": "result" }`,
-      validate: (value) => {
+      validate: (value, context) => {
         const result = requireRecord(value, "default-branch delivery");
         if (result.status !== "completed" && result.status !== "blocked") {
           throw new Error("default-branch delivery status must be completed or blocked");
         }
         if (result.merged !== false || result.pr !== "none") {
-          throw new Error("default-branch delivery cannot merge or open a pull request to itself");
+          throw new Error(
+            `default-branch delivery cannot merge or open a ${forgeTerms(forgeFor(context)).request} to itself`,
+          );
         }
         return result;
       },
@@ -2615,8 +2617,12 @@ export const autoimplementWorkflow = defineWorkflow({
           `Published repositories: ${JSON.stringify(currentPublishedRepositories(context))}`,
         ].join("\n"),
       expectedOutput: `{ "route": "redesign" | "fix" | "ci" | "blocked", "summary": "comment status", "evidence": ["comment or response"] }`,
-      validate: (value) =>
-        parseRoute(value, ["redesign", "fix", "ci", "blocked"] as const, "PR comment assessment"),
+      validate: (value, context) =>
+        parseRoute(
+          value,
+          ["redesign", "fix", "ci", "blocked"] as const,
+          `${forgeTerms(forgeFor(context)).short} comment assessment`,
+        ),
     }),
     commentsResult: compute({
       run: (context) => branchResultFrom(context, ["inspectComments"]),

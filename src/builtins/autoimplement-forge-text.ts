@@ -18,13 +18,10 @@ import { parseGitLabMergeRequestUrl, type Forge } from "./autoimplement-forge.js
  * `expectedOutput` are static parts of the definition.
  */
 
-/** Nouns for lines that interpolate the forge's request name. */
+/** Nouns for new lines and validation errors that name the forge's request. */
 export type ForgeTerms = {
   request: "pull request" | "merge request";
-  requests: "pull requests" | "merge requests";
   short: "PR" | "MR";
-  shortPlural: "PRs" | "MRs";
-  cli: "gh" | "glab";
 };
 
 /** Complete prompt sentences, keyed by the node that uses them. */
@@ -58,21 +55,8 @@ export type ForgeText = {
   decide: readonly string[];
 };
 
-const GITHUB_TERMS: ForgeTerms = {
-  request: "pull request",
-  requests: "pull requests",
-  short: "PR",
-  shortPlural: "PRs",
-  cli: "gh",
-};
-
-const GITLAB_TERMS: ForgeTerms = {
-  request: "merge request",
-  requests: "merge requests",
-  short: "MR",
-  shortPlural: "MRs",
-  cli: "glab",
-};
+const GITHUB_TERMS: ForgeTerms = { request: "pull request", short: "PR" };
+const GITLAB_TERMS: ForgeTerms = { request: "merge request", short: "MR" };
 
 export function forgeTerms(forge: Forge): ForgeTerms {
   return forge === "gitlab" ? GITLAB_TERMS : GITHUB_TERMS;

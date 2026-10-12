@@ -1341,6 +1341,61 @@ describe("autoimplement GitLab publication validation", () => {
   });
 });
 
+describe("autoimplement forge-aware validation errors", () => {
+  const validatorOf = (nodeId: string) => {
+    const node = autoimplementWorkflow.nodes[nodeId];
+    if (node?.nodeType !== "agent" || node.validate === undefined) {
+      throw new Error(`${nodeId} must be a validated agent node`);
+    }
+    const validate = node.validate;
+    return async (value: unknown, forge: "github" | "gitlab") =>
+      await validate(
+        value,
+        forge === "gitlab"
+          ? syntheticAutoimplementContext({
+              pr: GITLAB_MR,
+              outputs: { resolveForge: DETECTED_GITLAB },
+            })
+          : syntheticAutoimplementContext(),
+      );
+  };
+  const cases = [
+    {
+      nodeId: "finalizeDefaultBranch",
+      value: { status: "completed", merged: false, pr: "https://example.test/1" },
+      github: "default-branch delivery cannot merge or open a pull request to itself",
+      gitlab: "default-branch delivery cannot merge or open a merge request to itself",
+    },
+    {
+      nodeId: "inspectComments",
+      value: { route: "merge", summary: "bad", evidence: [] },
+      github: "PR comment assessment route must be one of redesign, fix, ci, blocked",
+      gitlab: "MR comment assessment route must be one of redesign, fix, ci, blocked",
+    },
+    {
+      nodeId: "finalizeDelivery",
+      value: {
+        status: "completed",
+        merged: false,
+        pr: "https://example.test/other/1",
+        reportComment: "report",
+        reason: "ready",
+      },
+      github: "completed delivery does not match published repository and PR: /golden/repository",
+      gitlab: "completed delivery does not match published repository and MR: /golden/repository",
+    },
+  ];
+
+  it.each(cases)(
+    "keeps the upstream $nodeId error on GitHub and names the MR on GitLab",
+    async (testCase) => {
+      const validate = validatorOf(testCase.nodeId);
+      await expect(validate(testCase.value, "github")).rejects.toThrow(testCase.github);
+      await expect(validate(testCase.value, "gitlab")).rejects.toThrow(testCase.gitlab);
+    },
+  );
+});
+
 describe("autoimplement GitLab CI head pipeline", () => {
   const validatorOf = (nodeId: "inspectCi" | "assessTrackedCi") => {
     const node = autoimplementWorkflow.nodes[nodeId];

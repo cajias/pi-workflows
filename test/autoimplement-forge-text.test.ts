@@ -22,24 +22,12 @@ function publishedRecord(repository: string, pr: string, branch = "feat/demo") {
 }
 
 describe("forgeTerms", () => {
-  it("names the pull request nouns and gh on GitHub", () => {
-    expect(forgeTerms("github")).toEqual({
-      request: "pull request",
-      requests: "pull requests",
-      short: "PR",
-      shortPlural: "PRs",
-      cli: "gh",
-    });
+  it("names the pull request on GitHub", () => {
+    expect(forgeTerms("github")).toEqual({ request: "pull request", short: "PR" });
   });
 
-  it("names the merge request nouns and glab on GitLab", () => {
-    expect(forgeTerms("gitlab")).toEqual({
-      request: "merge request",
-      requests: "merge requests",
-      short: "MR",
-      shortPlural: "MRs",
-      cli: "glab",
-    });
+  it("names the merge request on GitLab", () => {
+    expect(forgeTerms("gitlab")).toEqual({ request: "merge request", short: "MR" });
   });
 });
 
