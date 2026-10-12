@@ -1,20 +1,18 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import fs from "node:fs";
-import { fileURLToPath } from "node:url";
 import { errorMessage } from "../workflows/errors.js";
 import type {
   AgentStepExecutor,
   AgentStepRequest,
   AgentStepSubmission,
 } from "../workflows/types.js";
-import { RPC_SUBMISSION_PREFIX } from "./rpc-bridge.js";
+import {
+  describeHeadlessPiExit,
+  HeadlessPiProcess,
+  packagedExtensionPath,
+  type HeadlessPiOptions,
+} from "./headless-pi.js";
+import { RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
 
-// Production resolves the compiled .js; tests and dev checkouts load the .ts
-// source, which pi compiles itself when loading extensions.
-const BRIDGE_PATH = ["./rpc-bridge.js", "./rpc-bridge.ts"]
-  .map((candidate) => fileURLToPath(new URL(candidate, import.meta.url)))
-  .find((candidate) => fs.existsSync(candidate));
-const DEFAULT_ABORT_GRACE_MS = 3_000;
+const BRIDGE_PATH = packagedExtensionPath(import.meta.url, "rpc-bridge");
 
 type StepSubmission = {
   action: "submit";
@@ -31,24 +29,7 @@ type StepUpdate = {
 
 type StepAction = StepSubmission | StepUpdate;
 
-export interface SupervisedProcessRegistry {
-  register(pid: number): unknown | Promise<unknown>;
-  unregister(pid: number): unknown | Promise<unknown>;
-}
-
-export type RpcStepExecutorOptions = {
-  cwd: string;
-  registry?: SupervisedProcessRegistry;
-  /** Start a separate process group, or inherit the caller's process group. */
-  processGroup?: "own" | "inherit";
-  /** Grace period before a process group receives SIGKILL. */
-  abortGraceMs?: number;
-  /** Absolute path to the pi binary; defaults to the installed `pi`. */
-  piBin?: string;
-  /** Extra environment for the child; the server's environment is inherited. */
-  env?: Record<string, string>;
-  /** Extra pi arguments, for example a model override. */
-  piArgs?: string[];
+export type RpcStepExecutorOptions = HeadlessPiOptions & {
   /** Park assistant-message nodes for a visible origin session. */
   assistantMessageMode?: "park";
 };
@@ -63,13 +44,9 @@ export type RpcStepExecutorOptions = {
 export class RpcStepExecutor implements AgentStepExecutor {
   readonly assistantMessageMode: "park" | "unsupported";
   private readonly options: RpcStepExecutorOptions;
-  private child: ChildProcess | null = null;
-  private childExited: { code: number | null; signal: string | null } | null = null;
-  private stderrBuffer = "";
+  private child: HeadlessPiProcess | null = null;
   private actions: StepAction[] = [];
   private submissionWaiters: Array<() => void> = [];
-  private stdoutBuffer = "";
-  private registeredPid: number | null = null;
   private closePromise: Promise<void> | null = null;
 
   constructor(options: RpcStepExecutorOptions) {
@@ -105,134 +82,48 @@ export class RpcStepExecutor implements AgentStepExecutor {
   private async closeChild(): Promise<void> {
     const child = this.child;
     this.child = null;
-    if (child === null) return;
-    const pid = child.pid;
-    try {
-      try {
-        child.stdin?.end();
-      } catch {
-        // The pipe may already be closed.
-      }
-      const ownGroup = this.options.processGroup !== "inherit";
-      if (pid !== undefined && ownGroup) {
-        killGroup(pid, "SIGTERM");
-        const exited = await waitForGroupExit(
-          pid,
-          this.options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS,
-        );
-        if (!exited) killGroup(pid, "SIGKILL");
-      } else if (this.childExited === null) {
-        child.kill("SIGTERM");
-        const exited = await waitForExit(
-          child,
-          this.options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS,
-        );
-        if (!exited) child.kill("SIGKILL");
-      }
-    } finally {
-      await this.unregisterChild();
-    }
-  }
-
-  private currentExit(): { code: number | null; signal: string | null } | null {
-    return this.childExited;
+    await child?.close();
   }
 
   private async ensureStarted(): Promise<void> {
     if (this.closePromise !== null) throw new Error("Headless pi session is closed");
     if (this.child !== null) {
-      const exited = this.currentExit();
+      const exited = this.child.currentExit();
       if (exited !== null) {
-        throw new Error(
-          `Headless pi session exited (code ${exited.code}, signal ${exited.signal})`,
-        );
+        throw new Error(`Headless pi session exited (${describeHeadlessPiExit(exited)})`);
       }
       return;
     }
     if (BRIDGE_PATH === undefined) {
       throw new Error("The pi-workflows rpc-bridge extension is missing from this installation");
     }
-    const piBin = this.options.piBin ?? "pi";
-    const child = spawn(
-      piBin,
-      [
-        "--mode",
-        "rpc",
-        "--no-session",
-        // Isolation is required: an installed pi-workflows extension would
-        // otherwise load beside the bridge, register a competing workflow
-        // tool, and start its own resume and resource runners.
-        "--no-extensions",
-        "-e",
-        BRIDGE_PATH,
-        ...(this.options.piArgs ?? []),
-      ],
-      {
-        cwd: this.options.cwd,
-        env: { ...process.env, ...this.options.env },
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: this.options.processGroup !== "inherit",
-      },
-    );
+    const child = new HeadlessPiProcess(BRIDGE_PATH, this.options, {
+      onStderrLine: (line) => this.acceptSubmissionLine(line),
+      onExit: () => this.wakeSubmissionWaiters(),
+    });
     this.child = child;
-    child.on("exit", (code, signal) => {
-      this.childExited = { code, signal };
-      this.wakeSubmissionWaiters();
-    });
-    // A failed spawn (missing binary, EACCES) emits error instead of exit;
-    // without a listener it would crash the server as an uncaught exception.
-    child.on("error", (error) => {
-      this.childExited = { code: null, signal: error.message };
-      this.wakeSubmissionWaiters();
-    });
-    child.stdin?.on("error", () => {
-      // Writes racing child exit surface asynchronously as EPIPE; the step
-      // fails through the exit path instead of an uncaught stream error.
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      this.stderrBuffer += chunk.toString("utf8");
-      const lines = this.stderrBuffer.split("\n");
-      this.stderrBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.startsWith(RPC_SUBMISSION_PREFIX)) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(line.slice(RPC_SUBMISSION_PREFIX.length)) as StepAction;
-          if (
-            (parsed.action === "submit" || parsed.action === "update") &&
-            typeof parsed.requestId === "string"
-          ) {
-            this.actions.push(parsed);
-          }
-        } catch {
-          // A malformed marker line is ignored; the step times out instead.
-        }
-      }
-      this.wakeSubmissionWaiters();
-    });
-    // stdout carries the RPC event stream. The submission channel is stderr,
-    // so stdout is only drained to keep the pipe from blocking.
-    child.stdout?.on("data", (chunk: Buffer) => {
-      this.stdoutBuffer = (this.stdoutBuffer + chunk.toString("utf8")).slice(-64 * 1024);
-    });
-    if (child.pid !== undefined && this.options.registry !== undefined) {
-      try {
-        await this.options.registry.register(child.pid);
-        this.registeredPid = child.pid;
-      } catch (error) {
-        killGroup(child.pid, "SIGKILL");
-        this.child = null;
-        throw error;
-      }
+    try {
+      await child.start();
+    } catch (error) {
+      this.child = null;
+      throw error;
     }
   }
 
-  private async unregisterChild(): Promise<void> {
-    const pid = this.registeredPid;
-    if (pid === null) return;
-    this.registeredPid = null;
-    await this.options.registry?.unregister(pid);
+  private acceptSubmissionLine(line: string): void {
+    if (!line.startsWith(RPC_SUBMISSION_PREFIX)) return;
+    try {
+      const parsed = JSON.parse(line.slice(RPC_SUBMISSION_PREFIX.length)) as StepAction;
+      if (
+        (parsed.action === "submit" || parsed.action === "update") &&
+        typeof parsed.requestId === "string"
+      ) {
+        this.actions.push(parsed);
+      }
+    } catch {
+      // A malformed marker line is ignored; the step times out instead.
+    }
+    this.wakeSubmissionWaiters();
   }
 
   private async promptForSubmission(
@@ -241,13 +132,13 @@ export class RpcStepExecutor implements AgentStepExecutor {
     signal: AbortSignal,
   ): Promise<StepSubmission> {
     const child = this.child;
-    if (child === null || this.childExited !== null) {
+    if (child === null || child.currentExit() !== null) {
       throw new Error("Headless pi session is not running");
     }
-    child.stdin?.write(`${JSON.stringify({ type: "prompt", message: prompt })}\n`);
+    child.write({ type: "prompt", message: prompt });
     for (;;) {
       throwIfAborted(signal);
-      const exited = this.currentExit();
+      const exited = child.currentExit();
       if (exited !== null) {
         throw new Error(`Headless pi session exited mid-step (code ${exited.code})`);
       }
@@ -260,12 +151,10 @@ export class RpcStepExecutor implements AgentStepExecutor {
         try {
           await request.publishUpdate(found.update, found.idempotencyKey);
         } catch (error) {
-          child.stdin?.write(
-            `${JSON.stringify({
-              type: "prompt",
-              message: `Workflow update rejected: ${errorMessage(error)}. Correct the update and continue the same step.`,
-            })}\n`,
-          );
+          child.write({
+            type: "prompt",
+            message: `Workflow update rejected: ${errorMessage(error)}. Correct the update and continue the same step.`,
+          });
         }
         continue;
       }
@@ -292,11 +181,7 @@ export class RpcStepExecutor implements AgentStepExecutor {
   }
 
   private sendAbortQuietly(): void {
-    try {
-      this.child?.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
-    } catch {
-      // Best-effort.
-    }
+    this.child?.write({ type: "abort" });
   }
 
   private wakeSubmissionWaiters(): void {
@@ -308,54 +193,8 @@ export class RpcStepExecutor implements AgentStepExecutor {
   }
 }
 
-function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal);
-    return;
-  } catch {
-    // Group signals are unsupported here; the leader still needs it.
-  }
-  try {
-    process.kill(pid, signal);
-  } catch {
-    // Already gone.
-  }
-}
-
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) {
     throw (signal.reason as unknown) ?? new Error("Workflow step aborted");
   }
-}
-
-async function waitForGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
-  if (process.platform === "win32") return true;
-  const deadline = Date.now() + timeoutMs;
-  while (processGroupExists(pid)) {
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return true;
-}
-
-function processGroupExists(pid: number): boolean {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return true;
-  }
-  return await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
 }
