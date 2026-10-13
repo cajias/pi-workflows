@@ -20,6 +20,7 @@ import {
 import { resolveNext, resolveNextForOutcome, validateWorkflowDefinition } from "./graph.js";
 import { createHumanDecisionRequest } from "./human-decision.js";
 import { extractJsonValue } from "./json.js";
+import { abortedAttemptProgress } from "./progress.js";
 import { workflowRequestId } from "./requests.js";
 import {
   parseWorkflowSettingsValue,
@@ -60,6 +61,7 @@ import type {
   WorkflowRunState,
   WorkflowSource,
   WorkflowStepRecord,
+  WorkflowTraceEvent,
   WorkflowTraceEventDraft,
   WorkflowUpdateInput,
   WorkflowUpdateReceipt,
@@ -139,6 +141,8 @@ export class WorkflowEngine {
     | undefined;
   private readonly updateLimiters = new Map<string, UpdateRateLimiter>();
   private readonly updatePublications = new Map<string, Promise<WorkflowUpdateReceipt>>();
+  /** Publications still in flight, per attempt, so settlement sees every accepted update. */
+  private readonly pendingPublications = new Map<string, Set<Promise<unknown>>>();
   private cancelled = false;
   private parked = false;
   private paused = false;
@@ -202,15 +206,62 @@ export class WorkflowEngine {
       active.state.updates = updateProjection(active.state.updates, record);
       active.state.traceSeq = event.seq;
       active.state.updatedAt = event.at;
-      try {
-        this.onEvent?.(event, active.state);
-      } catch {
-        // UI and logging observers never determine workflow correctness.
-      }
+      this.observe(event, active.state);
       return updateReceipt(record);
     })();
+    this.trackPublication(active.attemptId, publication);
     if (receiptKey !== undefined) this.updatePublications.set(receiptKey, publication);
     return await publication;
+  }
+
+  private trackPublication(attemptId: string, publication: Promise<unknown>): void {
+    const pending = this.pendingPublications.get(attemptId) ?? new Set<Promise<unknown>>();
+    this.pendingPublications.set(attemptId, pending);
+    pending.add(publication);
+    const release = () => {
+      pending.delete(publication);
+      if (pending.size === 0) this.pendingPublications.delete(attemptId);
+    };
+    publication.then(release, release);
+  }
+
+  /**
+   * Give the progress tracks that a timed-out or cancelled attempt left open a
+   * terminal state. The aborted attempt can no longer publish, so the engine
+   * writes that final snapshot itself, after every publication the attempt
+   * started before the abort has settled and before the attempt result commits.
+   */
+  private async settleAbortedProgress(
+    runId: string,
+    state: WorkflowRunState,
+    nodeId: string,
+    attemptId: string,
+    outcome: "timed_out" | "cancelled",
+  ): Promise<void> {
+    const pending = this.pendingPublications.get(attemptId);
+    if (pending !== undefined) await Promise.allSettled(pending);
+    for (const update of abortedAttemptProgress(state.updates, attemptId, outcome)) {
+      try {
+        const { event, record } = await this.store.publishUpdate(runId, nodeId, attemptId, update);
+        state.updates = updateProjection(state.updates, record);
+        state.traceSeq = event.seq;
+        state.updatedAt = event.at;
+        this.observe(event, state);
+      } catch (error) {
+        if (isClaimLostError(error)) throw error;
+        // Progress is display state. A rejected settlement never changes the
+        // attempt outcome, and the remaining tracks still settle.
+      }
+    }
+  }
+
+  private observe(event: WorkflowTraceEvent, state: WorkflowRunState): void {
+    try {
+      this.onEvent?.(event, state);
+    } catch {
+      // Observers (UI updates, loggers) must never determine workflow
+      // correctness; a throwing observer would otherwise fail the run.
+    }
   }
 
   /** Abort the currently running node and mark the run cancelled. */
@@ -897,6 +948,10 @@ export class WorkflowEngine {
     } catch (error) {
       if (isRunParkedError(error) || isClaimLostError(error)) throw error;
       const outcome = this.outcomeForError(error);
+      // A parked attempt is abandoned for resume, not ended, so its tracks stay open.
+      if (!this.parked && (outcome === "timed_out" || outcome === "cancelled")) {
+        await this.settleAbortedProgress(runId, state, nodeId, attemptId, outcome);
+      }
       return {
         result: {
           ...this.createNodeResult(nodeId, node, attemptId, startedAt, outcome, undefined),
@@ -1500,12 +1555,7 @@ export class WorkflowEngine {
     const traceEvent = await this.store.commitTransition(runId, executionTransition(state, event));
     state.traceSeq = traceEvent.seq;
     state.updatedAt = traceEvent.at;
-    try {
-      this.onEvent?.(traceEvent, state);
-    } catch {
-      // Observers (UI updates, loggers) must never determine workflow
-      // correctness; a throwing observer would otherwise fail the run.
-    }
+    this.observe(traceEvent, state);
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
 

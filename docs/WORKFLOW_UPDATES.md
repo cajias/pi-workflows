@@ -355,7 +355,7 @@ Fields:
 
 `completed` must be finite and at least zero. `total` must be finite, greater than zero, and at least `completed`. `unit` is 1 to 32 printable characters after trimming. Time fields use RFC 3339 with an offset.
 
-A progress object is a full snapshot for its key. Omitted optional fields clear their previous values. Publishers mark finished tracks with a terminal status instead of deleting them.
+A progress object is a full snapshot for its key. Omitted optional fields clear their previous values. Publishers mark finished tracks with a terminal status instead of deleting them. When an attempt times out or is cancelled first, the runtime writes that terminal record for the attempt's open tracks, as [Progress of timed-out and cancelled attempts](WORKFLOWS.md#progress-of-timed-out-and-cancelled-attempts) describes.
 
 The reserved key `overall` represents an explicit aggregate supplied by the workflow. pi-workflows never combines unrelated tracks automatically. Without `overall`, displays list independent tracks.
 

@@ -436,6 +436,10 @@ action({
 });
 ```
 
+If the attempt times out or is cancelled before the action marks a track
+finished, the runtime settles that track. See
+[Progress of timed-out and cancelled attempts](#progress-of-timed-out-and-cancelled-attempts).
+
 A shell action can parse complete lines from stdout or stderr and return one
 or more updates through `updates.parseLine`. Parsing applies backpressure and
 keeps normal output capture. Lines and update data are each limited to 64 KiB.
@@ -918,7 +922,7 @@ Sanity Check creates child sessions directly through the documented Pi SDK. A pr
 
 Revision 7 runs that SDK work in a headless Pi process. The `review` and `verify` actions execute in the plain Node workflow runner, which cannot load the packages that Pi supplies to extensions (see [Host-provided Pi packages](#host-provided-pi-packages)). For each agent group, the runner starts `pi --mode rpc --no-session --no-extensions -e <agent-group-bridge>` with the same `pi` command, server-supplied Pi arguments, environment, process group, and server process registration as a headless agent step. Pi loads the bridge extension with its own module mapping. The runner sends the group as the argument of one bridge command in an RPC `prompt`, which Pi handles without a model turn. The bridge reports lifecycle facts and the final result or error on stderr lines tagged with a random group ID; the runner ignores other output. The runner fails the group if Pi rejects the command or routes it anywhere except the bridge.
 
-Cancellation and action timeouts send a cancel command. The bridge aborts each session, disposes its runtime, which runs provider extension shutdown, and reports each session's final state. The runner waits up to 10 seconds for that settlement. Sessions settle concurrently, and the real-Pi end-to-end test settles in under one second, so the bound leaves room for an extension that closes network clients or saves refreshed credentials. A started session that the bridge has not confirmed by then is reported `cancelled` with the phase `cancelled: headless pi did not report that the session settled`, and queued work that never started is reported `cancelled` with the phase `cancelled: the session did not start`. The runner then stops the Pi process group with `SIGTERM` and, after the one-second stop grace, `SIGKILL`. Pi's own shutdown also settles open sessions while it runs. The 10-second wait applies only while the runner keeps running. When the run itself ends or the runner stops, the runner stops each Pi process group at once with the same one-second grace, and settlement relies on the bridge's `session_shutdown` handler during Pi's shutdown. Once the runner settles a group, it ignores later bridge events, so each request has exactly one terminal state and a reported state never changes. Late events are ignored; when the group's stderr log is kept (failures where pi could not run the group), they remain in it. When a timeout or cancellation has already ended the action attempt, the engine accepts no more progress updates for it. The durable tracks then keep the last state recorded before the attempt ended, and the node status records the timeout or cancellation. Follow-up: settling these tracks needs the engine to finalize progress for aborted attempts, because `WorkflowEngine.publishUpdate` rejects updates once the attempt signal aborts (`src/workflows/engine.ts:168-177`) and the engine stops waiting for an aborted action (`src/workflows/engine.ts:1046`).
+Cancellation and action timeouts send a cancel command. The bridge aborts each session, disposes its runtime, which runs provider extension shutdown, and reports each session's final state. The runner waits up to 10 seconds for that settlement. Sessions settle concurrently, and the real-Pi end-to-end test settles in under one second, so the bound leaves room for an extension that closes network clients or saves refreshed credentials. A started session that the bridge has not confirmed by then is reported `cancelled` with the phase `cancelled: headless pi did not report that the session settled`, and queued work that never started is reported `cancelled` with the phase `cancelled: the session did not start`. The runner then stops the Pi process group with `SIGTERM` and, after the one-second stop grace, `SIGKILL`. Pi's own shutdown also settles open sessions while it runs. The 10-second wait applies only while the runner keeps running. When the run itself ends or the runner stops, the runner stops each Pi process group at once with the same one-second grace, and settlement relies on the bridge's `session_shutdown` handler during Pi's shutdown. Once the runner settles a group, it ignores later bridge events, so each request has exactly one terminal state and a reported state never changes. Late events are ignored; when the group's stderr log is kept (failures where pi could not run the group), they remain in it. When a timeout or cancellation has already ended the action attempt, the engine accepts no more progress updates for it, so these late events never reach durable state. The runtime settles the open tracks instead, as [Progress of timed-out and cancelled attempts](#progress-of-timed-out-and-cancelled-attempts) describes: after a timeout, every review or verification track that has not finished shows `failed` with the phase `timed out`, and after a cancellation it shows `cancelled`. Tracks that already finished keep their final state.
 
 If `pi` cannot start, exits before its bridge loads, or exits before the group finishes, the action fails with that cause. Started sessions without a final state are first reported `failed`, and queued ones `cancelled`, so no track stays running. The same applies when Pi rejects the bridge command or the bridge returns without a result. After Pi reports that the bridge command returned, the runner allows five seconds of stderr silence for the final event, and each stderr chunk restarts that wait so a large result in transit still arrives. The failure names a private log file that holds Pi's complete stderr and, when Pi rejects or misroutes the bridge command, Pi's complete RPC response. The error message bounds any text that Pi supplied, then names the full log path after it, so every such failure points to the complete diagnostics. Pi's stderr can contain provider extension output, so Pi Workflows neither copies it into workflow state nor quotes it in the error. The runner deletes the file when the group succeeds, is cancelled, or fails with an error that the bridge reported. A kept log stays at `$TMPDIR/pi-workflows-<runId>-agent-group-XXXXXX/pi-stderr.log` (`0700` directory, `0600` file) for seven days. A runner that is stopped with `SIGKILL` during a group can also leave its directory behind. The action's manual effect never repeats automatically, and the post-workflow model turn can inspect the failure and read the log.
 
@@ -1155,6 +1159,50 @@ resume` takes a new generation and reruns only work after the last durable
   an operator explicitly resumes or cancels it.
 - Server status reports safe counts and timestamps. It does not report session
   IDs, project paths, prompts, payloads, tokens, process IDs, or credentials.
+
+## Progress of timed-out and cancelled attempts
+
+A progress track belongs to the attempt that published its current record.
+Publishers mark finished tracks with a terminal status. An attempt that times
+out or is cancelled cannot do that any more: once its abort signal fires, the
+engine rejects every update from that attempt, so an action that ignores the
+signal and keeps reporting never changes durable state. The runtime settles
+those tracks instead.
+
+When an attempt ends with the outcome `timed_out` or `cancelled`, every
+`progress` track whose current record belongs to that attempt and whose status
+is not `completed`, `failed`, or `cancelled` receives one more record for the
+same attempt:
+
+| Attempt outcome | `status`    | `phase`     |
+| --------------- | ----------- | ----------- |
+| `timed_out`     | `failed`    | `timed out` |
+| `cancelled`     | `cancelled` | `cancelled` |
+
+The progress profile has no timed-out status. `failed` keeps a timed-out track
+with the failed tracks that the Pi widget lists first, and the phase says why
+the track ended. The record keeps `label`, `completed`, `total`, `unit`, and
+`sourceUpdatedAt`, and drops `sourceEstimatedFinishAt`, because the finish
+estimate no longer applies.
+
+- Terminal tracks, other update types, and tracks whose current record belongs
+  to another attempt keep their records. A retry runs under a new attempt ID,
+  so settling one attempt never changes a retry's tracks, and a retry that
+  publishes a key again replaces the settled record with its own.
+- Settlement records are ordinary updates. Each one is a `workflow_updates`
+  row and an `update_published` event for the ended attempt, so the run view,
+  the Pi widget, and `piw` show them like any other update. They do not count
+  toward the publication rate limit.
+- The engine waits until every publication that the attempt started before the
+  abort has settled, then writes the settlement records before the attempt's
+  `node_failed` event. A publication that was in flight at the abort can still
+  finish its track, and the engine never overwrites that terminal state.
+- A rejected settlement record never changes the attempt outcome or its route.
+  A lost claim still stops the runner.
+- A parked attempt is abandoned for resume, not ended, so its tracks stay open.
+  This includes a runner that the workflow server stops for a pause, a
+  handoff, or a server shutdown. When the node runs again, its new attempt
+  publishes its tracks again.
 
 ## Wake recovery
 

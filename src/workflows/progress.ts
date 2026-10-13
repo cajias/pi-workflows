@@ -1,5 +1,10 @@
 import { sanitizeText } from "./text.js";
-import type { WorkflowProgressData, WorkflowTraceEvent, WorkflowUpdateRecord } from "./types.js";
+import type {
+  WorkflowProgressData,
+  WorkflowTraceEvent,
+  WorkflowUpdateInput,
+  WorkflowUpdateRecord,
+} from "./types.js";
 import { validateProgressData } from "./updates.js";
 
 export type ProgressConfidence = "low" | "medium" | "high";
@@ -33,6 +38,43 @@ export type ProgressTrackState = {
 };
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+
+const ABORTED_PROGRESS = {
+  timed_out: { status: "failed", phase: "timed out" },
+  cancelled: { status: "cancelled", phase: "cancelled" },
+} as const;
+
+/**
+ * Terminal snapshots for the progress tracks that one attempt left open when a
+ * timeout or cancellation ended it. Only tracks whose current record belongs
+ * to that attempt change, so terminal states and other attempts' tracks stay as
+ * published. Each snapshot keeps the label and counts, records why the attempt
+ * ended, and drops a finish estimate that no longer applies.
+ */
+export function abortedAttemptProgress(
+  updates: readonly WorkflowUpdateRecord[] | undefined,
+  attemptId: string,
+  outcome: keyof typeof ABORTED_PROGRESS,
+): WorkflowUpdateInput[] {
+  const settled: WorkflowUpdateInput[] = [];
+  for (const record of updates ?? []) {
+    if (record.type !== "progress" || record.attemptId !== attemptId) continue;
+    let data: Record<string, unknown>;
+    try {
+      data = { ...validateProgressData(record.data) };
+    } catch {
+      continue;
+    }
+    if (TERMINAL.has(data.status as string)) continue;
+    delete data.sourceEstimatedFinishAt;
+    settled.push({
+      type: "progress",
+      key: record.key,
+      data: { ...data, ...ABORTED_PROGRESS[outcome] },
+    });
+  }
+  return settled;
+}
 
 export function estimateProgress(
   key: string,

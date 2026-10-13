@@ -29,7 +29,9 @@ import sanityCheckWorkflow, {
 } from "../src/builtins/sanity-check.workflow.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
-import { makeStateDatabasePath, ScriptedExecutor } from "./helpers.js";
+import { readWorkflowRun } from "../src/workflows/store.js";
+import type { WorkflowUpdateRecord } from "../src/workflows/types.js";
+import { makeStateDatabasePath, ScriptedExecutor, waitUntil } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 const areas: SanityCheckArea[] = ["necessity", "duplication", "contracts", "scope_tests"];
@@ -140,6 +142,66 @@ async function runAgentProbe(mode: SanityCheckMode) {
   }).run(agentProbe(mode), {});
 }
 
+/**
+ * Start every session, then wait for the abort and report final states the
+ * way the headless launcher does after the action attempt has already ended.
+ */
+function installAbortedHost(): { started: () => boolean; lateEvents: () => number } {
+  let started = false;
+  let lateEvents = 0;
+  setPiAgentGroupLauncher(async (requests, options) => {
+    for (const request of requests) {
+      await options.onLifecycle?.({
+        id: request.id,
+        role: request.role,
+        elapsedMs: 1,
+        model: "fixture/model",
+        state: "running",
+        phase: "thinking",
+      });
+    }
+    started = true;
+    await new Promise((resolve) => options.signal.addEventListener("abort", resolve));
+    for (const request of requests) {
+      lateEvents += 1;
+      await options.onLifecycle?.({
+        id: request.id,
+        role: request.role,
+        elapsedMs: 2,
+        state: "cancelled",
+        phase: "cancelled: headless pi did not report that the session settled",
+      });
+    }
+    throw new Error("Pi agent group was cancelled");
+  });
+  return { started: () => started, lateEvents: () => lateEvents };
+}
+
+function reviewProbe(timeoutMs?: number) {
+  return defineWorkflow({
+    name: "sanity-check-review",
+    startAt: "prepare",
+    nodes: {
+      prepare: compute({ run: () => ({ mode: "parallel" }) }),
+      collectEvidence: compute({ run: () => evidence() }),
+      review: {
+        ...sanityCheckWorkflow.nodes.review!,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      },
+    },
+    edges: [
+      { from: "prepare", to: "collectEvidence" },
+      { from: "collectEvidence", to: "review" },
+    ],
+  });
+}
+
+function progressStates(updates: WorkflowUpdateRecord[] | undefined) {
+  return Object.fromEntries(
+    (updates ?? []).map((update) => [update.key, [update.data.status, update.data.phase]]),
+  );
+}
+
 afterEach(() => setPiAgentGroupLauncher(undefined));
 
 describe("sanity-check workflow", () => {
@@ -202,6 +264,54 @@ describe("sanity-check workflow", () => {
     );
     expect(progress.get("agents/review")).toBe("failed");
     expect(progress.get("agents/review/review")).toBe("failed");
+  });
+
+  it("settles every agent track as timed out when the review action times out", async () => {
+    const host = installAbortedHost();
+    const databasePath = await makeStateDatabasePath("sanity-check-timeout");
+    const result = await new WorkflowEngine({
+      executor: new ScriptedExecutor(),
+      databasePath,
+    }).run(reviewProbe(500), {});
+
+    expect(result.state.status).toBe("timed_out");
+    const timedOut = ["failed", "timed out"];
+    const expected = Object.fromEntries(
+      ["agents/review", ...areas.map((area) => `agents/review/${area}`)].map((key) => [
+        key,
+        timedOut,
+      ]),
+    );
+    expect(progressStates(result.state.updates)).toEqual(expected);
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
+    // The launcher's own final events arrive after the attempt ended and change nothing.
+    await waitUntil(() => host.lateEvents() === areas.length);
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
+  });
+
+  it("settles every agent track as cancelled when the run is cancelled", async () => {
+    const host = installAbortedHost();
+    const databasePath = await makeStateDatabasePath("sanity-check-cancel");
+    const engine = new WorkflowEngine({ executor: new ScriptedExecutor(), databasePath });
+    const running = engine.run(reviewProbe(), {});
+    await waitUntil(host.started);
+    engine.cancel();
+    const result = await running;
+
+    expect(result.state.status).toBe("cancelled");
+    const expected = Object.fromEntries(
+      ["agents/review", ...areas.map((area) => `agents/review/${area}`)].map((key) => [
+        key,
+        ["cancelled", "cancelled"],
+      ]),
+    );
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
   });
 
   it("bounds malformed agent output errors without retaining model text", () => {
