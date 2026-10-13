@@ -1499,8 +1499,12 @@ elsewhere in this plan.
 - **O3: forbid `glab` everywhere.** This is the accepted safety tightening.
 - **Live validation.** Drop step 2 of [Validation](#validation): a disposable GitLab or GitHub
   run that pushes or opens an MR or PR. The goal forbids live MR or PR creation. The real-model
-  `test:e2e:live` run in step 1 is optional and needs owner approval for its cost. The required
-  live check is read-only: `glab mr list` against a code.aws.dev repository.
+  `test:e2e:live` run in step 1 stays required, because AGENTS.md requires one real-model live E2E
+  with a low-cost model. An earlier version of this note called it optional, which was wrong. It
+  ran once on fork main 7d3f478:
+  `npm run test:e2e:live -- --provider amazon-bedrock --model us.openai.gpt-5.6-luna` exited 0
+  with `result: passed` and `modelCostUsd` 0.0041 (log `/tmp/fpt-live-e2e.log`). The other live
+  check is read-only: `glab mr list` against a code.aws.dev repository.
 
 ### Open issues
 
@@ -1599,7 +1603,9 @@ These are out of scope for this plan.
 - F8: Make `examples/resource-managers/pull-request.resource-manager.ts` aware of the forge
   (`github-merge` at `:99`, the GitHub API accept header at `:201`).
 - F9: Fix the stale `codex review` and "PR" text in `skills/autoimplement/agents/openai.yaml:3-4`.
-  The workflow uses `pi-reviewer`.
+  The workflow uses `pi-reviewer`. _(done)_
+  - `default_prompt` now names `pi-reviewer --base <branch>`, and both fields name the pull
+    request or merge request, as `skills/autoimplement/SKILL.md` does.
 - F10: Detect a push before the review gate that bypasses the push destination's remote-tracking
   ref (review N3).
   - The gap: `assertNotPushedBeforeGate` (`src/builtins/autoimplement.workflow.ts`) reads only the
@@ -1652,9 +1658,12 @@ These are out of scope for this plan.
     timeout rather than by an assertion.
 - F17: Name both forges in the `prTiming` field rule of `skills/autoimplement/SKILL.md:30` (grep
   audit). It says `early` "opens the pull request before review" without the GitLab wording. Fix:
-  "opens the pull request or merge request".
+  "opens the pull request or merge request". _(done)_
 - F18: Correct `docs/WORKFLOWS.md:858`. It says that after a failed push check "a person can move
-  `prTiming` to `early`". That is not possible until F2 lands.
+  `prTiming` to `early`". That is not possible until F2 lands. _(done)_
+  - The sentence now says the controller should choose `blocked`, and that moving `prTiming` to
+    `early` is not available yet because no server path can record a `human` settings change. F2
+    still has to land before a person can make that change.
 - F19: Re-check built-in revisions when merging upstream.
   - The fork's built-in revision numbers (autoimplement 15, monitor 14, change-verification 3,
     autodoc 4, plan-change 2) equal upstream's next numbers.

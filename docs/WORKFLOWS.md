@@ -855,7 +855,7 @@ When Git keeps no reflog for the ref, for example with `core.logAllRefUpdates` t
 
 The run start is the start of the run's first recorded step. Step records are persisted, so a resume keeps that time.
 
-A failing check tells the model not to push before the review gate passes. Pushed commits cannot be withdrawn without a force push, so the controller should then choose `blocked`, or a person can move `prTiming` to `early`. An absent ref or an unknown push destination counts as no push. The check reads local refs only, so it detects a push only after the fact. With a reflog it detects every push through the push destination that updates this ref, including one that sends only commits made before the run. It does not detect a push that bypasses that ref, such as a push to a URL, to another remote, or to another branch name, and that is then fetched into the ref: the reflog then shows only a fetch, which looks like a commit that someone else added. It also cannot see a push made from another clone.
+A failing check tells the model not to push before the review gate passes. Pushed commits cannot be withdrawn without a force push, so the controller should then choose `blocked`. Moving `prTiming` to `early` is not available as a way out yet: only a `human` settings actor may make that change, and no server path can record a `human` settings change today. The Pi session path checks a change as a `resource_manager` actor and records it as a `session` actor, and the ResourceManager path uses a `resource_manager` actor. An absent ref or an unknown push destination counts as no push. The check reads local refs only, so it detects a push only after the fact. With a reflog it detects every push through the push destination that updates this ref, including one that sends only commits made before the run. It does not detect a push that bypasses that ref, such as a push to a URL, to another remote, or to another branch name, and that is then fetched into the ref: the reflog then shows only a fetch, which looks like a commit that someone else added. It also cannot see a push made from another clone.
 
 The review gate passes when the newest work event records a head and every head it records passes. A head passes when its newest successful review found no P0, P1, or P2 findings, or when a passed P2 verification produced it after a P2-only review of its parent. An `implement`, `fix`, or `addressP2` step counts as new work with any outcome, because a failed or timed-out edit may be partial. While a reviewed head is not pushed, a clean review, a reused clean review, or a passed P2 verification offers `publication`, `review`, or `blocked` instead of comments. A reused review of a head that is not pushed and did not pass offers `repair`, `redesign`, or `blocked`.
 
@@ -1151,7 +1151,8 @@ wake:
   its own listener bound, which is the path the replacement now serves; the
   replacement re-creates the socket file within one poll tick while its claim
   still names it, and clients retry through the brief window.
-- Only the epoch owner writes `server/server.lock.json`. The probe only reads,
+- Only the epoch owner writes `server/server.lock.json`, except in the
+  poll-repair race listed below. The probe only reads,
   so a starter owns nothing on disk until it wins the claim. A starter whose
   claim is fenced exits without writing or removing the lock file or the
   socket, and without reaping the owner's child processes. This holds when
@@ -1160,18 +1161,31 @@ wake:
   lock record atomically: a private temporary file in the same directory is
   renamed over the lock. While the claim row still names the owner and its
   epoch, every poll rewrites a lock file that is missing or names another
-  record. A superseded server never rewrites it.
+  record. A superseded server never rewrites it, except in the poll-repair
+  race listed below.
 - A server removes the lock file only while it still owns the epoch and the
   lock names it. Stop, and a startup that fails after the claim, remove it
   before they release the claim. A superseded server leaves the lock to its
   successor, which may have claimed the epoch without having written its
-  record yet. Two narrow windows remain. The ownership check and the removal
-  are separate steps, so a successor that claims an expired lease and writes
-  its lock between them can still lose its record. And during the first
-  restart onto this behavior, the stopping server still runs the earlier code,
-  which releases its claim before it removes its lock. In both cases the
-  owner's poll rewrites the missing lock within one claim poll, 2 seconds by
-  default.
+  record yet. Four narrow windows remain, in which the owner's lock file is
+  missing or names the superseded server. In each of them the owner's poll
+  rewrites the lock within one claim poll, 2 seconds by default:
+  - The lock's server ID check and the removal are separate steps, so a
+    successor that claims an expired lease after the ownership check and
+    writes its lock between those two steps can still lose its record.
+  - When the ownership read fails, for example because the state database
+    cannot be read, the removal falls back to the lock's server ID check
+    alone. A superseded server then removes a lock that still names it, so a
+    successor that claimed the epoch earlier and writes its lock between that
+    check and the removal loses its record.
+  - The poll's own lock repair also checks ownership and rewrites the lock in
+    separate steps. When it finds the lock missing or foreign and a successor
+    claims an expired lease and writes its lock between those steps, the
+    superseded server overwrites the successor's record with its own. It
+    later leaves that record in place, because it no longer owns the epoch.
+  - During the first restart onto this behavior, the stopping server still
+    runs the earlier code, which releases its claim before it removes its
+    lock.
 - Clients re-spawn failed replacements. When a spawned server exits without
   becoming ready, the client starts the next one within the same start window,
   capped at three attempts, so one lost race costs milliseconds instead of the
