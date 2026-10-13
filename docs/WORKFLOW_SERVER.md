@@ -197,6 +197,21 @@ A runner exit is not automatically a run failure. The server decides from the la
 
 Each runner starts in its own process group. A headless Pi child starts in another process group so normal runner completion can stop all Pi tool descendants without signaling the runner itself. The runner registers that direct child with the server before it sends a prompt and unregisters it only after group shutdown. The server owns the one process registry and reaps a registered child if its runner exits first. Headless Pi children that run [Sanity Check agent groups](WORKFLOWS.md#built-in-sanity-check) start and register the same way in interactive and headless runs, one child per group.
 
+### Headless Pi command
+
+The server pins one pi for every headless Pi child, agent steps and agent groups alike, once when it starts. The server never looks `pi` or `node` up on `PATH` when a child starts. A pi that is a Node script runs as `<pinned node> <pinned pi CLI script> --mode rpc ...`. A pi executable that is not a Node script runs directly. Everything else about the child stays the same: its working directory, inherited environment and overrides, process group, registration, stop signals, server Pi arguments, and the `--no-extensions -e <bridge>` arguments.
+
+The pin comes from one of two places:
+
+- **The starting Pi session.** When the extension starts the server, it passes its own pi to the server as `server-entry` arguments. That pi is Pi's Node (`process.execPath`) with the real file behind Pi's entry script (`process.argv[1]`, symlinks resolved). Pi's own subagent example starts pi again in the same way. The extension accepts that script only when it is a `bin` of the nearest `package.json` and that package has a `piConfig`. A compiled pi, such as a Bun executable or a Node single executable application, is pinned as an executable. A process that is not a pi CLI, such as an SDK host or a test runner, passes no pin. Headless children of a server that a Pi session started therefore run the same pi and Node as that session.
+- **The server's `PATH`.** When nothing was passed, for example after `pi-workflows server run`, `server start`, or `piw` started the server, the server resolves `pi` on its own `PATH` once at start and follows symlinks to the real file. If that file starts with `#!/usr/bin/env node` or `#!/path/to/node`, the server runs that Node once to read its `process.execPath`, so a version manager shim is resolved once instead of at each child start. Any other file, such as Pi's managed launcher or a compiled pi, is pinned as an executable and runs as it is. That program then makes its own choices each time it starts.
+
+The pin does not change while the server runs. A later Pi session from another pi installation connects to the running server and does not change its pin. After `pi update`, or when a session should use another pi, restart the server with `pi-workflows server stop`. The next client starts a server with its own pin. Runs resumed after the restart use the new pin.
+
+`pi-workflows server status` reports the pin as `headlessPi`: `source` is `session` or `path`, and `kind` is `node` with `node` and `cli`, `executable` with `executable`, or `unresolved` with `error`. The server also logs it at start. The pin is not persisted: it lives in the server process and in each runner's startup reply.
+
+A server that cannot resolve pi still starts, because state commands and workflows without agent steps do not need pi. Each headless child then fails at start with the reason from `headlessPi.error`. Before each start, the runner also checks that the pinned files still exist and are executable. A pin whose files were removed, for example by an update that deleted the old release, fails the step or agent group with the missing path and the restart instruction instead of running a different pi.
+
 The server enforces:
 
 - a startup handshake deadline;
@@ -418,7 +433,7 @@ A notify node creates a passive `notification` message in the same transaction a
 
 ## Detached execution
 
-A run with headless execution mode uses the existing `pi --mode rpc` integration for agent steps. The Pi child uses a separate process group registered with the server. The runner stops that group during normal completion. Cancellation gives the runner a bounded cleanup interval, and the server reaps the registered group if the runner exits first.
+A run with headless execution mode uses the existing `pi --mode rpc` integration for agent steps, started with the [pinned pi](#headless-pi-command). The Pi child uses a separate process group registered with the server. The runner stops that group during normal completion. Cancellation gives the runner a bounded cleanup interval, and the server reaps the registered group if the runner exits first.
 
 The headless child receives only the workflow step prompt, configured model arguments, and the bridge extension. Its submission uses the same exact request contract as origin-session work. A headless run cannot use a visible assistant-message step because it has no origin Pi session.
 
