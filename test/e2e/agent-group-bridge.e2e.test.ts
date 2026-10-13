@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { CANCEL_SETTLE_MS } from "../../src/server/agent-group-launcher.js";
 import { makeTempDir, waitUntil } from "../helpers.js";
+import { startMockOpenAiServer } from "./mock-openai.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 // PI_WORKFLOWS_E2E_PI_ENTRY runs this scenario on another Pi cli.js, such as a newer release.
@@ -238,6 +239,51 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
     expect(output.updates.at(-1)).toMatchObject({ key: "agents/review", status: "completed" });
     expect(output.pids).toHaveLength(1);
     await waitUntil(() => output.pids.every(processGone), 10_000);
+  }, 120_000);
+
+  it("runs the review action offline with a provider built into Pi", async () => {
+    // `models.json` points Pi's built-in Cerebras provider at a local mock, and there is no
+    // cached model catalog, so the model comes from Pi's bundled catalog.
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: JSON.stringify(REVIEW),
+    }));
+    const agentDir = path.join(root, "builtin-agent");
+    await fs.mkdir(agentDir, { recursive: true });
+    await writeJson(path.join(agentDir, "settings.json"), {
+      defaultProvider: "cerebras",
+      defaultModel: "gpt-oss-120b",
+      defaultThinkingLevel: "high",
+    });
+    await writeJson(path.join(agentDir, "models.json"), {
+      providers: { cerebras: { baseUrl: mock.baseUrl } },
+    });
+    await writeJson(path.join(agentDir, "auth.json"), {
+      cerebras: { type: "api_key", key: "builtin-provider-key" },
+    });
+    try {
+      const output = await runReview({ PI_CODING_AGENT_DIR: agentDir });
+
+      expect(output.error).toBeUndefined();
+      expect(output.reviews).toEqual([REVIEW]);
+      expect(output.updates).toContainEqual(
+        expect.objectContaining({
+          key: "agents/review/review",
+          status: "completed",
+          label: "Combined review · cerebras/gpt-oss-120b",
+        }),
+      );
+      expect(mock.authorizations).toEqual(["Bearer builtin-provider-key"]);
+      // Headless Pi may create an empty models store, but offline it caches no catalog.
+      const store = await fs
+        .readFile(path.join(agentDir, "models-store.json"), "utf8")
+        .catch(() => "{}");
+      expect(JSON.parse(store)).not.toHaveProperty("cerebras");
+      expect(output.pids).toHaveLength(1);
+      await waitUntil(() => output.pids.every(processGone), 10_000);
+    } finally {
+      await mock.close();
+    }
   }, 120_000);
 
   it("cancels a running review session and stops headless pi", async () => {

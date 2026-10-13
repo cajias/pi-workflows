@@ -171,9 +171,12 @@ export async function startMockOpenAiServer(
 ): Promise<{
   baseUrl: string;
   requests: ChatRequest[];
+  /** The `authorization` header of each request, in request order. */
+  authorizations: (string | undefined)[];
   close: () => Promise<void>;
 }> {
   const requests: ChatRequest[] = [];
+  const authorizations: (string | undefined)[] = [];
   const server = http.createServer((req, res) => {
     if (req.method !== "POST" || !req.url?.includes("/chat/completions")) {
       res.writeHead(404).end();
@@ -186,6 +189,7 @@ export async function startMockOpenAiServer(
     req.on("end", () => {
       const parsed = JSON.parse(body) as ChatRequest;
       requests.push(parsed);
+      authorizations.push(req.headers.authorization);
       const lastMessage = parsed.messages.at(-1);
       const lastUser = [...parsed.messages].reverse().find((message) => message.role === "user");
       const reply = script({
@@ -216,6 +220,7 @@ export async function startMockOpenAiServer(
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     requests,
+    authorizations,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));

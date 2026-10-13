@@ -79,6 +79,53 @@ async function writeNativeFixtureConfig(agentDir: string, extensions?: string[])
   await fs.writeFile(path.join(agentDir, "auth.json"), "{}\n", "utf8");
 }
 
+// A provider built into Pi with an OpenAI-compatible API. Tests point it at a local mock
+// server through `models.json`, the way a user configures a proxy, so no request leaves the
+// machine.
+const BUILTIN_PROVIDER = "cerebras";
+const BUILTIN_MODEL = "gpt-oss-120b";
+const BUILTIN_PROVIDER_KEY = "builtin-provider-key";
+const BUILTIN_PROVIDER_KEY_ENV = "CEREBRAS_API_KEY";
+
+async function writeBuiltinProviderConfig(
+  agentDir: string,
+  baseUrl: string,
+  options: { extensions?: string[]; auth?: boolean } = {},
+): Promise<void> {
+  await fs.writeFile(
+    path.join(agentDir, "settings.json"),
+    JSON.stringify({
+      defaultProvider: BUILTIN_PROVIDER,
+      defaultModel: BUILTIN_MODEL,
+      defaultThinkingLevel: "high",
+      extensions: options.extensions ?? [],
+    }),
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(agentDir, "models.json"),
+    JSON.stringify({ providers: { [BUILTIN_PROVIDER]: { baseUrl } } }),
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(agentDir, "auth.json"),
+    JSON.stringify(
+      options.auth === false
+        ? {}
+        : { [BUILTIN_PROVIDER]: { type: "api_key", key: BUILTIN_PROVIDER_KEY } },
+    ),
+    "utf8",
+  );
+}
+
+async function readAgentConfig(agentDir: string): Promise<string[]> {
+  return await Promise.all(
+    ["settings.json", "models.json", "auth.json"].map(
+      async (name) => await fs.readFile(path.join(agentDir, name), "utf8"),
+    ),
+  );
+}
+
 function successfulFactory(
   delays: Record<string, number> = {},
   results: Record<string, string> = {},
@@ -1135,7 +1182,7 @@ describe("Pi agent groups", () => {
     }
   });
 
-  it("fails without the exact provider extension or cached model", async () => {
+  it("fails with an unknown provider or model", async () => {
     const agentDir = await makeTempDir("pi-agent-group-exact-dispatch");
     const cwd = await makeTempDir("pi-agent-group-exact-project");
     await writeNativeFixtureConfig(agentDir, []);
@@ -1147,7 +1194,15 @@ describe("Pi agent groups", () => {
           maxConcurrency: 1,
           signal: new AbortController().signal,
         }),
-      ).rejects.toThrow(/has no provider extension/);
+      ).rejects.toThrow("Pi agent group has unknown provider: fixture-native");
+      // An extension that registers another provider does not make this one known.
+      await writeNativeFixtureConfig(agentDir, [fixtureExtension("legacy-provider")]);
+      await expect(
+        runPiAgentGroup([{ ...request("other-provider"), cwd }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow("Pi agent group has unknown provider: fixture-native");
       await writeNativeFixtureConfig(agentDir);
       await expect(
         runPiAgentGroup(
@@ -1161,7 +1216,187 @@ describe("Pi agent groups", () => {
           ],
           { maxConcurrency: 1, signal: new AbortController().signal },
         ),
-      ).rejects.toThrow(/has no model/);
+      ).rejects.toThrow("Pi agent missing-model has no model: fixture-native/missing");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("runs a provider built into Pi without a cached model catalog, online and offline", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"builtin"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin");
+    const cwd = await makeTempDir("pi-agent-group-builtin-project");
+    const lifecycleFile = path.join(agentDir, "lifecycle.log");
+    // A user extension that registers another provider is preflighted but not admitted.
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, {
+      extensions: [fixtureExtension("native-provider")],
+    });
+    const configBefore = await readAgentConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_AGENT_FIXTURE_LIFECYCLE_FILE", lifecycleFile);
+    try {
+      for (const offline of [undefined, "1"]) {
+        vi.stubEnv("PI_OFFLINE", offline);
+        await expect(
+          runPiAgentGroup([{ ...request("builtin"), cwd, tools: ["read"] }], {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+          }),
+        ).resolves.toEqual([
+          expect.objectContaining({
+            model: `${BUILTIN_PROVIDER}/${BUILTIN_MODEL}`,
+            thinkingLevel: "high",
+            text: '{"answer":"builtin"}',
+          }),
+        ]);
+      }
+      // Each child used the stored credential through Pi's own provider resolution.
+      expect(mock.authorizations).toEqual([
+        `Bearer ${BUILTIN_PROVIDER_KEY}`,
+        `Bearer ${BUILTIN_PROVIDER_KEY}`,
+      ]);
+      // Each group's preflight settled the extension, and no child session loaded it.
+      expect((await fs.readFile(lifecycleFile, "utf8")).trim().split("\n")).toEqual([
+        "session_shutdown",
+        "session_shutdown",
+      ]);
+      await expect(fs.stat(path.join(agentDir, "models-store.json"))).rejects.toThrow();
+      await expect(fs.stat(path.join(agentDir, "sessions"))).rejects.toThrow();
+      expect(await readAgentConfig(agentDir)).toEqual(configBefore);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("runs a built-in provider model that only the cached catalog knows while offline", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"cached"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-cached");
+    const cwd = await makeTempDir("pi-agent-group-builtin-cached-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    const catalogText = JSON.stringify({
+      [BUILTIN_PROVIDER]: {
+        models: [
+          {
+            id: "fixture-cached-model",
+            name: "Fixture cached model",
+            api: "openai-completions",
+            provider: BUILTIN_PROVIDER,
+            baseUrl: "https://catalog.invalid/v1",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 128_000,
+            maxTokens: 4_096,
+          },
+        ],
+        checkedAt: 1,
+        // Pi applies a cached catalog only when it is newer than its bundled catalog.
+        lastModified: Date.UTC(2100, 0, 1),
+      },
+    });
+    await fs.writeFile(path.join(agentDir, "models-store.json"), catalogText, "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("cached"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "fixture-cached-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 1, signal: new AbortController().signal },
+        ),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: `${BUILTIN_PROVIDER}/fixture-cached-model`,
+          text: '{"answer":"cached"}',
+        }),
+      ]);
+      expect(mock.authorizations).toEqual([`Bearer ${BUILTIN_PROVIDER_KEY}`]);
+      expect(await fs.readFile(path.join(agentDir, "models-store.json"), "utf8")).toBe(catalogText);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("fails before prompting without built-in provider authentication or model", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-missing");
+    const cwd = await makeTempDir("pi-agent-group-builtin-missing-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, { auth: false });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("builtin-auth"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow(
+        `Pi agent builtin-auth has no provider authentication: ${BUILTIN_PROVIDER}`,
+      );
+      await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("builtin-model"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "missing-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 1, signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow(`Pi agent builtin-model has no model: ${BUILTIN_PROVIDER}/missing-model`);
+      expect(mock.requests).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("runs an extension provider without a cached model catalog while offline", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-extension-offline");
+    const cwd = await makeTempDir("pi-agent-group-extension-offline-project");
+    await writeNativeFixtureConfig(agentDir);
+    await fs.rm(path.join(agentDir, "models-store.json"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("extension-offline"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: "fixture-native/fixture-model",
+          text: '{"answer":"ok"}',
+        }),
+      ]);
+      await expect(fs.stat(path.join(agentDir, "models-store.json"))).rejects.toThrow();
     } finally {
       vi.unstubAllEnvs();
     }

@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isModelType } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createAgentSessionFromServices,
@@ -321,13 +320,21 @@ type SdkGroupPlan = {
   cwd: string;
   dispatch: PiAgentDispatch;
   extensionPaths: readonly string[];
+  /** An admitted extension registers the dispatch provider. Otherwise Pi itself defines it. */
+  providerExtension: boolean;
   credentialSnapshot: CredentialSnapshot;
-  modelSnapshot: StoredModelStoreEntry;
+  /** The dispatch provider's cached catalog entry, when Pi has saved one. */
+  modelSnapshot: StoredModelStoreEntry | undefined;
 };
 
 type ExtensionCandidate = {
   path: string;
   source: string;
+};
+
+type ChildExtensionProfile = {
+  extensionPaths: readonly string[];
+  providerExtension: boolean;
 };
 
 async function createSdkGroupPlan(
@@ -343,7 +350,7 @@ async function createSdkGroupPlan(
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const dispatch = resolveGroupDispatch(requests, settingsManager);
-  const extensionPaths = await resolveChildExtensionPaths(
+  const profile = await resolveChildExtensionProfile(
     cwd,
     agentDir,
     settingsManager,
@@ -351,30 +358,37 @@ async function createSdkGroupPlan(
     behaviorExtensionPaths,
     signal,
   );
+  if (!profile.providerExtension) await assertPiProvider(dispatch.provider, signal);
   const credentials = await createEphemeralCredentialStore(signal);
   const credentialSnapshot = new Map<string, StoredCredential>();
   for (const { providerId } of await credentials.list()) {
     const credential = await credentials.read(providerId);
     if (credential !== undefined) credentialSnapshot.set(providerId, cloneCredential(credential)!);
   }
+  // The cached catalog is optional. Providers built into Pi and providers that declare their
+  // models resolve without it, so a group also runs offline before any catalog refresh.
   const models = await createEphemeralModelStore(signal);
   const modelSnapshot = await models.read(dispatch.provider);
-  if (modelSnapshot === undefined) {
-    throw new PiAgentGroupError(
-      "group",
-      "has no model catalog",
-      `${dispatch.provider}/${dispatch.modelId}`,
-    );
-  }
   signal.throwIfAborted();
   return {
     agentDir,
     cwd,
     dispatch,
-    extensionPaths,
+    ...profile,
     credentialSnapshot,
-    modelSnapshot: structuredClone(modelSnapshot),
+    modelSnapshot,
   };
+}
+
+/**
+ * A dispatch provider that no admitted extension registers must be one that Pi defines
+ * itself: built into Pi or configured in `models.json`.
+ */
+async function assertPiProvider(provider: string, signal: AbortSignal): Promise<void> {
+  const modelRuntime = await offlineModelRuntime(signal);
+  if (modelRuntime.getProvider(provider) === undefined) {
+    throw new PiAgentGroupError("group", "has unknown provider", provider);
+  }
 }
 
 function resolveGroupDispatch(
@@ -422,14 +436,14 @@ function resolveGroupDispatch(
   return { provider, modelId, thinkingLevel };
 }
 
-async function resolveChildExtensionPaths(
+async function resolveChildExtensionProfile(
   cwd: string,
   agentDir: string,
   settingsManager: SettingsManager,
   provider: string,
   behaviorExtensionPaths: string[],
   signal: AbortSignal,
-): Promise<readonly string[]> {
+): Promise<ChildExtensionProfile> {
   signal.throwIfAborted();
   const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
   const resolved = await packageManager.resolve(async () => "skip");
@@ -441,9 +455,7 @@ async function resolveChildExtensionPaths(
   }
   const behaviorPaths = await canonicalizeBehaviorPaths(behaviorExtensionPaths, signal);
   for (const candidate of behaviorPaths) candidates.set(candidate.path, candidate);
-  if (candidates.size === 0) {
-    throw new PiAgentGroupError("group", "has no provider extension", provider);
-  }
+  if (candidates.size === 0) return { extensionPaths: Object.freeze([]), providerExtension: false };
 
   const candidateList = [...candidates.values()].toSorted((left, right) =>
     left.path.localeCompare(right.path),
@@ -462,7 +474,7 @@ async function resolveChildExtensionPaths(
     appendSystemPromptOverride: () => [],
   });
   let result: LoadExtensionsResult | undefined;
-  let admittedPaths: readonly string[] | undefined;
+  let profile: ChildExtensionProfile | undefined;
   let failure: unknown;
   try {
     await loader.reload();
@@ -489,17 +501,21 @@ async function resolveChildExtensionPaths(
         owners.add(await canonicalPath(registration.extensionPath, signal));
       }
     }
-    if (owners.size === 0) {
-      throw new PiAgentGroupError("group", "has no provider extension", provider);
-    }
     if (owners.size > 1) {
       throw new PiAgentGroupError("group", "has competing provider extensions", provider);
     }
-    const providerPath = [...owners][0]!;
-    if (!candidates.has(providerPath) || !byPath.has(providerPath)) {
+    // Without an owner, the child loads no provider extension and uses Pi's own provider.
+    const providerPath = [...owners][0];
+    if (
+      providerPath !== undefined &&
+      (!candidates.has(providerPath) || !byPath.has(providerPath))
+    ) {
       throw new PiAgentGroupError("group", "has invalid provider extension", provider);
     }
-    const admitted = new Set([providerPath, ...behaviorPaths.map((candidate) => candidate.path)]);
+    const admitted = new Set([
+      ...(providerPath === undefined ? [] : [providerPath]),
+      ...behaviorPaths.map((candidate) => candidate.path),
+    ]);
     for (const admittedPath of admitted) {
       const extension = byPath.get(admittedPath);
       if (extension === undefined) {
@@ -507,7 +523,10 @@ async function resolveChildExtensionPaths(
       }
       validateAdmittedExtension(extension, candidates.get(admittedPath)?.source ?? "extension");
     }
-    admittedPaths = Object.freeze([...admitted].toSorted());
+    profile = {
+      extensionPaths: Object.freeze([...admitted].toSorted()),
+      providerExtension: providerPath !== undefined,
+    };
   } catch (error) {
     failure = error;
   }
@@ -525,7 +544,18 @@ async function resolveChildExtensionPaths(
     }
   }
   if (failure !== undefined) throw failure;
-  return admittedPaths!;
+  return profile!;
+}
+
+/** A model runtime with Pi's own providers and no credentials, cache, or network. */
+async function offlineModelRuntime(signal: AbortSignal): Promise<ModelRuntime> {
+  return await ModelRuntime.create({
+    allowModelNetwork: false,
+    refreshOnCreate: false,
+    signal,
+    credentials: credentialStoreFromSnapshot(new Map(), signal),
+    modelsStore: emptyModelStore(signal),
+  });
 }
 
 async function shutdownLoadedExtensions(
@@ -533,13 +563,7 @@ async function shutdownLoadedExtensions(
   cwd: string,
   signal: AbortSignal,
 ): Promise<void> {
-  const modelRuntime = await ModelRuntime.create({
-    allowModelNetwork: false,
-    refreshOnCreate: false,
-    signal,
-    credentials: credentialStoreFromSnapshot(new Map(), signal),
-    modelsStore: emptyModelStore(signal),
-  });
+  const modelRuntime = await offlineModelRuntime(signal);
   const runner = new ExtensionRunner(
     result.extensions,
     result.runtime,
@@ -757,10 +781,12 @@ function credentialStoreFromSnapshot(
 
 function modelStoreFromSnapshot(
   provider: string,
-  snapshot: StoredModelStoreEntry,
+  snapshot: StoredModelStoreEntry | undefined,
   signal: AbortSignal,
 ): ModelStore {
-  const entries = new Map<string, StoredModelStoreEntry>([[provider, structuredClone(snapshot)]]);
+  const entries = new Map<string, StoredModelStoreEntry>(
+    snapshot === undefined ? [] : [[provider, structuredClone(snapshot)]],
+  );
   return {
     async read(providerId) {
       signal.throwIfAborted();
@@ -957,21 +983,6 @@ async function createSdkSession(
   signal: AbortSignal,
 ): Promise<PiAgentSession> {
   if (signal.aborted) throw cancellationError(request.id, signal.reason);
-  // One provider model ID can name a chat entry and an image or classifier
-  // entry. An agent session needs the chat entry.
-  const model = plan.modelSnapshot.models
-    .filter((candidate) => isModelType(candidate, "chat"))
-    .find(
-      (candidate) =>
-        candidate.provider === plan.dispatch.provider && candidate.id === plan.dispatch.modelId,
-    );
-  if (model === undefined) {
-    throw new PiAgentGroupError(
-      request.id,
-      "has no model",
-      `${plan.dispatch.provider}/${plan.dispatch.modelId}`,
-    );
-  }
   let latestExtensions: LoadExtensionsResult | undefined;
   const runtime = await createAgentSessionRuntime(
     async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
@@ -1013,7 +1024,8 @@ async function createSdkSession(
         });
         latestExtensions = services.resourceLoader.getExtensions();
         assertLoadedProfile(request.id, latestExtensions, plan.extensionPaths);
-        assertProviderRegistration(request.id, services, plan.dispatch.provider);
+        assertProviderRegistration(request.id, services, plan);
+        const model = dispatchModel(request.id, services.modelRuntime, plan.dispatch);
         const sessionResult = await createAgentSessionFromServices({
           services,
           sessionManager,
@@ -1056,7 +1068,7 @@ async function createSdkSession(
     });
     await session.bindExtensions({ mode: "print" });
     assertExactSession(request, session, plan.dispatch);
-    const auth = await runtime.services.modelRuntime.getAuth(model, { signal });
+    const auth = await runtime.services.modelRuntime.getAuth(session.model!, { signal });
     if (auth === undefined) {
       throw new PiAgentGroupError(
         request.id,
@@ -1127,14 +1139,35 @@ async function createSdkSession(
 function assertProviderRegistration(
   id: string,
   services: Awaited<ReturnType<typeof createAgentSessionServices>>,
-  provider: string,
+  plan: SdkGroupPlan,
 ): void {
   if (services.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
     throw new PiAgentGroupError(id, "could not register provider extension", "registration failed");
   }
-  if (!services.modelRuntime.getRegisteredProviderIds().includes(provider)) {
-    throw new PiAgentGroupError(id, "could not register provider extension", provider);
+  if (
+    plan.providerExtension &&
+    !services.modelRuntime.getRegisteredProviderIds().includes(plan.dispatch.provider)
+  ) {
+    throw new PiAgentGroupError(
+      id,
+      "could not register provider extension",
+      plan.dispatch.provider,
+    );
   }
+}
+
+/**
+ * The exact dispatch model from the child's model runtime, which resolves it the way Pi does:
+ * Pi's bundled catalog, the cached catalog snapshot, `models.json`, and the admitted provider
+ * extension. Only a physical chat model qualifies, so a virtual model cannot route the session
+ * to another model.
+ */
+function dispatchModel(id: string, modelRuntime: ModelRuntime, dispatch: PiAgentDispatch) {
+  const model = modelRuntime.getPhysicalModel(dispatch.provider, dispatch.modelId);
+  if (model === undefined) {
+    throw new PiAgentGroupError(id, "has no model", `${dispatch.provider}/${dispatch.modelId}`);
+  }
+  return model;
 }
 
 function assertLoadedProfile(

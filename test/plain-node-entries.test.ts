@@ -259,7 +259,7 @@ describe("host package guard", () => {
         modulePath(form, "builtins/pi-agent-group"),
       );
       expect(blocked.code, `${form.name}: ${blocked.stderr}`).not.toBe(0);
-      expect(blocked.stderr).toContain(`${BLOCKED_MARKER} @earendil-works/pi-ai`);
+      expect(blocked.stderr).toContain(`${BLOCKED_MARKER} @earendil-works/pi-coding-agent`);
     }
   }, 120_000);
 });
