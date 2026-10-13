@@ -15,6 +15,18 @@ import {
 import { startMockOpenAiServer } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
 
+/**
+ * Per-agent timeout for requests that do not test timeout behavior. A real SDK session loads
+ * extensions and a model runtime, and its first model request loads the provider's API client,
+ * which can take more than a second on a loaded machine. This bound only stops a session that
+ * never settles: a hang still fails with a timeout error, after the runner has aborted and
+ * disposed the session. Tests of timeout behavior set their own short `timeoutMs` on sessions
+ * that never settle by themselves.
+ */
+const SESSION_HANG_MS = 30_000;
+/** Vitest timeout for this file, long enough that the per-agent bound fires first. */
+const TEST_TIMEOUT_MS = 3 * SESSION_HANG_MS;
+
 function request(id: string): PiAgentRequest {
   return {
     id,
@@ -22,7 +34,7 @@ function request(id: string): PiAgentRequest {
     prompt: `Prompt ${id}`,
     cwd: process.cwd(),
     tools: ["read", "grep", "find", "ls"],
-    timeoutMs: 1_000,
+    timeoutMs: SESSION_HANG_MS,
   };
 }
 
@@ -166,7 +178,7 @@ function successfulFactory(
   };
 }
 
-describe("Pi agent groups", () => {
+describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
   it("validates requests and options before creating sessions", async () => {
     const signal = new AbortController().signal;
     await expect(runPiAgentGroup([], { maxConcurrency: 1, signal })).resolves.toEqual([]);
