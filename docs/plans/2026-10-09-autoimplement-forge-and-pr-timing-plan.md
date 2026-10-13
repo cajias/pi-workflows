@@ -1689,18 +1689,22 @@ These are out of scope for this plan.
   - If upstream reuses them for different content, mixed fork and upstream installs would silently
     accept each other's runs.
   - Re-check revisions when merging upstream.
-- F20: Settle durable per-agent tracks after an action times out or is cancelled.
+- F20: Settle durable per-agent tracks after an action times out or is cancelled. _(done)_
   - The gap: the `agents/<group>/<id>` tracks stay `running`. This predates the resolver host-peer
     fix: `WorkflowEngine.publishUpdate` rejects updates once the attempt signal aborts
     (`src/workflows/engine.ts:168-177`), and the engine stops waiting for an aborted action
     (`src/workflows/engine.ts:1046`).
   - Fix: the engine finalizes progress for aborted attempts.
+  - Done in `d522def` and `0eaabfe`: the engine and the queue's cancellation transaction give each
+    open track of the ended attempt a final `failed` (`timed out`) or `cancelled` record.
 - F21: Revisit the 2,000-character agent error cap as a product decision.
   - `MAX_ERROR_CHARS` (`src/builtins/pi-agent-launch.ts:59`, moved from
     `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
     not from a named external interface.
   - `PiAgentGroupError.detail` keeps the complete cause.
-- F22: Let Sanity Check agent groups use built-in providers and run offline.
+  - product decision pending: options sent to the human (keep cap with documented exception /
+    remove cap / keep full cause in a private 0600 file with no raw text in state).
+- F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
     refresh. Groups therefore fail with `PI_OFFLINE=1` (set in the user's `~/.zprofile`) and with
@@ -1708,18 +1712,26 @@ These are out of scope for this plan.
   - This predates the fix: `src/builtins/pi-agent-group.ts` at 2cb8ab3, lines 477 (user-scope
     candidates), 521-532 (extension-registered owner check), and 298 and 400-404
     (`models-store.json` snapshot).
-- F23: Prune kept agent group stderr logs.
+  - Done in `a7ef6fc`: groups also accept providers that Pi defines itself, resolve the model
+    without a cached catalog, and run with `PI_OFFLINE=1`.
+- F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
-- F24: Install the live E2E candidate the way Pi does.
+  - Done in `047b697`: before its first agent group, each runner deletes only log directories in
+    the exact logger layout that are unchanged for a fixed seven days.
+- F24: Install the live E2E candidate the way Pi does. _(done)_
   - `scripts/live-e2e.mjs:541-545` runs plain `npm install`, which installs the peer packages, so
     it cannot catch a plain Node entry that value-imports a host-only Pi package. Add
     `--legacy-peer-deps` to match `pi install`.
-- F25: Pin the `pi` and Node that headless Pi uses.
+  - Done in `57349aa`: the candidate installs with `--omit=dev --legacy-peer-deps`, and the run
+    fails if a host-provided Pi package can be resolved from it.
+- F25: Pin the `pi` and Node that headless Pi uses. _(done)_
   - Agent steps and agent groups spawn `pi` from the server's inherited `PATH`
     (`src/server/headless-pi.ts:85-86`), and npm-installed `pi` starts through
     `#!/usr/bin/env node`. A server started with a mise shim on `PATH` would run that Node.
-- F26: Make the timing-sensitive agent group test robust under load.
+  - Done in `138b41f` and `1f357e2`: the server pins pi and Node once at start, and
+    `server status` reports the pin as `headlessPi`.
+- F26: Make the timing-sensitive agent group test robust under load. _(done)_
   - `test/pi-agent-group.test.ts:1170` ("discovers a legacy provider owner and uses its configured
     authentication") runs a real SDK session with the helper's `timeoutMs: 1_000`
     (`test/pi-agent-group.test.ts:25`). It failed with "Pi agent legacy timed out: after 1000ms" on
@@ -1728,6 +1740,14 @@ These are out of scope for this plan.
     (`/tmp/resolver-peers-int3-check.attempt1-flake.log`).
   - It passed alone (3/3 and 36/36) and on full reruns. It predates the resolver host-peer fix,
     which changed only its imports.
+  - Done in `e16cb98`: real SDK sessions in that file use a 30-second hang limit under a 90-second
+    test timeout, so only a real hang fails by timeout.
+- F27: Let headless Pi load a provider that only an extension registers. _(done)_
+  - Done in `b666986` and `e05d4b2`: server piArgs can load an extension-only provider through
+    absolute `-e` paths, documented and validated. Opt-in for the auto-spawned server is pending
+    a decision.
+- F28: Keep the checkout clean after pi-style installs. _(done)_
+  - Done in `7ec4245`: lockfile regenerated so pi-style installs leave the checkout clean.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
