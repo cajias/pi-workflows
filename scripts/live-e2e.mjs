@@ -19,6 +19,17 @@ const RPC_TIMEOUT_MS = 30_000;
 const RUNTIME_TIMEOUT_MS = 90_000;
 const MODEL_TIMEOUT_MS = 10 * 60 * 1_000;
 const DIAGNOSTIC_CHARS = 12_000;
+/**
+ * Packages that Pi supplies to the extensions it loads. A Pi-style install leaves them out of
+ * the package tree. `typebox` is not listed: `@earendil-works/pi-server` installs it as a
+ * regular dependency.
+ */
+const HOST_PI_PACKAGES = [
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+];
 
 export function parseArgs(argv) {
   const options = {
@@ -516,6 +527,51 @@ function assertOneFrame(output, workflowName, status) {
   }
 }
 
+/**
+ * npm arguments that install the packed candidate the way `pi install` installs an npm package:
+ * Pi runs `npm install <spec> --prefix <root> --legacy-peer-deps`, and adds `--omit=dev` when it
+ * installs a git package's dependencies. Without peer installation, the packages that Pi
+ * supplies are absent, as for a user. Pi provides them at run time only to code it loads itself,
+ * so a plain Node process that imports one fails here as it would after `pi install`.
+ */
+export function candidateInstallArgs(archivePath, consumer) {
+  return [
+    "install",
+    archivePath,
+    "--prefix",
+    consumer,
+    "--omit=dev",
+    "--legacy-peer-deps",
+    "--no-audit",
+    "--no-fund",
+  ];
+}
+
+/**
+ * Fail when Node could resolve a package that Pi supplies from the installed candidate: in its
+ * own `node_modules` or in any ancestor's, up to and including `root`.
+ */
+export async function assertHostPackagesAbsent(candidate, root = path.parse(candidate).root) {
+  const found = [];
+  for (let directory = path.resolve(candidate); ; directory = path.dirname(directory)) {
+    for (const name of HOST_PI_PACKAGES) {
+      const target = path.join(directory, "node_modules", name);
+      try {
+        await fs.lstat(target);
+        found.push(target);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    if (directory === path.resolve(root) || path.dirname(directory) === directory) break;
+  }
+  if (found.length > 0) {
+    throw new Error(
+      `The candidate install contains packages that Pi supplies at run time:\n${found.join("\n")}`,
+    );
+  }
+}
+
 async function installCandidate(context) {
   stage("packing the npm package");
   await fs.mkdir(context.packs, { recursive: true });
@@ -532,7 +588,7 @@ async function installCandidate(context) {
   if (archiveName === undefined) throw new Error(`npm pack returned no archive: ${packed.stdout}`);
   const archivePath = path.join(context.packs, path.basename(archiveName));
 
-  stage("installing the packed package into an isolated consumer");
+  stage("installing the packed package into an isolated consumer the way pi install does");
   await fs.mkdir(context.consumer, { recursive: true });
   await fs.writeFile(
     path.join(context.consumer, "package.json"),
@@ -540,12 +596,13 @@ async function installCandidate(context) {
   );
   await runProcess(
     process.platform === "win32" ? "npm.cmd" : "npm",
-    ["install", "--omit=dev", "--no-audit", "--no-fund", archivePath],
+    candidateInstallArgs(archivePath, context.consumer),
     context.processOptions(context.consumer),
   );
   const candidate = path.join(context.consumer, "node_modules", "@osolmaz", "pi-workflows");
   await fs.access(path.join(candidate, "dist", "extension", "index.js"));
   await fs.access(path.join(candidate, "dist", "client", "index.js"));
+  await assertHostPackagesAbsent(candidate);
 
   stage("installing the candidate package through base Pi");
   await runProcess(

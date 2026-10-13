@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertHostPackagesAbsent,
   assertPackageIsolation,
   assertSafeTempRoot,
+  candidateInstallArgs,
   configureModelBudget,
   isExpectedWorkflowAbort,
   parseArgs,
@@ -225,6 +227,43 @@ describe("installed live E2E script", () => {
     await expect(
       assertPackageIsolation(rpc([...own, { name: "skill:x", source: "skill" }]), candidate),
     ).rejects.toThrow("Base Pi loaded unrelated resources");
+  });
+
+  it("installs the candidate like pi install, without the packages that Pi supplies", () => {
+    expect(candidateInstallArgs("/packs/candidate.tgz", "/consumer")).toEqual([
+      "install",
+      "/packs/candidate.tgz",
+      "--prefix",
+      "/consumer",
+      "--omit=dev",
+      "--legacy-peer-deps",
+      "--no-audit",
+      "--no-fund",
+    ]);
+  });
+
+  it("fails when Node could resolve a package that Pi supplies from the candidate", async () => {
+    await withTemporaryRoot(async (root) => {
+      const consumer = path.join(root, "consumer");
+      const candidate = path.join(consumer, "node_modules", "@osolmaz", "pi-workflows");
+      await fs.mkdir(candidate, { recursive: true });
+      // typebox arrives as a regular dependency of @earendil-works/pi-server.
+      await fs.mkdir(path.join(consumer, "node_modules", "typebox"), { recursive: true });
+      await expect(assertHostPackagesAbsent(candidate, root)).resolves.toBeUndefined();
+
+      const installed = [
+        path.join(consumer, "node_modules", "@earendil-works", "pi-ai"),
+        path.join(candidate, "node_modules", "@earendil-works", "pi-coding-agent"),
+        path.join(root, "node_modules", "@earendil-works", "pi-tui"),
+      ];
+      for (const directory of installed) await fs.mkdir(directory, { recursive: true });
+      const error = await assertHostPackagesAbsent(candidate, root).catch(
+        (caught: unknown) => caught as Error,
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("packages that Pi supplies at run time");
+      for (const directory of installed) expect((error as Error).message).toContain(directory);
+    });
   });
 
   it("refuses cleanup outside one direct guarded temporary root", () => {
