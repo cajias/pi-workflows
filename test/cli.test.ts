@@ -78,6 +78,28 @@ describe("pi-workflows CLI", () => {
     );
   });
 
+  it("accepts absolute provider extensions in server run Pi arguments", () => {
+    const piArgs = ["-e", "/opt/ext/provider.ts", "--provider", "fixture", "--model", "model"];
+    expect(parseCliArgs(["server", "run", "--", ...piArgs])).toMatchObject({ piArgs });
+  });
+
+  it("rejects a relative extension path in server run Pi arguments", async () => {
+    expect(() =>
+      parseCliArgs(["server", "run", "--", "--extension", "./provider.ts", "--provider", "x"]),
+    ).toThrow(
+      "Extra Pi argument `--extension ./provider.ts` names a relative extension path. Headless pi starts in each run's project directory, so Pi would resolve it there and could load project code. Pass an absolute path.",
+    );
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(await main(["server", "run", "--", "-e", "provider.ts"])).toBe(2);
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining("Extra Pi argument `-e provider.ts` names a relative"),
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("rejects a relative prune backup path", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {

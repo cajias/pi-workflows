@@ -1,11 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
 
 const DEFAULT_ABORT_GRACE_MS = 3_000;
 const RESTART_HINT = "Restart the workflow server with `pi-workflows server stop` to pin pi again";
+/** The flags that load an extension in Pi 1.1.0. Each takes the next argument as its source. */
+const EXTENSION_FLAGS = new Set(["-e", "--extension"]);
+/** Sources that Pi does not read as filesystem paths (`isLocalPath` in Pi's `utils/paths`). */
+const NON_PATH_SOURCE = /^(?:npm|git|github|http|https|ssh|builtin):/;
 
 /** The pi that the workflow server pinned at start, or why it could not pin one. */
 export type HeadlessPiLaunch = HeadlessPiCommand | { kind: "unresolved"; error: string };
@@ -54,6 +59,37 @@ export function packagedExtensionPath(moduleUrl: string, name: string): string |
   return [`./${name}.js`, `./${name}.ts`]
     .map((candidate) => fileURLToPath(new URL(candidate, moduleUrl)))
     .find((candidate) => fs.existsSync(candidate));
+}
+
+/**
+ * Reject a relative extension path in the Pi arguments that a server adds to every headless
+ * child. Each child starts in its run's project directory, so Pi would resolve a relative
+ * path there and could load code from every project. Pi reads no options after `--`, so
+ * neither does this check.
+ */
+export function assertAbsoluteExtensionPaths(piArgs: readonly string[]): void {
+  for (let index = 0; index < piArgs.length; index += 1) {
+    const flag = piArgs[index] as string;
+    if (flag === "--") return;
+    if (!EXTENSION_FLAGS.has(flag)) continue;
+    index += 1;
+    const source = piArgs[index];
+    if (source === undefined) {
+      throw new Error(`Extra Pi argument ${flag} requires an absolute extension path`);
+    }
+    if (isRelativeExtensionPath(source)) {
+      throw new Error(
+        `Extra Pi argument \`${flag} ${source}\` names a relative extension path. Headless pi starts in each run's project directory, so Pi would resolve it there and could load project code. Pass an absolute path.`,
+      );
+    }
+  }
+}
+
+function isRelativeExtensionPath(source: string): boolean {
+  if (NON_PATH_SOURCE.test(source.trim())) return false;
+  // Pi expands `~` to the home directory and reads a `file://` URL as an absolute path.
+  if (source === "~" || source.startsWith("~/") || source.startsWith("file://")) return false;
+  return !path.isAbsolute(source);
 }
 
 export function abortGraceMs(options: HeadlessPiOptions): number {
