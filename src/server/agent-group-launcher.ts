@@ -7,7 +7,7 @@ import {
   type PiAgentResult,
 } from "../builtins/pi-agent-launch.js";
 import { errorMessage } from "../workflows/errors.js";
-import { AgentLifecycleLedger, PiStderrLog } from "./agent-group-diagnostics.js";
+import { AgentLifecycleLedger, PiStderrLog, pruneStderrLogs } from "./agent-group-diagnostics.js";
 import {
   decodeAgentGroupEvent,
   encodeAgentGroupPrompt,
@@ -74,6 +74,7 @@ export class HeadlessPiAgentGroupLauncher {
   private readonly bridgePath: string | null;
   private readonly settings: ResolvedSettings;
   private closed = false;
+  private pruned: Promise<void> | undefined;
 
   constructor(
     private readonly options: HeadlessPiOptions,
@@ -92,6 +93,9 @@ export class HeadlessPiAgentGroupLauncher {
     requests: PiAgentRequest[],
     options: PiAgentGroupLaunchOptions,
   ): Promise<PiAgentResult[]> => {
+    // Before its first group, the launcher deletes expired logs that earlier runs kept or left.
+    this.pruned ??= this.pruneStderrLogs();
+    await this.pruned;
     if (options.signal.aborted) throw cancellationError(options.signal.reason);
     if (this.closed) {
       throw new PiAgentGroupError("group", "could not run", "the workflow runner is stopping");
@@ -119,6 +123,17 @@ export class HeadlessPiAgentGroupLauncher {
       await call.finishStderrLog();
     }
   };
+
+  /** Pruning is housekeeping: a failure is reported on the runner's stderr, never to the group. */
+  private async pruneStderrLogs(): Promise<void> {
+    await pruneStderrLogs(this.settings.diagnosticsDirectory, {
+      onError: (target, error) => {
+        process.stderr.write(
+          `Could not prune agent group stderr logs at ${target}: ${errorMessage(error)}\n`,
+        );
+      },
+    });
+  }
 
   /** Stop every running group's pi child. Later groups fail instead of starting. */
   async close(): Promise<void> {

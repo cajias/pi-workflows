@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PiAgentGroupError,
   type PiAgentLifecycleEvent,
   type PiAgentRequest,
 } from "../src/builtins/pi-agent-launch.js";
+import { STDERR_LOG_RETENTION_MS } from "../src/server/agent-group-diagnostics.js";
 import {
   CANCEL_SETTLE_MS,
   HeadlessPiAgentGroupLauncher,
@@ -127,6 +128,24 @@ async function namedStderrLog(error: unknown): Promise<string> {
 function states(events: PiAgentLifecycleEvent[]): string[] {
   return events.map((event) => `${event.id}:${event.state}:${event.phase}`);
 }
+
+/** A kept stderr log directory, as PiStderrLog leaves it, last modified `ageMs` ago. */
+async function keptLog(parent: string, name: string, ageMs: number): Promise<string> {
+  const directory = path.join(parent, name);
+  await fs.mkdir(directory, { mode: 0o700 });
+  await fs.chmod(directory, 0o700);
+  const log = path.join(directory, "pi-stderr.log");
+  await fs.writeFile(log, "pi stderr\n", { mode: 0o600 });
+  await fs.chmod(log, 0o600);
+  const mtime = new Date(Date.now() - ageMs);
+  await fs.utimes(log, mtime, mtime);
+  await fs.utimes(directory, mtime, mtime);
+  return directory;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("headless pi agent group launcher", () => {
   it("documents bounded waits longer than the runner's process stop grace", () => {
@@ -552,6 +571,71 @@ describe("headless pi agent group launcher", () => {
         diagnosticsDirectory: path.join(setup.dir, "missing-directory"),
       }).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal }),
     ).rejects.toThrow(/bridge loaded \(code 3, signal null\)\. pi stderr was not saved: ENOENT/u);
+  });
+
+  it("prunes expired stderr logs once, before its first group", async () => {
+    const setup = await harness("success");
+    const day = 24 * 60 * 60 * 1_000;
+    const expired = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old001",
+      STDERR_LOG_RETENTION_MS + day,
+    );
+    const recent = await keptLog(
+      setup.logs,
+      "pi-workflows-run-2-agent-group-new001",
+      STDERR_LOG_RETENTION_MS - day,
+    );
+    const launcher = setup.launcher();
+    const run = async () =>
+      await launcher.run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      });
+
+    await run();
+    expect(await fs.readdir(setup.logs)).toEqual([path.basename(recent)]);
+    await expect(fs.lstat(expired)).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Later groups of the same launcher do not scan again.
+    const later = await keptLog(
+      setup.logs,
+      "pi-workflows-run-3-agent-group-old002",
+      STDERR_LOG_RETENTION_MS + day,
+    );
+    await run();
+    expect((await fs.readdir(setup.logs)).sort()).toEqual(
+      [path.basename(recent), path.basename(later)].sort(),
+    );
+  });
+
+  it("runs the group when pruning fails and reports the failure on stderr", async () => {
+    const setup = await harness("success");
+    const expired = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old001",
+      STDERR_LOG_RETENTION_MS + 24 * 60 * 60 * 1_000,
+    );
+    vi.spyOn(fs, "rmdir").mockRejectedValue(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    const written: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk, ...rest) => {
+      if (String(chunk).startsWith("Could not prune")) {
+        written.push(String(chunk));
+        return true;
+      }
+      return write(chunk, ...(rest as []));
+    });
+
+    const results = await setup
+      .launcher()
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    expect(results.map((result) => result.text)).toEqual(["result a"]);
+    expect(written).toEqual([
+      `Could not prune agent group stderr logs at ${expired}: device busy\n`,
+    ]);
   });
 
   it("kills the child when the server refuses to supervise it", async () => {
