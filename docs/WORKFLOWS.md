@@ -152,11 +152,21 @@ control the same user-level server for all projects:
 pi-workflows server start
 pi-workflows server status
 pi-workflows server stop
-pi-workflows server run
+pi-workflows server run [-- <extra pi args>]
 ```
 
 `server run` stays attached. The other commands start, inspect, or stop the
 on-demand process. No command installs an operating-system service.
+
+`server run -- <args>` adds Pi arguments to every headless Pi child. To use a
+provider that only a user extension registers, name that extension by its
+absolute path: `pi-workflows server run -- -e /abs/path/provider-ext.ts
+--provider <provider> --model <model>`. The whole extension then loads into
+every headless agent step and agent group host process, for every run and
+project. It must not be the pi-workflows extension, and `server run` rejects a
+relative extension path. A server started any other way gets no extra Pi
+arguments. See
+[Extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments) for every caveat.
 
 The extension, CLI, and `piw` use the same version-1 client protocol over a Unix socket or Windows named pipe. The server sends byte-bounded run-list and run-view pages. Clients collect a complete run list for one revision and reject stale run pages whose cursor or revision no longer matches. A run view's `revision` is the presentation cursor; `runRevision` is the execution resource revision used by restart and other exact execution commands. The server reads only the selected history ranges and reuses an unchanged subscribed view after a lightweight revision check. It waits for a slow socket to drain and removes every subscription when its client unsubscribes. Large values stay available through verified content chunks. Server-generated aggregate values are saved and linked to the run before the server advertises them.
 
@@ -938,6 +948,8 @@ Kept and left-behind stderr logs are pruned after seven days. Before a workflow 
 The child runner resolves enabled user extension paths, excludes Pi Workflows and project extensions by default, and preflights the remaining paths without creating a session. It admits only the extension that registers the exact configured provider, plus any behavior extension on an explicit private allowlist. When no extension registers that provider, the provider must be one that Pi defines itself: a provider built into Pi or one configured in `models.json`. Children then load no provider extension and use Pi's own provider, as normal Pi does. A provider that neither an extension nor Pi defines fails the group with `has unknown provider` before any session starts. The runner rejects competing provider owners, workflow tools or commands, and extensions that replace a built-in read-only tool. The admitted paths are frozen for the group, and each child loads only those explicit paths without a second discovery pass.
 
 Each child owns a separate `ModelRuntime`, provider instance, extension runtime, resource loader, and in-memory session. The runner loads validated model and ordinary credential snapshots into per-child in-memory stores without writing them back. A provider extension uses its existing provider-owned credential store in place; Pi Workflows does not copy, print, migrate, or persist those credentials.
+
+The server's [extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments) reach the group's host process, but its `--provider` and `--model` do not select the group's model, and a provider extension that they load is not admitted to child sessions.
 
 Each child resolves the exact model the way Pi does, without network access. The sources are Pi's bundled catalog, the provider's cached entry in `<agentDir>/models-store.json`, `models.json`, and the admitted provider extension. Only a physical chat model qualifies, so a virtual model cannot route the session to another model. The cached entry is optional, because Pi writes it only after an online catalog refresh. A group therefore runs before any refresh and with `PI_OFFLINE=1` when its model is built into Pi, declared by `models.json` or the provider extension, or already cached. A model that no source lists fails the agent with `has no model` before prompting. Built-in providers authenticate as in normal Pi, from the ordinary credential snapshot, a `models.json` key, or the provider's environment variable. A provider without usable authentication fails the agent with `has no provider authentication` before prompting.
 
