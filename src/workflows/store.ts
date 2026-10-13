@@ -23,6 +23,7 @@ import { compileWorkflowDefinition, compositionMetadata } from "./composition.js
 import { ClaimLostError } from "./errors.js";
 import { HumanDecisionStore } from "./human-decision.js";
 import { applyJsonPatch, validateJsonPatch } from "./json-patch.js";
+import { abortedAttemptProgress } from "./progress.js";
 import {
   reduceSessionEvents,
   reduceSessionEventsFromCheckpoint,
@@ -1606,16 +1607,6 @@ export class WorkflowRunStore {
       this.assertWriteAuthority(run, context.revision);
       const revision = context.revision + 1;
       const at = new Date().toISOString();
-      const event: WorkflowTraceEvent = {
-        seq: revision,
-        at,
-        runId,
-        scope: "node",
-        type: "update_published",
-        nodeId,
-        attemptId,
-        payload: { updateId, type: update.type, key: update.key, data },
-      };
       const record: WorkflowUpdateRecord = {
         updateId,
         seq: revision,
@@ -1631,26 +1622,7 @@ export class WorkflowRunStore {
       state.traceSeq = revision;
       state.updatedAt = at;
       this.ensureAttempt(state, nodeId, attemptId, Date.now());
-      const dataHash = this.state.putJson(data);
-      const nextUpdateSeq = this.nextUpdateSequence(attemptId);
-      this.state.connection
-        .prepare(
-          `INSERT INTO workflow_updates(
-               update_id, attempt_id, update_seq, run_revision,
-               update_type, update_key, data_hash, recorded_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          updateId,
-          attemptId,
-          nextUpdateSeq,
-          revision,
-          update.type,
-          update.key,
-          dataHash,
-          Date.now(),
-        );
-      insertRunEvent(this.state, run.resourceId, revision, at, event);
+      const event = insertWorkflowUpdate(this.state, run.resourceId, record);
       const committedAt = Date.now();
       this.persistRunState(run, state, revision, committedAt);
       recordViewerDeltas(this.state, runId, runViewerTargets(state, event), committedAt);
@@ -3503,18 +3475,6 @@ export class WorkflowRunStore {
     return row.attemptNumber;
   }
 
-  private nextUpdateSequence(attemptId: string): number {
-    const row = this.state.connection
-      .prepare(
-        `SELECT COALESCE(MAX(update_seq), 0) + 1 AS updateSeq
-         FROM workflow_updates WHERE attempt_id = ?`,
-      )
-      .get(attemptId);
-    /* istanbul ignore if -- exact schema and internal query shape */
-    if (!isUpdateSequenceRow(row)) throw new Error("Could not allocate workflow update sequence");
-    return row.updateSeq;
-  }
-
   private insertRunSources(
     runId: string,
     root: { type: "builtin" | "file"; ref: string; revision: string },
@@ -3966,38 +3926,7 @@ export class WorkflowRunStore {
   }
 
   private readCurrentUpdates(runId: string, range?: WorkflowRunViewRange): WorkflowUpdateRecord[] {
-    const rangeClause = range === undefined ? "" : " LIMIT ? OFFSET ?";
-    const params = range === undefined ? [runId] : [runId, range.limit, range.start];
-    const rows = this.state.connection
-      .prepare(
-        `WITH ranked AS (
-           SELECT u.update_id AS updateId, u.run_revision AS runRevision,
-                  a.node_id AS nodeId, u.attempt_id AS attemptId,
-                  u.update_type AS updateType, u.update_key AS updateKey,
-                  u.data_hash AS dataHash, u.recorded_at AS recordedAt,
-                  row_number() OVER (
-                    PARTITION BY u.update_type, u.update_key ORDER BY u.run_revision DESC
-                  ) AS rank
-           FROM workflow_updates u
-           JOIN node_attempts a ON a.attempt_id = u.attempt_id
-           WHERE a.run_id = ?
-         )
-         SELECT updateId, runRevision, nodeId, attemptId, updateType, updateKey, dataHash, recordedAt
-         FROM ranked WHERE rank = 1 ORDER BY runRevision${rangeClause}`,
-      )
-      .all(...params)
-      .filter(isUpdateRow);
-    return rows.map((row) => ({
-      updateId: row.updateId,
-      seq: row.runRevision,
-      at: new Date(row.recordedAt).toISOString(),
-      runId,
-      nodeId: row.nodeId,
-      attemptId: row.attemptId,
-      type: row.updateType,
-      key: row.updateKey,
-      data: this.readJsonAs<Record<string, unknown>>(row.dataHash),
-    }));
+    return readCurrentUpdateRecords(this.state, runId, range);
   }
 
   private readJsonAs<T>(hash: Buffer): T {
@@ -4446,6 +4375,153 @@ function insertRunEvent(
     payloadHash,
     Date.parse(at),
   );
+}
+
+/** Write one accepted update as its `workflow_updates` row and its `update_published` event. */
+function insertWorkflowUpdate(
+  state: StateDatabase,
+  resourceId: string,
+  record: WorkflowUpdateRecord,
+): WorkflowTraceEvent {
+  const event: WorkflowTraceEvent = {
+    seq: record.seq,
+    at: record.at,
+    runId: record.runId,
+    scope: "node",
+    type: "update_published",
+    nodeId: record.nodeId,
+    attemptId: record.attemptId,
+    payload: { updateId: record.updateId, type: record.type, key: record.key, data: record.data },
+  };
+  const sequence = state.connection
+    .prepare(
+      `SELECT COALESCE(MAX(update_seq), 0) + 1 AS updateSeq
+       FROM workflow_updates WHERE attempt_id = ?`,
+    )
+    .get(record.attemptId);
+  /* istanbul ignore if -- exact schema and internal query shape */
+  if (!isUpdateSequenceRow(sequence)) {
+    throw new Error("Could not allocate workflow update sequence");
+  }
+  state.connection
+    .prepare(
+      `INSERT INTO workflow_updates(
+         update_id, attempt_id, update_seq, run_revision,
+         update_type, update_key, data_hash, recorded_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      record.updateId,
+      record.attemptId,
+      sequence.updateSeq,
+      record.seq,
+      record.type,
+      record.key,
+      state.putJson(record.data),
+      Date.parse(record.at),
+    );
+  insertRunEvent(state, resourceId, record.seq, record.at, event);
+  return event;
+}
+
+/** The latest update for each `(type, key)` pair of a run, in run revision order. */
+function readCurrentUpdateRecords(
+  state: StateDatabase,
+  runId: string,
+  range?: WorkflowRunViewRange,
+): WorkflowUpdateRecord[] {
+  const rangeClause = range === undefined ? "" : " LIMIT ? OFFSET ?";
+  const params = range === undefined ? [runId] : [runId, range.limit, range.start];
+  const rows = state.connection
+    .prepare(
+      `WITH ranked AS (
+         SELECT u.update_id AS updateId, u.run_revision AS runRevision,
+                a.node_id AS nodeId, u.attempt_id AS attemptId,
+                u.update_type AS updateType, u.update_key AS updateKey,
+                u.data_hash AS dataHash, u.recorded_at AS recordedAt,
+                row_number() OVER (
+                  PARTITION BY u.update_type, u.update_key ORDER BY u.run_revision DESC
+                ) AS rank
+         FROM workflow_updates u
+         JOIN node_attempts a ON a.attempt_id = u.attempt_id
+         WHERE a.run_id = ?
+       )
+       SELECT updateId, runRevision, nodeId, attemptId, updateType, updateKey, dataHash, recordedAt
+       FROM ranked WHERE rank = 1 ORDER BY runRevision${rangeClause}`,
+    )
+    .all(...params)
+    .filter(isUpdateRow);
+  return rows.map((row) => ({
+    updateId: row.updateId,
+    seq: row.runRevision,
+    at: new Date(row.recordedAt).toISOString(),
+    runId,
+    nodeId: row.nodeId,
+    attemptId: row.attemptId,
+    type: row.updateType,
+    key: row.updateKey,
+    data: state.readJson(row.dataHash) as Record<string, unknown>,
+  }));
+}
+
+/**
+ * Give the open progress tracks of the attempts that a run cancellation ends a
+ * terminal `cancelled` record. A workflow server cancellation commits outside
+ * the engine and stops the runner, so the aborted attempt cannot settle its own
+ * tracks. Call this inside the cancellation transaction, before the attempts
+ * are marked cancelled. Each settled track is one ordinary update row and
+ * `update_published` event, and every event needs its own run revision
+ * (`UNIQUE(resource_id, resource_revision)`), so the run revision advances once
+ * per settled track. See docs/SQLITE_STATE.md.
+ */
+export function settleCancelledRunProgress(state: StateDatabase, runId: string, now: number): void {
+  if (!state.connection.inTransaction) {
+    throw new Error("Cancelled progress must settle inside the cancellation transaction");
+  }
+  const run = state.connection
+    .prepare("SELECT resource_id AS resourceId FROM runs WHERE run_id = ?")
+    .get(runId);
+  /* istanbul ignore if -- the caller selected this run in the same transaction */
+  if (!isRecord(run) || typeof run.resourceId !== "string") {
+    throw new Error(`Workflow run is missing: ${runId}`);
+  }
+  const resourceId = run.resourceId;
+  const attempts = state.connection
+    .prepare(
+      `SELECT attempt_id AS attemptId, node_id AS nodeId FROM node_attempts
+       WHERE run_id = ? AND status IN ('pending', 'running', 'waiting', 'interrupted')
+       ORDER BY created_at, attempt_id`,
+    )
+    .all(runId)
+    .filter(isAttemptIdentityRow);
+  if (attempts.length === 0) return;
+  const current = readCurrentUpdateRecords(state, runId);
+  const at = new Date(now).toISOString();
+  for (const attempt of attempts) {
+    for (const update of abortedAttemptProgress(current, attempt.attemptId, "cancelled")) {
+      const revision = state.connection
+        .prepare(
+          `UPDATE resources SET revision = revision + 1, updated_at = ?
+           WHERE resource_id = ? RETURNING revision`,
+        )
+        .get(now, resourceId);
+      /* istanbul ignore if -- exact schema and internal query shape */
+      if (!isRevisionRow(revision)) throw new Error(`Resource is missing: ${resourceId}`);
+      insertWorkflowUpdate(state, resourceId, {
+        updateId: createUpdateId(),
+        seq: revision.revision,
+        at,
+        runId,
+        nodeId: attempt.nodeId,
+        attemptId: attempt.attemptId,
+        ...update,
+      });
+    }
+  }
+}
+
+function isAttemptIdentityRow(value: unknown): value is { attemptId: string; nodeId: string } {
+  return isRecord(value) && typeof value.attemptId === "string" && typeof value.nodeId === "string";
 }
 
 function compactTracePayload(

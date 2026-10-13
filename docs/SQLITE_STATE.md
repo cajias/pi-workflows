@@ -235,6 +235,26 @@ COMMIT
 
 Any failed check rolls back the complete command.
 
+One command increments the run resource revision more than once: the queue's run
+cancellation (`WorkflowRunQueueStore.cancelWorkflowRun`, through `terminalRun` or
+`cancelStaleWorkflowRun`, and their shared `cancelWorkflowRunDependents`). A workflow server
+cancellation commits outside the engine and stops the runner, so the cancelled attempt cannot
+settle its own progress tracks. The transaction settles them itself: every open progress track
+of an attempt it cancels gets a terminal `cancelled` record. Each record is an ordinary
+`workflow_updates` row with its own `update_published` event, so the run view, the trace, and
+every renderer read it like any other update. `events` stores one event per resource revision
+(`UNIQUE(resource_id, resource_revision)`), so N settled records need N run revisions before the
+`run.queue_cancelled` event. A cancellation that settles N tracks therefore advances the run
+revision by N + 1. Every settled record, the cancelled attempts, and the cancelled run commit
+in one transaction, or none of them do. Every run revision still has exactly one event.
+
+No reader assumes a +1 step. Runner messages, restarts, and child-run starts compare an expected
+run revision for equality, and the runner adopts the revision that the server returns. A run
+store resynchronizes its cached revision before it writes after an out-of-band queue change.
+Server views key their caches on a version string that contains the revision, and the separate
+presentation cursor advances by one for each viewer change, as before. Trace pages count events,
+and `state verify` checks domain facts, not revision gaps.
+
 Session-event batches use `session_events` as their journal. They update the contiguous segment counter in the same transaction and do not create a generic `session.events_appended` event for each flush. The recorder stores order, IDs, roles, status, and timing boundaries. It discards token deltas, completed text, thinking text, tool arguments, tool results, and incremental tool progress. The settled Pi entries keep the replay content.
 
 A TypeScript write permit carries the expected facts between layers. It is not authority by itself. The store verifies durable ownership and revision data again inside the transaction.

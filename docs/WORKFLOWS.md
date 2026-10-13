@@ -1145,8 +1145,9 @@ resume` takes a new generation and reruns only work after the last durable
 - A start is committed as `queued` with its final run ID before the command
   reports success. Cancellation can use that run ID before its scheduled runner
   starts. Active cancellation commits its terminal state and command receipt
-  together before runner shutdown. It cancels effects that have not started and
-  marks applying effects ambiguous for explicit recovery. `workflow status` and
+  together before runner shutdown. It cancels effects that have not started,
+  marks applying effects ambiguous for explicit recovery, and settles the
+  cancelled attempt's open progress tracks. `workflow status` and
   `workflow cancel` can use the run ID immediately.
 - One interactive workflow request is presented per Pi session. Other requests
   remain durable and ordered.
@@ -1199,10 +1200,27 @@ estimate no longer applies.
   finish its track, and the engine never overwrites that terminal state.
 - A rejected settlement record never changes the attempt outcome or its route.
   A lost claim still stops the runner.
+- A workflow server cancellation commits outside the engine and then stops the
+  runner, which has lost its claim. The queue's cancellation transaction
+  therefore writes the `cancelled` settlement records itself, for every
+  attempt it cancels: the active attempt of a running run, and the open
+  attempt of a paused, parked, or expired run. The records, the cancelled
+  attempts, and the cancelled run commit together, or none of them do. Each
+  record advances the run revision once, as
+  [SQLite state](SQLITE_STATE.md#write-contract) describes.
 - A parked attempt is abandoned for resume, not ended, so its tracks stay open.
   This includes a runner that the workflow server stops for a pause, a
   handoff, or a server shutdown. When the node runs again, its new attempt
-  publishes its tracks again.
+  publishes its tracks again. If the run is cancelled while it is parked, the
+  cancellation settles them.
+
+Known limitation: a run that the workflow server fails without the engine
+keeps the open tracks of its last attempt. This covers
+`WorkflowRunStore.markRunInterrupted`, which fails an abandoned run as
+interrupted, and `WorkflowRunQueueStore.failWorkflowRun`, which the server uses
+when the missing-submission reminders run out or a runner cannot load its
+workflow source. Those tracks keep the last state that their attempt
+published, while the run and node status show the failure.
 
 ## Wake recovery
 
