@@ -7,6 +7,7 @@ import net, { type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { workflowStatePath } from "../state/database.js";
 import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+import { headlessPiCommandArgs, type HeadlessPiCommand } from "./headless-pi-command.js";
 import {
   CLIENT_PROTOCOL_SCHEMA,
   NdjsonFrameDecoder,
@@ -73,6 +74,12 @@ export type WorkflowClientOptions = {
   databasePath?: string;
   serverEntryPath?: string;
   env?: Record<string, string>;
+  /**
+   * The pi that runs this client, handed to a server that this client starts. That server's
+   * headless children run it. Omit it outside a Pi session; the server then resolves `pi`
+   * from its `PATH`. A server that is already running keeps its own pin.
+   */
+  headlessPi?: HeadlessPiCommand | undefined;
 };
 
 export class WorkflowClient {
@@ -82,6 +89,7 @@ export class WorkflowClient {
 
   private readonly serverEntryPath: string | undefined;
   private readonly env: Record<string, string> | undefined;
+  private readonly headlessPi: HeadlessPiCommand | undefined;
   private socket: Socket | null = null;
   private connectTask: Promise<ClientHello> | null = null;
   private hello: ClientHello | null = null;
@@ -99,6 +107,7 @@ export class WorkflowClient {
     this.endpoint = clientSocketPath(this.databasePath);
     this.serverEntryPath = options.serverEntryPath;
     this.env = options.env;
+    this.headlessPi = options.headlessPi;
   }
 
   get connectionId(): string | undefined {
@@ -921,7 +930,13 @@ export class WorkflowClient {
       this.serverEntryPath === undefined && !fs.existsSync(builtEntry)
         ? ["--import", createRequire(import.meta.url).resolve("tsx"), sourceEntry]
         : [entry];
-    const child = spawn(process.execPath, [...args, "--database", this.databasePath], {
+    const serverArgs = [
+      ...args,
+      "--database",
+      this.databasePath,
+      ...headlessPiCommandArgs(this.headlessPi),
+    ];
+    const child = spawn(process.execPath, serverArgs, {
       detached: true,
       stdio: ["ignore", "ignore", "ignore", "pipe"],
       env: { ...process.env, ...this.env, PI_WORKFLOWS_STARTUP_FD: "3" },

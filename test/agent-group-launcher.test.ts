@@ -22,7 +22,7 @@ const UNSETTLED_CANCEL = "cancelled: headless pi did not report that the session
 const UNFINISHED_RUN = "failed: headless pi stopped before the session finished";
 const NEVER_STARTED = "cancelled: the session did not start";
 const LAUNCH_HINT =
-  "The workflow runner starts agent groups with the same `pi` command, arguments, and environment as headless workflow steps; check that this command runs on the workflow server";
+  "The workflow runner starts agent groups with the same pinned pi, arguments, and environment as headless workflow steps; `pi-workflows server status` reports that pi as `headlessPi`";
 
 function request(id: string): PiAgentRequest {
   return { id, role: `Role ${id}`, prompt: `Prompt ${id}`, cwd: "/repo", tools: ["read"] };
@@ -40,7 +40,7 @@ type Harness = {
   launcher(): HeadlessPiAgentGroupLauncher;
 };
 
-/** A launcher whose `pi` is the fake bridge child, started through the same launch options. */
+/** A launcher whose pinned pi is the fake bridge child, started through the same launch options. */
 async function harness(
   scenario: string,
   extra: Partial<HeadlessPiOptions> = {},
@@ -49,19 +49,13 @@ async function harness(
   const dir = await makeTempDir("agent-group-launcher");
   const logs = path.join(dir, "logs");
   await fs.mkdir(logs);
-  const piBin = path.join(dir, "pi");
-  await fs.writeFile(
-    piBin,
-    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_PI)} "$@"\n`,
-    { encoding: "utf8", mode: 0o755 },
-  );
   const registered: number[] = [];
   const unregistered: number[] = [];
   const argvFile = path.join(dir, "argv.json");
   const commandsFile = path.join(dir, "commands.jsonl");
   const options: HeadlessPiOptions = {
     cwd: dir,
-    piBin,
+    pi: { kind: "node", node: process.execPath, cli: FAKE_PI },
     processGroup: "own",
     abortGraceMs: 300,
     env: {
@@ -171,9 +165,14 @@ describe("headless pi agent group launcher", () => {
     expect(results.map((result) => result.text)).toEqual(["result a", "result b"]);
     expect(seen).toEqual(["a:running", "b:running", "a:completed", "b:completed", "resolved"]);
     const launched = JSON.parse(await fs.readFile(setup.argvFile, "utf8")) as {
+      node: string;
+      cli: string;
       argv: string[];
       env: string;
     };
+    // The pinned Node runs the pinned CLI script; nothing comes from PATH.
+    expect(launched.node).toBe(process.execPath);
+    expect(launched.cli).toBe(FAKE_PI);
     expect(launched.argv.slice(0, 5)).toEqual([
       "--mode",
       "rpc",
@@ -443,7 +442,7 @@ describe("headless pi agent group launcher", () => {
     expect(error).toBeInstanceOf(PiAgentGroupError);
     expect((error as Error).message).toMatch(/^Pi agent group could not run: /);
     expect((error as Error).message).toMatch(expected);
-    expect((error as Error).message).toContain("same `pi` command");
+    expect((error as Error).message).toContain("same pinned pi");
     // The complete stderr stream stays in the named private log, not in the error.
     const log = await namedStderrLog(error);
     if (stderr !== undefined) {
@@ -460,15 +459,59 @@ describe("headless pi agent group launcher", () => {
 
   it("fails clearly when pi cannot start", async () => {
     const setup = await harness("success");
-    const missing = path.join(setup.dir, "missing-pi");
+    // The pinned file exists, but its interpreter does not, so the spawn itself fails.
+    const brokenPi = path.join(setup.dir, "broken-pi");
+    await fs.writeFile(brokenPi, "#!/nonexistent/interpreter\n", { mode: 0o755 });
     const error = await new HeadlessPiAgentGroupLauncher(
-      { ...setup.options, piBin: missing },
+      { ...setup.options, pi: { kind: "executable", executable: brokenPi } },
       setup.settings,
     )
       .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
       .catch((caught: unknown) => caught);
-    expect((error as Error).message).toContain(`bridge loaded (spawn ${missing} ENOENT)`);
+    expect((error as Error).message).toContain(`bridge loaded (spawn ${brokenPi} ENOENT)`);
     expect(await namedStderrLog(error)).toBe("");
+  });
+
+  it("names the missing file when the pinned pi no longer exists", async () => {
+    const setup = await harness("success");
+    const missing = path.join(setup.dir, "removed-release", "cli.js");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      { ...setup.options, pi: { kind: "node", node: process.execPath, cli: missing } },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      `Pi agent group could not run: headless pi is unavailable. The workflow server pinned headless pi as ${missing} run by ${process.execPath}, but ${missing} is missing or not executable. Restart the workflow server with \`pi-workflows server stop\` to pin pi again.`,
+    );
+    expect(setup.registered).toEqual([]);
+    expect(await fs.readdir(setup.logs)).toEqual([]);
+  });
+
+  it("reports why the server could not pin pi before any session starts", async () => {
+    const setup = await harness("success");
+    const events: PiAgentLifecycleEvent[] = [];
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        pi: { kind: "unresolved", error: "The workflow server could not pin headless pi: no pi." },
+      },
+      setup.settings,
+    )
+      .run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          events.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toBe(
+      "Pi agent group could not run: headless pi is unavailable. The workflow server could not pin headless pi: no pi.",
+    );
+    expect(events).toEqual([]);
+    await expect(fs.access(setup.argvFile)).rejects.toThrow();
   });
 
   it("names the complete log path after a long pi rejection, beyond the message cap", async () => {

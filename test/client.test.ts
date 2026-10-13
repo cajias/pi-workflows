@@ -125,6 +125,41 @@ describe("WorkflowClient", () => {
     }
   });
 
+  it("hands only a supplied headless pi pin to the server process it starts", async () => {
+    const directory = await makeTempDir("client-headless-pi-args");
+    const databasePath = path.join(directory, "state.sqlite");
+    const serverEntryPath = path.join(directory, "report-args.mjs");
+    await fs.writeFile(
+      serverEntryPath,
+      'import fs from "node:fs"; fs.writeSync(3, JSON.stringify(process.argv.slice(2))); process.exit(1);',
+    );
+    const startArgs = async (client: WorkflowClient): Promise<string[]> => {
+      try {
+        const failure = await (
+          client as unknown as { startDetached: () => Promise<Error> }
+        ).startDetached();
+        return JSON.parse(failure.message) as string[];
+      } finally {
+        await client.close();
+      }
+    };
+    const pin = { kind: "node", node: "/opt/node/bin/node", cli: "/opt/pi/dist/cli.js" } as const;
+    expect(
+      await startArgs(new WorkflowClient({ databasePath, serverEntryPath, headlessPi: pin })),
+    ).toEqual([
+      "--database",
+      databasePath,
+      "--headless-pi-node",
+      pin.node,
+      "--headless-pi-cli",
+      pin.cli,
+    ]);
+    expect(await startArgs(new WorkflowClient({ databasePath, serverEntryPath }))).toEqual([
+      "--database",
+      databasePath,
+    ]);
+  });
+
   it("prefers the detached server error when startup never becomes available", async () => {
     const databasePath = path.join(await makeTempDir("client-startup-blocker"), "state.sqlite");
     const client = new WorkflowClient({ databasePath });

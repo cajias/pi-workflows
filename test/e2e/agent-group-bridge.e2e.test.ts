@@ -100,7 +100,8 @@ async function runReview(env: Record<string, string> = {}): Promise<ReviewOutput
     NO_COLOR: "1",
     PI_WORKFLOWS_TEST_FORM_ROOT: packageSource,
     PI_WORKFLOWS_TEST_FORM_EXTENSION: ".ts",
-    FAKE_PI_BIN: path.join(root, "bin", "pi"),
+    // The real Pi CLI, pinned with this Node binary.
+    PI_WORKFLOWS_TEST_PI_CLI: PI_ENTRY,
     PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR: path.join(root, "logs"),
     ...env,
   };
@@ -164,7 +165,7 @@ beforeAll(async () => {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.symlink(path.join(REPO_ROOT, "node_modules", name), target, "dir");
   }
-  for (const name of ["home", "project", "bin", "config", "agent", "fixtures", "logs"]) {
+  for (const name of ["home", "project", "config", "agent", "fixtures", "logs"]) {
     await fs.mkdir(path.join(root, name), { recursive: true });
   }
   const provider = path.join(root, "fixtures", "review-provider.ts");
@@ -196,12 +197,6 @@ beforeAll(async () => {
     },
   });
   await fs.writeFile(path.join(agentDir, "auth.json"), "{}\n", "utf8");
-  // The real Pi CLI, started with this Node binary.
-  await fs.writeFile(
-    path.join(root, "bin", "pi"),
-    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(PI_ENTRY)} "$@"\n`,
-    { encoding: "utf8", mode: 0o755 },
-  );
 }, 60_000);
 
 describe("Sanity Check agent groups under the real Pi runtime", () => {

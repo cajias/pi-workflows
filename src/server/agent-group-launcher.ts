@@ -16,6 +16,7 @@ import {
   type AgentGroupRunOptions,
 } from "./agent-group-protocol.js";
 import {
+  availableHeadlessPi,
   describeHeadlessPiExit,
   HeadlessPiProcess,
   packagedExtensionPath,
@@ -42,7 +43,7 @@ export const CANCEL_SETTLE_MS = 10_000;
  */
 export const RESULT_IDLE_MS = 5_000;
 const LAUNCH_HINT =
-  "The workflow runner starts agent groups with the same `pi` command, arguments, and environment as headless workflow steps; check that this command runs on the workflow server";
+  "The workflow runner starts agent groups with the same pinned pi, arguments, and environment as headless workflow steps; `pi-workflows server status` reports that pi as `headlessPi`";
 
 export type HeadlessPiAgentGroupSettings = {
   /** The bridge extension; `null` reports a broken installation. */
@@ -105,6 +106,17 @@ export class HeadlessPiAgentGroupLauncher {
         "group",
         "could not run",
         "the pi-workflows agent group bridge is missing from this installation",
+      );
+    }
+    try {
+      availableHeadlessPi(this.options.pi);
+    } catch (error) {
+      // The reason is Pi Workflows' own text with paths, so it follows the cause in full.
+      throw new PiAgentGroupError(
+        "group",
+        "could not run",
+        "headless pi is unavailable",
+        errorMessage(error),
       );
     }
     const call = new AgentGroupCall(

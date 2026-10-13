@@ -3,6 +3,7 @@ export {
   WorkflowClientVersionError,
   type WorkflowClientOptions,
 } from "./client.js";
+export type { HeadlessPiCommand } from "./headless-pi-command.js";
 export {
   CLIENT_PROTOCOL_SCHEMA,
   CLIENT_PROTOCOL_VERSION,

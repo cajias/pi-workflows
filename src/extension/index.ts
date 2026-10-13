@@ -4,6 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { BUILTIN_WORKFLOW_METADATA } from "../builtins/metadata.js";
 import { verifyTelegramTokenFile, writeDecisionChannelProfile } from "../channels/config.js";
 import { WorkflowClient } from "../client/client.js";
+import { currentPiCommand } from "../client/headless-pi-command.js";
 import type { ClientResponse } from "../client/protocol.js";
 import type {
   ClientInteractiveRequest,
@@ -180,7 +181,9 @@ export function parseWorkflowArgs(args: string): ParsedWorkflowArgs {
 export default function piWorkflows(pi: ExtensionAPI): void {
   registerWorkflowAgentStepMessageRenderer(pi);
   registerTerminalMessageRenderer(pi);
-  let client = new WorkflowClient({ clientId: `pi-extension-${randomUUID()}` });
+  // A server that this session starts runs headless pi with this session's own pi.
+  const headlessPi = currentPiCommand();
+  let client = new WorkflowClient({ clientId: `pi-extension-${randomUUID()}`, headlessPi });
   const herdrViewer = new HerdrWorkflowViewer(pi.exec, process.env, () => client.endpoint);
   let sessionContext: ExtensionContext | null = null;
   let sessionGeneration = 0;
@@ -884,7 +887,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     sessionSubscriptionRetryAt = 0;
     serverUnavailableNotified = false;
     await client.close();
-    client = new WorkflowClient({ clientId: `pi-extension-${randomUUID()}` });
+    client = new WorkflowClient({ clientId: `pi-extension-${randomUUID()}`, headlessPi });
   });
 }
 

@@ -2,8 +2,13 @@ import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
 
 const DEFAULT_ABORT_GRACE_MS = 3_000;
+const RESTART_HINT = "Restart the workflow server with `pi-workflows server stop` to pin pi again";
+
+/** The pi that the workflow server pinned at start, or why it could not pin one. */
+export type HeadlessPiLaunch = HeadlessPiCommand | { kind: "unresolved"; error: string };
 
 export interface SupervisedProcessRegistry {
   register(pid: number): unknown | Promise<unknown>;
@@ -18,8 +23,8 @@ export type HeadlessPiOptions = {
   processGroup?: "own" | "inherit";
   /** Grace period before a process group receives SIGKILL. */
   abortGraceMs?: number;
-  /** Absolute path to the pi binary; defaults to the installed `pi`. */
-  piBin?: string;
+  /** The pinned pi. Nothing is looked up on `PATH` when a child starts. */
+  pi: HeadlessPiLaunch;
   /** Extra environment for the child; the server's environment is inherited. */
   env?: Record<string, string>;
   /** Extra pi arguments, for example a model override. */
@@ -55,6 +60,58 @@ export function abortGraceMs(options: HeadlessPiOptions): number {
   return options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
 }
 
+export function describeHeadlessPi(pi: HeadlessPiLaunch): string {
+  if (pi.kind === "node") return `${pi.cli} run by ${pi.node}`;
+  if (pi.kind === "executable") return pi.executable;
+  return `unresolved: ${pi.error}`;
+}
+
+/** The program and arguments that start the pinned pi with pi's own `args`. */
+export function headlessPiSpawnArgs(
+  pi: HeadlessPiCommand,
+  args: readonly string[],
+): { command: string; args: string[] } {
+  return pi.kind === "node"
+    ? { command: pi.node, args: [pi.cli, ...args] }
+    : { command: pi.executable, args: [...args] };
+}
+
+/**
+ * The pinned pi, checked before each start. A pin outlives `pi update` or a Node upgrade that
+ * removes its files, so a missing file is reported with the restart that pins pi again.
+ */
+export function availableHeadlessPi(pi: HeadlessPiLaunch): HeadlessPiCommand {
+  if (pi.kind === "unresolved") throw new Error(pi.error);
+  const programs = pi.kind === "node" ? [pi.node] : [pi.executable];
+  const missing =
+    programs.find((program) => !isExecutableFile(program)) ??
+    (pi.kind === "node" && !isFile(pi.cli) ? pi.cli : undefined);
+  if (missing !== undefined) {
+    throw new Error(
+      `The workflow server pinned headless pi as ${describeHeadlessPi(pi)}, but ${missing} is missing or not executable. ${RESTART_HINT}.`,
+    );
+  }
+  return pi;
+}
+
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function isExecutableFile(file: string): boolean {
+  if (!isFile(file)) return false;
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * One headless `pi --mode rpc` child that loads exactly one pi-workflows extension. Pi loads
  * the extension with its own module mapping, so the extension can import the packages that
@@ -82,27 +139,24 @@ export class HeadlessPiProcess {
   }
 
   async start(): Promise<void> {
-    const child = spawn(
-      this.options.piBin ?? "pi",
-      [
-        "--mode",
-        "rpc",
-        "--no-session",
-        // Isolation is required: an installed pi-workflows extension would
-        // otherwise load beside the bridge, register a competing workflow
-        // tool, and start its own resume and resource runners.
-        "--no-extensions",
-        "-e",
-        this.extensionPath,
-        ...(this.options.piArgs ?? []),
-      ],
-      {
-        cwd: this.options.cwd,
-        env: { ...process.env, ...this.options.env },
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: this.options.processGroup !== "inherit",
-      },
-    );
+    const launch = headlessPiSpawnArgs(availableHeadlessPi(this.options.pi), [
+      "--mode",
+      "rpc",
+      "--no-session",
+      // Isolation is required: an installed pi-workflows extension would
+      // otherwise load beside the bridge, register a competing workflow
+      // tool, and start its own resume and resource runners.
+      "--no-extensions",
+      "-e",
+      this.extensionPath,
+      ...(this.options.piArgs ?? []),
+    ]);
+    const child = spawn(launch.command, launch.args, {
+      cwd: this.options.cwd,
+      env: { ...process.env, ...this.options.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: this.options.processGroup !== "inherit",
+    });
     this.child = child;
     child.on("exit", (code, signal) => this.settle({ code, signal }));
     // A failed spawn (missing binary, EACCES) emits error instead of exit;

@@ -63,7 +63,7 @@ describe("RpcStepExecutor submissions", () => {
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     const submission = await executor.runAgentStep(
       requestFor("work", "a1"),
@@ -80,7 +80,7 @@ describe("RpcStepExecutor submissions", () => {
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     const request = requestFor("work", "a1") as AgentStepRequest;
     request.publishUpdate = async () => {
@@ -105,7 +105,7 @@ describe("RpcStepExecutor submissions", () => {
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     const submission = await executor.runAgentStep(
       requestFor("work", "a1", async (output) => {
@@ -133,7 +133,7 @@ sleep 2
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     // The marker is already waiting when the step starts; the executor
     // resolves without waiting for more.
@@ -152,7 +152,7 @@ sleep 2
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     const submission = await executor.runAgentStep(
       requestFor("work", "a1"),
@@ -167,7 +167,7 @@ sleep 2
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     const abort = new AbortController();
     const step = executor.runAgentStep(requestFor("work", "a1"), abort.signal);
@@ -182,7 +182,7 @@ sleep 2
     const executor = new RpcStepExecutor({
       cwd: "/tmp",
       registry: new ServerProcessRegistry("/tmp"),
-      piBin: fakePi,
+      pi: { kind: "executable", executable: fakePi },
     });
     await expect(
       executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),

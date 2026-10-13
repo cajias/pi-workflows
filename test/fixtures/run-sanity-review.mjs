@@ -1,6 +1,7 @@
 // Runs Sanity Check's review action in a plain Node process, the way the workflow runner
 // does, with the headless pi agent group launcher. The test selects the source or built form,
-// the pi binary, and an optional cancellation point through the environment.
+// the pi CLI script that this Node pins, and an optional cancellation point through the
+// environment.
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -18,7 +19,7 @@ const pids = [];
 const launcher = new HeadlessPiAgentGroupLauncher(
   {
     cwd: process.cwd(),
-    piBin: process.env.FAKE_PI_BIN,
+    pi: { kind: "node", node: process.execPath, cli: process.env.PI_WORKFLOWS_TEST_PI_CLI },
     abortGraceMs: 1_000,
     registry: { register: (pid) => pids.push(pid), unregister: () => undefined },
   },

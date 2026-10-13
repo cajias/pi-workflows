@@ -24,7 +24,7 @@ import type {
   WorkflowSource,
 } from "../workflows/types.js";
 import { HeadlessPiAgentGroupLauncher } from "./agent-group-launcher.js";
-import type { HeadlessPiOptions } from "./headless-pi.js";
+import type { HeadlessPiLaunch, HeadlessPiOptions } from "./headless-pi.js";
 import { RpcStepExecutor } from "./rpc-executor.js";
 import type { WorkflowRunnerLaunchEnvelope } from "./state.js";
 import { materializeRunnerContent } from "./workflow-runner-content.js";
@@ -50,6 +50,8 @@ type WorkflowRunnerBootstrap = {
   originSessionId: string | null;
   stateDirectory: string;
   piArgs?: string[];
+  /** The pi that the server pinned at its start. */
+  headlessPi: HeadlessPiLaunch;
   candidateInteraction?: {
     requestId: string;
     attemptId: string;
@@ -442,6 +444,7 @@ function headlessPiOptions(
   };
   return {
     cwd: launch.projectPath,
+    pi: bootstrap.headlessPi,
     processGroup: "own",
     abortGraceMs: 1_000,
     registry: {

@@ -888,6 +888,23 @@ describe.sequential("out-of-process workflow server end to end", () => {
     await execFileAsync("git", ["branch", "-D", "test/handoff"], { cwd: repository });
   });
 
+  it("pins the starting Pi session's own pi for the server's headless children", async () => {
+    // The extension started this server from inside Pi, so it handed over Pi's own Node and
+    // the real file behind the pi CLI script that this test started.
+    const client = new WorkflowClient({ databasePath });
+    try {
+      const response = await client.request({ operation: "server.status" });
+      expect((response.receipt as Record<string, unknown>).headlessPi).toEqual({
+        source: "session",
+        kind: "node",
+        node: process.execPath,
+        cli: await fs.realpath(PI_BIN),
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
   it("marks a completed agent node done while the next agent turn runs", async () => {
     const requestStart = mock.requests.length;
     pi.send({

@@ -16,6 +16,7 @@ import {
   type TelegramMessageReference,
 } from "../channels/protocol.js";
 import { WorkflowClient } from "../client/client.js";
+import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
 import {
   CLIENT_PROTOCOL_SCHEMA,
   encodeProtocolFrameOrNull,
@@ -109,6 +110,8 @@ import {
   type ChannelEffectRecord,
 } from "./channel-effects.js";
 import { ChannelAdapterSupervisor } from "./channel-supervisor.js";
+import { pinHeadlessPi, type HeadlessPiPin } from "./headless-pi-resolution.js";
+import { describeHeadlessPi, type HeadlessPiLaunch } from "./headless-pi.js";
 import {
   assertNoServingServer,
   readServerLock,
@@ -157,6 +160,11 @@ export type WorkflowServerOptions = {
   databasePath?: string;
   registry?: ServerProcessRegistry;
   piArgs?: string[];
+  /**
+   * The pi of the Pi session that starts this server. Headless children run it for the whole
+   * server lifetime. Without it, the server resolves `pi` from its `PATH` once at start.
+   */
+  headlessPi?: HeadlessPiCommand | undefined;
   env?: Record<string, string>;
   claimPollMs?: number;
   /** Combined capacity for workflow runner and resource runner processes. */
@@ -281,6 +289,8 @@ export class WorkflowServer {
   /** This process's start identity, recorded in the lock file once this server owns the epoch. */
   private startIdentity: string | null = null;
   private claim: ServerClaim | null = null;
+  /** Pinned once at start; every runner receives it for its headless pi children. */
+  private headlessPi: HeadlessPiPin | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private viewTimer: ReturnType<typeof setInterval> | null = null;
@@ -372,6 +382,10 @@ export class WorkflowServer {
     // check only reads. A fenced starter can then never remove, replace, or
     // restore the owner's lock file.
     await assertNoServingServer(this.lockPath, { socketPath: this.socketPath });
+    this.headlessPi = await pinHeadlessPi(this.options.headlessPi, {
+      ...process.env,
+      ...this.options.env,
+    });
     try {
       const previousServer = this.serverState.serverStatus();
       this.claim = this.serverState.acquireServer({
@@ -392,6 +406,8 @@ export class WorkflowServer {
       this.startTimers();
       this.started = true;
       this.log(`ready on ${this.socketPath} at epoch ${this.claim.epoch}`);
+      const pinSource = this.headlessPi.source === "session" ? "the starting Pi session" : "PATH";
+      this.log(`headless pi from ${pinSource}: ${describeHeadlessPi(this.headlessPi.pi)}`);
       this.requestAutomaticStatePrune();
       void this.expireTimedOutDecision().finally(() => this.resumeAutomaticStatePruneIfDue());
       void this.claimOne().finally(() => this.resumeAutomaticStatePruneIfDue());
@@ -2246,6 +2262,11 @@ export class WorkflowServer {
     return { outcome: "accepted", receipt: deleting as unknown as JsonValue };
   }
 
+  private pinnedHeadlessPi(): HeadlessPiLaunch {
+    if (this.headlessPi === null) throw new Error("The workflow server has not pinned headless pi");
+    return this.headlessPi.pi;
+  }
+
   private statusReceipt(): JsonValue {
     const serverStatus = this.serverState.serverStatus();
     const count = (sql: string, ...params: unknown[]): number => {
@@ -2287,6 +2308,9 @@ export class WorkflowServer {
       activeResourceRunners: this.activeResourceManagers.size,
       executionRunners: this.executionRunnerCount(),
       maxRunners: this.maxRunners,
+      ...(this.headlessPi === null
+        ? {}
+        : { headlessPi: { source: this.headlessPi.source, ...this.headlessPi.pi } }),
       lifecycleContradictions: violations.filter((item) => item.code === "queueState").length,
       stateViolations: violations,
     };
@@ -4302,6 +4326,7 @@ export class WorkflowServer {
           stateDirectory: this.stateDirectory,
           ...(candidateInteraction === undefined ? {} : { candidateInteraction }),
           ...(this.options.piArgs === undefined ? {} : { piArgs: this.options.piArgs }),
+          headlessPi: this.pinnedHeadlessPi(),
         } as JsonValue,
         undefined,
         revision,

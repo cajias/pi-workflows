@@ -1089,18 +1089,15 @@ describe("global workflow server", () => {
       const stateDir = await makeTempDir("server-headless-group-state");
       const databasePath = path.join(stateDir, "state.sqlite");
       const workflowPath = await writeHeadlessAgentWorkflow(cwd);
-      const binDir = path.join(cwd, "bin");
       const pidFile = path.join(cwd, "fake-pi-pids.json");
-      const fakePi = path.join(binDir, "pi");
-      await fs.mkdir(binDir);
+      const fakePi = path.join(cwd, "fake-pi.cjs");
       await fs.writeFile(
         fakePi,
-        `#!/usr/bin/env node
-const fs = require("node:fs");
+        `const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-fs.writeFileSync(process.env.FAKE_PI_PIDS, JSON.stringify({ leader: process.pid, grandchild: grandchild.pid }));
+fs.writeFileSync(process.env.FAKE_PI_PIDS, JSON.stringify({ leader: process.pid, grandchild: grandchild.pid, node: process.execPath, cli: process.argv[1] }));
 let submitted = false;
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (submitted) return;
@@ -1113,17 +1110,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 });
 setInterval(() => {}, 1000);
 `,
-        { encoding: "utf8", mode: 0o755 },
+        "utf8",
       );
       const registry = new ServerProcessRegistry(stateDir);
+      // The runner receives this pin from the server and starts headless pi with it.
       const server = new WorkflowServer({
         databasePath,
         registry,
         claimPollMs: 10,
-        env: {
-          PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-          FAKE_PI_PIDS: pidFile,
-        },
+        headlessPi: { kind: "node", node: process.execPath, cli: fakePi },
+        env: { FAKE_PI_PIDS: pidFile },
       });
       const client = new WorkflowClient({ databasePath });
       await server.start();
@@ -1143,7 +1139,10 @@ setInterval(() => {}, 1000);
         const pids = JSON.parse(await fs.readFile(pidFile, "utf8")) as {
           leader: number;
           grandchild: number;
+          node: string;
+          cli: string;
         };
+        expect({ node: pids.node, cli: pids.cli }).toEqual({ node: process.execPath, cli: fakePi });
         await waitUntil(
           () =>
             !processExists(pids.leader) && !processExists(pids.grandchild) && registry.size === 0,

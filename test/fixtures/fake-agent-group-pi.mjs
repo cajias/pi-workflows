@@ -1,5 +1,5 @@
 // A fake `pi --mode rpc` child that speaks the agent group bridge protocol. The scenario in
-// FAKE_AGENT_GROUP_SCENARIO selects its behavior; tests run it through a shell wrapper.
+// FAKE_AGENT_GROUP_SCENARIO selects its behavior; tests pin it as the headless pi CLI script.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -11,7 +11,12 @@ const scenario = process.env.FAKE_AGENT_GROUP_SCENARIO ?? "success";
 if (process.env.FAKE_PI_ARGV_FILE) {
   fs.writeFileSync(
     process.env.FAKE_PI_ARGV_FILE,
-    JSON.stringify({ argv: process.argv.slice(2), env: process.env.FAKE_PI_MARKER ?? null }),
+    JSON.stringify({
+      node: process.execPath,
+      cli: process.argv[1],
+      argv: process.argv.slice(2),
+      env: process.env.FAKE_PI_MARKER ?? null,
+    }),
   );
 }
 // These scenarios outlive SIGTERM until SIGKILL, so late output can race the stop.

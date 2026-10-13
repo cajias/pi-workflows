@@ -326,13 +326,7 @@ describe.each(["src", "dist"] as const)(
       "runs Sanity Check's review through the headless pi agent group launcher",
       async () => {
         const form = formName === "src" ? sourceForm() : builtForm();
-        const piBin = path.join(sandbox, `fake-pi-${formName}`);
         const argvFile = path.join(sandbox, `fake-pi-${formName}.json`);
-        await fs.writeFile(
-          piBin,
-          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_PI)} "$@"\n`,
-          { encoding: "utf8", mode: 0o755 },
-        );
         const review = {
           areas: ["necessity", "duplication", "contracts", "scope_tests"].map((area) => ({
             area,
@@ -347,7 +341,7 @@ describe.each(["src", "dist"] as const)(
         const result = await runNode([...blockedArgs(form), REVIEW_PROBE], {
           PI_WORKFLOWS_TEST_FORM_ROOT: form.root,
           PI_WORKFLOWS_TEST_FORM_EXTENSION: form.extension,
-          FAKE_PI_BIN: piBin,
+          PI_WORKFLOWS_TEST_PI_CLI: FAKE_PI,
           FAKE_PI_ARGV_FILE: argvFile,
           FAKE_AGENT_GROUP_SCENARIO: "success",
           FAKE_AGENT_GROUP_TEXT: JSON.stringify(review),
