@@ -1106,14 +1106,26 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         );
       }
       await fs.writeFile(path.join(agentDir, "auth.json"), "PRIVATE_NOT_JSON", "utf8");
-      let message = "";
-      try {
-        await createEphemeralCredentialStore(new AbortController().signal);
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toBe("Could not load Pi credentials for isolated agents");
-      expect(message).not.toContain("PRIVATE_NOT_JSON");
+      const unparsable = await createEphemeralCredentialStore(new AbortController().signal).catch(
+        (error: unknown) => error,
+      );
+      // A parse error can quote a credential, so its text is kept nowhere, not even as detail.
+      expect(unparsable).toBeInstanceOf(PiAgentGroupError);
+      expect(unparsable).toMatchObject({
+        message: "Pi agent group failed: Could not load Pi credentials for isolated agents",
+        detail: undefined,
+      });
+      expect(JSON.stringify({ ...(unparsable as object) })).not.toContain("PRIVATE_NOT_JSON");
+      // A filesystem error is not Pi Workflows' text, so only the private detail holds it.
+      vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("PRIVATE_FS_MARKER: permission denied"), { code: "EACCES" }),
+      );
+      await expect(
+        createEphemeralCredentialStore(new AbortController().signal),
+      ).rejects.toMatchObject({
+        message: "Pi agent group failed: Could not load Pi credentials for isolated agents",
+        detail: "PRIVATE_FS_MARKER: permission denied",
+      });
       await fs.rm(path.join(agentDir, "auth.json"));
       await expect(
         createEphemeralCredentialStore(new AbortController().signal),
@@ -1125,6 +1137,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       );
     } finally {
       vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     }
   });
 
@@ -1153,14 +1166,22 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         );
       }
       await fs.writeFile(path.join(agentDir, "models-store.json"), "PRIVATE_NOT_JSON", "utf8");
-      let message = "";
-      try {
-        await createEphemeralModelStore(new AbortController().signal);
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toBe("Could not load Pi model catalog for isolated agents");
-      expect(message).not.toContain("PRIVATE_NOT_JSON");
+      const unparsable = await createEphemeralModelStore(new AbortController().signal).catch(
+        (error: unknown) => error,
+      );
+      // The parser's text is not Pi Workflows' own, so it is private detail.
+      expect(unparsable).toBeInstanceOf(PiAgentGroupError);
+      expect((unparsable as Error).message).toBe(
+        "Pi agent group failed: Could not load Pi model catalog for isolated agents",
+      );
+      expect((unparsable as PiAgentGroupError).detail).toContain("PRIVATE_NOT_JSON");
+      vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("PRIVATE_FS_MARKER: device busy"), { code: "EBUSY" }),
+      );
+      await expect(createEphemeralModelStore(new AbortController().signal)).rejects.toMatchObject({
+        message: "Pi agent group failed: Could not load Pi model catalog for isolated agents",
+        detail: "PRIVATE_FS_MARKER: device busy",
+      });
       await fs.rm(path.join(agentDir, "models-store.json"));
       await expect(createEphemeralModelStore(new AbortController().signal)).resolves.toBeDefined();
       const cancelled = new AbortController();
@@ -1170,6 +1191,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       );
     } finally {
       vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     }
   });
 
@@ -1766,6 +1788,37 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
           ],
         }),
       ).rejects.toThrow(/exposes workflow control/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("shows that it could not resolve an extension path and keeps the file error private", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-missing-extension");
+    const cwd = await makeTempDir("pi-agent-group-missing-extension-project");
+    await writeNativeFixtureConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    const missing = path.join(agentDir, "PRIVATE_PATH_MARKER", "extension.ts");
+    try {
+      const error = await runPiAgentGroup([{ ...request("missing-extension"), cwd }], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        behaviorExtensionPaths: [missing],
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PiAgentGroupError);
+      expect((error as Error).message).toBe(
+        "Pi agent group failed: Could not resolve Pi child extension path",
+      );
+      expect((error as PiAgentGroupError).detail).toMatch(/^ENOENT: .*PRIVATE_PATH_MARKER/u);
+      // The bridge sends the facts as visible text and the file error only as detail.
+      expect(describeAgentGroupFailure(error)).toEqual({
+        message: "Pi agent group failed: Could not resolve Pi child extension path",
+        agentId: "group",
+        code: "failed",
+        facts: "Could not resolve Pi child extension path",
+        detail: (error as PiAgentGroupError).detail,
+      });
     } finally {
       vi.unstubAllEnvs();
     }

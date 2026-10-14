@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
+import { createEphemeralCredentialStore, runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
 import {
   PiAgentGroupError,
   type PiAgentLifecycleEvent,
@@ -326,7 +326,7 @@ describe("headless pi agent group launcher", () => {
     expect(await fs.readdir(path.dirname(namedCausePath(error)))).toEqual(["cause.txt"]);
   });
 
-  it("shows its own validation text and hides a thrown SDK error, as the bridge reports them", async () => {
+  it("shows its own validation and loader text and hides foreign error text, as the bridge reports them", async () => {
     const signal = new AbortController().signal;
     // The bridge's own description of each error, from the real group runner.
     const reported = async (run: Promise<unknown>) =>
@@ -354,6 +354,27 @@ describe("headless pi agent group launcher", () => {
     const invalidError = await run(invalid);
     expect((invalidError as Error).message).toBe(
       `Pi agent group has an invalid request: Duplicate Pi agent id: same. complete cause: ${namedCausePath(invalidError)}`,
+    );
+    const loader = await reported(
+      (async () => {
+        // Pi Workflows' own loader sentence with a foreign filesystem error beneath it.
+        vi.stubEnv("PI_CODING_AGENT_DIR", await makeTempDir("agent-group-launcher-agent-dir"));
+        vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+          Object.assign(new Error("PRIVATE_FS_MARKER permission denied"), { code: "EACCES" }),
+        );
+        try {
+          return await createEphemeralCredentialStore(signal);
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      })(),
+    );
+    const loaderError = await run(loader);
+    expect((loaderError as Error).message).toBe(
+      `Pi agent group failed: Could not load Pi credentials for isolated agents. complete cause: ${namedCausePath(loaderError)}`,
+    );
+    expect(await namedCause(loaderError)).toBe(
+      "Pi agent group failed: Could not load Pi credentials for isolated agents\n\nPRIVATE_FS_MARKER permission denied\n",
     );
     const thrownError = await run(thrown);
     expect((thrownError as Error).message).toBe(

@@ -52,6 +52,8 @@ const RESERVED_EXTENSION_NAMES = new Set([
   "workflow-resume",
   "workflow-cancel",
 ]);
+const CREDENTIALS_LOAD_FAILURE = "Could not load Pi credentials for isolated agents";
+const MODELS_LOAD_FAILURE = "Could not load Pi model catalog for isolated agents";
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 type PiAgentEvent = Record<string, unknown>;
@@ -154,15 +156,12 @@ export async function createEphemeralCredentialStore(
   signal: AbortSignal,
 ): Promise<CredentialStore> {
   signal.throwIfAborted();
-  const authPath = path.join(getAgentDir(), "auth.json");
-  let source: unknown = {};
-  try {
-    source = JSON.parse(await fs.readFile(authPath, "utf8"));
-  } catch (error) {
-    if (!isMissingFile(error)) {
-      throw new Error("Could not load Pi credentials for isolated agents");
-    }
-  }
+  // A parse error can quote the file, and so a credential, so its text is not kept anywhere.
+  const source = await readAgentJson(
+    path.join(getAgentDir(), "auth.json"),
+    CREDENTIALS_LOAD_FAILURE,
+    false,
+  );
   const entries = parseCredentialEntries(source);
   const pending = new Map<string, Promise<Credential>>();
   const enqueue = (
@@ -213,12 +212,12 @@ export async function createEphemeralCredentialStore(
 
 function parseCredentialEntries(source: unknown): Map<string, StoredCredential> {
   if (source === null || typeof source !== "object" || Array.isArray(source)) {
-    throw new Error("Could not load Pi credentials for isolated agents");
+    throw loadFailure(CREDENTIALS_LOAD_FAILURE);
   }
   const entries = new Map<string, StoredCredential>();
   for (const [providerId, value] of Object.entries(source)) {
     if (!isStoredCredential(value)) {
-      throw new Error("Could not load Pi credentials for isolated agents");
+      throw loadFailure(CREDENTIALS_LOAD_FAILURE);
     }
     entries.set(providerId, cloneCredential(value)!);
   }
@@ -252,17 +251,46 @@ function isMissingFile(error: unknown): boolean {
   );
 }
 
+/**
+ * A failure of Pi Workflows' own loading. The fixed sentence is the message's facts. The text of
+ * an underlying filesystem or parser error is not Pi Workflows' own, so it is private detail.
+ */
+function loadFailure(facts: string, cause?: unknown): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "failed",
+    facts,
+    cause === undefined ? {} : { detail: errorMessage(cause) },
+  );
+}
+
+/** A JSON file in Pi's agent directory. A missing file reads as an empty object. */
+async function readAgentJson(
+  file: string,
+  failure: string,
+  keepParseError: boolean,
+): Promise<unknown> {
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) return {};
+    throw loadFailure(failure, error);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw loadFailure(failure, keepParseError ? error : undefined);
+  }
+}
+
 export async function createEphemeralModelStore(signal: AbortSignal): Promise<ModelStore> {
   signal.throwIfAborted();
-  const storePath = path.join(getAgentDir(), "models-store.json");
-  let source: unknown = {};
-  try {
-    source = JSON.parse(await fs.readFile(storePath, "utf8"));
-  } catch (error) {
-    if (!isMissingFile(error)) {
-      throw new Error("Could not load Pi model catalog for isolated agents");
-    }
-  }
+  const source = await readAgentJson(
+    path.join(getAgentDir(), "models-store.json"),
+    MODELS_LOAD_FAILURE,
+    true,
+  );
   const entries = parseModelStoreEntries(source);
   return {
     async read(providerId) {
@@ -283,12 +311,12 @@ export async function createEphemeralModelStore(signal: AbortSignal): Promise<Mo
 
 function parseModelStoreEntries(source: unknown): Map<string, StoredModelStoreEntry> {
   if (source === null || typeof source !== "object" || Array.isArray(source)) {
-    throw new Error("Could not load Pi model catalog for isolated agents");
+    throw loadFailure(MODELS_LOAD_FAILURE);
   }
   const entries = new Map<string, StoredModelStoreEntry>();
   for (const [providerId, value] of Object.entries(source)) {
     if (!isModelStoreEntry(value)) {
-      throw new Error("Could not load Pi model catalog for isolated agents");
+      throw loadFailure(MODELS_LOAD_FAILURE);
     }
     entries.set(providerId, structuredClone(value));
   }
@@ -632,8 +660,8 @@ async function canonicalPath(value: string, signal: AbortSignal): Promise<string
   signal.throwIfAborted();
   try {
     return await fs.realpath(path.resolve(value));
-  } catch {
-    throw new Error("Could not resolve Pi child extension path");
+  } catch (error) {
+    throw loadFailure("Could not resolve Pi child extension path", error);
   }
 }
 
