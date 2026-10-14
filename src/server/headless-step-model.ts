@@ -116,6 +116,8 @@ export function describeUnusableDefaultModel(
     `Headless pi cannot run workflow steps on the default model "${unusable.provider}/${unusable.model}" from Pi settings${describeSources(sources)}: ${unusable.reason}.`,
     `${instead}, so headless pi stopped before any model request.`,
     "Load the provider's extension with `PI_WORKFLOWS_HEADLESS_EXTENSIONS=/absolute/path/to/extension` or `pi-workflows server run -- -e /absolute/path/to/extension`, choose a model with `pi-workflows server run -- --provider <provider> --model <model>`, or change the default.",
+    // A shared server that started before the fix keeps its old list and arguments.
+    "The workflow server reads `PI_WORKFLOWS_HEADLESS_EXTENSIONS` and its extra Pi arguments only when it starts, so restart it with `pi-workflows server stop` after a change; `pi-workflows server status` shows the loaded `headlessExtensions`.",
   ].join(" ");
 }
 
