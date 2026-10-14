@@ -64,13 +64,21 @@ export function packagedExtensionPath(moduleUrl: string, name: string): string |
 /**
  * Reject a relative extension path in the Pi arguments that a server adds to every headless
  * child. Each child starts in its run's project directory, so Pi would resolve a relative
- * path there and could load code from every project. Pi reads no options after `--`, so
- * neither does this check.
+ * path there and could load code from every project. Every `-e` and `--extension` in the
+ * list is checked, wherever it is.
+ *
+ * A `--` is rejected as well. Pi gives it to an option before it that takes a value, such as
+ * `--model --`, and then keeps reading options, so `--` cannot mark where checking may stop.
+ * In RPC mode, headless pi ignores the messages that a real `--` would start.
  */
 export function assertAbsoluteExtensionPaths(piArgs: readonly string[]): void {
   for (let index = 0; index < piArgs.length; index += 1) {
     const flag = piArgs[index] as string;
-    if (flag === "--") return;
+    if (flag === "--") {
+      throw new Error(
+        "Extra Pi arguments cannot contain `--`. Pi can read it as the value of the option before it and then load extensions named after it, and headless pi takes no messages. Remove it.",
+      );
+    }
     if (!EXTENSION_FLAGS.has(flag)) continue;
     index += 1;
     const source = piArgs[index];

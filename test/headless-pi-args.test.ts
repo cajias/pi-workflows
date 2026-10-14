@@ -57,11 +57,20 @@ describe("assertAbsoluteExtensionPaths", () => {
     );
   });
 
-  it("stops at `--`, after which Pi reads only messages", () => {
-    expect(() => assertAbsoluteExtensionPaths(["--", "-e", "relative.ts"])).not.toThrow();
+  it("rejects every `--`, which Pi can read as the value of the option before it", () => {
+    const message =
+      "Extra Pi arguments cannot contain `--`. Pi can read it as the value of the option before it and then load extensions named after it, and headless pi takes no messages. Remove it.";
+    // Pi 1.1.0 sets the model to `--` here and then loads ./rel.ts from the project directory.
+    expect(() => assertAbsoluteExtensionPaths(["--model", "--", "-e", "rel.ts"])).toThrow(message);
+    expect(() => assertAbsoluteExtensionPaths(["--"])).toThrow(message);
+    expect(() => assertAbsoluteExtensionPaths(["--", "-e", "/opt/a.ts"])).toThrow(message);
     expect(() =>
-      assertAbsoluteExtensionPaths(["-e", "/opt/a.ts", "--", "--extension", "./b.ts"]),
-    ).not.toThrow();
+      assertAbsoluteExtensionPaths(["-e", "/opt/a.ts", "--provider", "p", "--", "hello"]),
+    ).toThrow(message);
+    // As an extension source, `--` is a relative path.
+    expect(() => assertAbsoluteExtensionPaths(["-e", "--"])).toThrow(
+      `Extra Pi argument \`-e --\` ${RELATIVE}`,
+    );
   });
 
   it("leaves `=` forms to Pi, which reports them as unknown options", () => {
