@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -7,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WorkflowClient } from "../../src/client/client.js";
 import { HeadlessPiProcess, type HeadlessPiExit } from "../../src/server/headless-pi.js";
+import { serverLockPath } from "../../src/server/lock.js";
 import { workflowStatePath } from "../../src/state/database.js";
 import { WorkflowRunQueueStore } from "../../src/workflows/queue.js";
 import { WorkflowRunStore } from "../../src/workflows/store.js";
@@ -19,6 +22,7 @@ const PI_ENTRY =
 const TSX_LOADER = createRequire(path.join(REPO_ROOT, "src", "client", "client.ts")).resolve("tsx");
 const CLI = path.join(REPO_ROOT, "src", "viewer", "cli.ts");
 const RPC_BRIDGE = path.join(REPO_ROOT, "src", "server", "rpc-bridge.ts");
+const EXTENSION = path.join(REPO_ROOT, "src", "extension", "index.ts");
 const PROVIDER = "fixture-headless";
 const MODEL = "fixture-model";
 
@@ -81,14 +85,64 @@ let providerExtension: string;
 let piCli: string;
 let bin: string;
 
-/** The environment of the server and every headless child: a private home and agent dir. */
-function piEnvironment(): Record<string, string> {
+/** The environment of Pi, the server, and every headless child: a private home and agent dir. */
+function piEnvironment(homeDir = home): Record<string, string> {
   return {
-    HOME: home,
-    PI_CODING_AGENT_DIR: path.join(home, ".pi", "agent"),
+    HOME: homeDir,
+    PI_CODING_AGENT_DIR: path.join(homeDir, ".pi", "agent"),
     PI_OFFLINE: "1",
     NO_COLOR: "1",
   };
+}
+
+/** Start the one-step headless workflow on a running server and return the step output. */
+async function runProviderStep(
+  databasePath: string,
+  runId: string,
+  diagnostics: () => string,
+): Promise<unknown> {
+  const client = new WorkflowClient({ databasePath });
+  try {
+    const workflowPath = path.join(project, "headless-provider.workflow.ts");
+    const resolved = await client.resolveWorkflow({ cwd: project, workflowRef: workflowPath });
+    const started = await client.request({
+      operation: "run.start",
+      runId,
+      payload: {
+        projectPath: project,
+        workflowName: resolved.workflowName,
+        workflowSourceRef: resolved.workflowSourceRef,
+        workflowSource: resolved.workflowSource,
+        definitionDigest: resolved.definitionDigest,
+        definitionSnapshot: resolved.definitionSnapshot,
+        input: {},
+        launchOptions: {},
+        originSessionId: "headless-provider-session",
+        executionMode: "headless",
+      },
+    });
+    expect(started.outcome, started.error).toBe("accepted");
+  } finally {
+    await client.close();
+  }
+  let status: string | undefined;
+  for (const deadline = Date.now() + 60_000; Date.now() < deadline;) {
+    const queue = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
+    try {
+      status = queue.getWorkflowRun(runId)?.status;
+    } finally {
+      queue.close();
+    }
+    if (status === "done" || status === "failed" || status === "cancelled") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(status, diagnostics()).toBe("done");
+  const store = new WorkflowRunStore(databasePath, { readOnly: true });
+  try {
+    return store.readRun(runId)?.state.steps.find((step) => step.nodeId === "ask")?.output;
+  } finally {
+    store.close();
+  }
 }
 
 beforeAll(async () => {
@@ -165,51 +219,9 @@ describe("server Pi arguments that load a provider extension into headless pi", 
     });
     expect(output).toContain(`[server] headless pi from PATH: ${piCli} run by ${process.execPath}`);
 
-    const databasePath = workflowStatePath(home);
-    const client = new WorkflowClient({ databasePath });
-    const runId = "headless-provider-run";
-    try {
-      const workflowPath = path.join(project, "headless-provider.workflow.ts");
-      const resolved = await client.resolveWorkflow({ cwd: project, workflowRef: workflowPath });
-      const started = await client.request({
-        operation: "run.start",
-        runId,
-        payload: {
-          projectPath: project,
-          workflowName: resolved.workflowName,
-          workflowSourceRef: resolved.workflowSourceRef,
-          workflowSource: resolved.workflowSource,
-          definitionDigest: resolved.definitionDigest,
-          definitionSnapshot: resolved.definitionSnapshot,
-          input: {},
-          launchOptions: {},
-          originSessionId: "headless-provider-session",
-          executionMode: "headless",
-        },
-      });
-      expect(started.outcome, started.error).toBe("accepted");
-    } finally {
-      await client.close();
-    }
-    let status: string | undefined;
-    for (const deadline = Date.now() + 60_000; Date.now() < deadline;) {
-      const queue = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
-      try {
-        status = queue.getWorkflowRun(runId)?.status;
-      } finally {
-        queue.close();
-      }
-      if (status === "done" || status === "failed" || status === "cancelled") break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    expect(status, output).toBe("done");
-    const store = new WorkflowRunStore(databasePath, { readOnly: true });
-    try {
-      const ask = store.readRun(runId)?.state.steps.find((step) => step.nodeId === "ask");
-      expect(ask?.output).toEqual({ provider: PROVIDER, model: MODEL });
-    } finally {
-      store.close();
-    }
+    expect(
+      await runProviderStep(workflowStatePath(home), "headless-provider-run", () => output),
+    ).toEqual({ provider: PROVIDER, model: MODEL });
   });
 
   it("cannot resolve the extension's provider without the extension", async () => {
@@ -240,5 +252,105 @@ describe("server Pi arguments that load a provider extension into headless pi", 
     }
     expect(exit?.code).toBe(1);
     expect(stderr.join("\n")).toContain(`Unknown provider "${PROVIDER}"`);
+  });
+});
+
+describe("opt-in headless extensions of a server that a Pi session starts", () => {
+  let sessionHome: string;
+  let pi: ChildProcess | undefined;
+  let piOutput = "";
+
+  beforeAll(async () => {
+    sessionHome = path.join(root, "session-home");
+    const agentDir = path.join(sessionHome, ".pi", "agent");
+    await fs.mkdir(agentDir, { recursive: true });
+    // Headless children get no Pi arguments from this server, so the settings select the
+    // provider, which only the listed extension registers.
+    await fs.writeFile(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: PROVIDER, defaultModel: MODEL }),
+    );
+  });
+
+  afterAll(async () => {
+    if (pi !== undefined && pi.exitCode === null && pi.signalCode === null) {
+      pi.kill("SIGTERM");
+      await once(pi, "exit");
+    }
+    const databasePath = workflowStatePath(sessionHome);
+    const client = new WorkflowClient({ databasePath });
+    try {
+      await client.request({ operation: "server.stop" });
+    } catch {
+      // The workflow server is already stopped.
+    } finally {
+      await client.close();
+    }
+    await waitUntil(() => !existsSync(serverLockPath(databasePath)), 15_000);
+  });
+
+  it("runs a headless step on a provider from the listed extension", async () => {
+    // The Pi session loads the provider itself only to start on its default model. The
+    // server that its extension starts inherits this environment, opt-in included.
+    pi = spawn(
+      process.execPath,
+      [
+        PI_ENTRY,
+        "--mode",
+        "rpc",
+        "--session-id",
+        randomUUID(),
+        "--session-dir",
+        path.join(sessionHome, "sessions"),
+        "--no-skills",
+        "--no-themes",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--offline",
+        "-e",
+        EXTENSION,
+        "-e",
+        providerExtension,
+      ],
+      {
+        cwd: project,
+        env: {
+          ...process.env,
+          ...piEnvironment(sessionHome),
+          PI_WORKFLOWS_HEADLESS_EXTENSIONS: providerExtension,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    pi.stdout?.on("data", (chunk: Buffer) => (piOutput += chunk.toString("utf8")));
+    pi.stderr?.on("data", (chunk: Buffer) => (piOutput += chunk.toString("utf8")));
+
+    const databasePath = workflowStatePath(sessionHome);
+    let status: Record<string, unknown> | undefined;
+    for (const deadline = Date.now() + 30_000; status === undefined && Date.now() < deadline;) {
+      const client = new WorkflowClient({ databasePath });
+      try {
+        status = (await client.request({ operation: "server.status" })).receipt as Record<
+          string,
+          unknown
+        >;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } finally {
+        await client.close();
+      }
+    }
+    expect(status, piOutput).toBeDefined();
+    expect(status?.headlessExtensions).toEqual({ paths: [providerExtension] });
+    expect(status?.headlessPi).toEqual({
+      source: "session",
+      kind: "node",
+      node: process.execPath,
+      cli: piCli,
+    });
+    expect(await runProviderStep(databasePath, "headless-extensions-run", () => piOutput)).toEqual({
+      provider: PROVIDER,
+      model: MODEL,
+    });
   });
 });

@@ -88,15 +88,26 @@ function runningProcessFacts(): PiProcessFacts {
 
 /** True when `cli` is a `bin` entry of the nearest package, and that package configures pi. */
 function isPiCliScript(cli: string): boolean {
-  for (let directory = path.dirname(cli); ; directory = path.dirname(directory)) {
-    const manifest = readManifest(path.join(directory, "package.json"));
-    if (manifest !== undefined) {
-      return (
-        isRecord(manifest.piConfig) &&
-        binScripts(manifest.bin).some((bin) => realFile(path.resolve(directory, bin)) === cli)
-      );
-    }
-    if (path.dirname(directory) === directory) return false;
+  const nearest = nearestPackageManifest(path.dirname(cli));
+  if (nearest === undefined) return false;
+  const { directory, manifest } = nearest;
+  return (
+    isRecord(manifest.piConfig) &&
+    binScripts(manifest.bin).some((bin) => realFile(path.resolve(directory, bin)) === cli)
+  );
+}
+
+/**
+ * The first `package.json` in `directory` or above it, with the directory that holds it. An
+ * unreadable manifest counts as found and parses as `{}`.
+ */
+export function nearestPackageManifest(
+  directory: string,
+): { directory: string; manifest: Record<string, unknown> } | undefined {
+  for (let current = directory; ; current = path.dirname(current)) {
+    const manifest = readManifest(path.join(current, "package.json"));
+    if (manifest !== undefined) return { directory: current, manifest };
+    if (path.dirname(current) === current) return undefined;
   }
 }
 

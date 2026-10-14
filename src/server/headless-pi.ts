@@ -4,6 +4,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
+import { availableHeadlessExtensions, type HeadlessExtensions } from "./headless-extensions.js";
 
 const DEFAULT_ABORT_GRACE_MS = 3_000;
 const RESTART_HINT = "Restart the workflow server with `pi-workflows server stop` to pin pi again";
@@ -30,6 +31,8 @@ export type HeadlessPiOptions = {
   abortGraceMs?: number;
   /** The pinned pi. Nothing is looked up on `PATH` when a child starts. */
   pi: HeadlessPiLaunch;
+  /** Opt-in extensions that load after the bridge; none unless the server lists some. */
+  extensions?: HeadlessExtensions;
   /** Extra environment for the child; the server's environment is inherited. */
   env?: Record<string, string>;
   /** Extra pi arguments, for example a model override. */
@@ -142,6 +145,17 @@ export function availableHeadlessPi(pi: HeadlessPiLaunch): HeadlessPiCommand {
   return pi;
 }
 
+/** The pinned pi and the listed extensions, checked before each start. */
+export function availableHeadlessLaunch(options: HeadlessPiOptions): {
+  pi: HeadlessPiCommand;
+  extensions: string[];
+} {
+  return {
+    pi: availableHeadlessPi(options.pi),
+    extensions: availableHeadlessExtensions(options.extensions ?? { paths: [] }),
+  };
+}
+
 function isFile(file: string): boolean {
   try {
     return fs.statSync(file).isFile();
@@ -187,7 +201,8 @@ export class HeadlessPiProcess {
   }
 
   async start(): Promise<void> {
-    const launch = headlessPiSpawnArgs(availableHeadlessPi(this.options.pi), [
+    const available = availableHeadlessLaunch(this.options);
+    const launch = headlessPiSpawnArgs(available.pi, [
       "--mode",
       "rpc",
       "--no-session",
@@ -197,6 +212,7 @@ export class HeadlessPiProcess {
       "--no-extensions",
       "-e",
       this.extensionPath,
+      ...available.extensions.flatMap((extension) => ["-e", extension]),
       ...(this.options.piArgs ?? []),
     ]);
     const child = spawn(launch.command, launch.args, {

@@ -9,24 +9,33 @@ import type { JsonValue } from "../src/state/json.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
-async function writeComputeWorkflow(cwd: string): Promise<string> {
-  const workflowPath = path.join(cwd, "compute.workflow.ts");
+const WORKFLOWS = JSON.stringify(path.resolve("src/workflows/index.ts"));
+const COMPUTE_NODE = "work: compute({ run: () => ({ done: true }) })";
+const AGENT_NODE = 'work: agent({ prompt: () => "Return a result." })';
+
+async function writeWorkflow(cwd: string, node: string): Promise<string> {
+  const workflowPath = path.join(cwd, "headless.workflow.ts");
   await fs.writeFile(
     workflowPath,
-    `import { compute, defineWorkflow } from ${JSON.stringify(path.resolve("src/workflows/index.ts"))};
+    `import { agent, compute, defineWorkflow } from ${WORKFLOWS};
 export default defineWorkflow({
-  name: "headless-pi-retry",
+  name: "headless-pi-server",
   startAt: "work",
-  nodes: { work: compute({ run: () => ({ done: true }) }) },
+  nodes: { ${node} },
   edges: [],
 });\n`,
   );
   return workflowPath;
 }
 
-/** Start one code-only run, which launches a workflow runner, and wait until it finishes. */
-async function runOnce(databasePath: string, cwd: string, runId: string): Promise<void> {
-  const workflowPath = await writeComputeWorkflow(cwd);
+/** Start one headless run, which launches a workflow runner, and wait until it finishes. */
+async function runOnce(
+  databasePath: string,
+  cwd: string,
+  runId: string,
+  node = COMPUTE_NODE,
+): Promise<void> {
+  const workflowPath = await writeWorkflow(cwd, node);
   const client = new WorkflowClient({ databasePath });
   try {
     const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
@@ -162,6 +171,62 @@ describe("workflow server headless pi pin", () => {
       // The retry already happened; the pin changes again only after a restart.
       expect((await statusOf(databasePath)).headlessPi).toMatchObject({ kind: "unresolved" });
       expect(logs.filter((line) => line.includes("after a retry"))).toHaveLength(1);
+    });
+  });
+
+  it("reports no headless extensions unless the opt-in lists some", async () => {
+    await withServer({}, async (databasePath, logs) => {
+      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ paths: [] });
+      expect(logs.some((line) => line.startsWith("headless extensions"))).toBe(false);
+    });
+  });
+
+  it("reports why listed headless extensions are invalid and still starts", async () => {
+    const env = { PI_WORKFLOWS_HEADLESS_EXTENSIONS: "relative/provider.ts" };
+    await withServer({ env }, async (databasePath, logs) => {
+      const error =
+        'PI_WORKFLOWS_HEADLESS_EXTENSIONS is invalid: "relative/provider.ts" is not an absolute path. Fix it, then restart the workflow server with `pi-workflows server stop`';
+      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ error });
+      expect(logs).toContain(`headless extensions unavailable: ${error}`);
+    });
+  });
+
+  it("hands listed headless extensions through the runner to each headless child", async () => {
+    const root = await makeTempDir("server-headless-extensions");
+    const extension = path.join(root, "provider.ts");
+    await fs.writeFile(extension, "export default function provider() {}\n");
+    const argvFile = path.join(root, "argv.json");
+    // A pi that records its arguments and submits the step it is given.
+    const fakePi = path.join(root, "fake-pi.cjs");
+    await fs.writeFile(
+      fakePi,
+      `const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const contract = JSON.parse(line).message.split("\\n").find((text) => text.startsWith('{"action": "submit"'));
+  if (contract === undefined) return;
+  const action = JSON.parse(contract.replace("<your result>", "null"));
+  process.stderr.write("PI_WORKFLOWS_STEP_SUBMISSION " + JSON.stringify({ ...action, output: { done: true } }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+    );
+    const options = {
+      headlessPi: { kind: "node", node: process.execPath, cli: fakePi } as const,
+      env: { PI_WORKFLOWS_HEADLESS_EXTENSIONS: extension },
+      claimPollMs: 10,
+    };
+    await withServer(options, async (databasePath, logs) => {
+      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ paths: [extension] });
+      expect(logs).toContain(
+        `headless extensions from PI_WORKFLOWS_HEADLESS_EXTENSIONS: ${extension}`,
+      );
+      await runOnce(databasePath, root, "headless-extensions-run", AGENT_NODE);
+      const argv = JSON.parse(await fs.readFile(argvFile, "utf8")) as string[];
+      expect(argv.slice(0, 5)).toEqual(["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
+      expect(path.basename(argv[5] ?? "")).toMatch(/^rpc-bridge\.(?:ts|js)$/);
+      expect(argv.slice(6)).toEqual(["-e", extension]);
     });
   });
 

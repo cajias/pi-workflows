@@ -16,7 +16,7 @@ import {
   type AgentGroupRunOptions,
 } from "./agent-group-protocol.js";
 import {
-  availableHeadlessPi,
+  availableHeadlessLaunch,
   describeHeadlessPiExit,
   HeadlessPiProcess,
   packagedExtensionPath,
@@ -109,7 +109,7 @@ export class HeadlessPiAgentGroupLauncher {
       );
     }
     try {
-      availableHeadlessPi(this.options.pi);
+      availableHeadlessLaunch(this.options);
     } catch (error) {
       // The reason is Pi Workflows' own text with paths, so it follows the cause in full.
       throw new PiAgentGroupError(

@@ -514,6 +514,37 @@ describe("headless pi agent group launcher", () => {
     await expect(fs.access(setup.argvFile)).rejects.toThrow();
   });
 
+  it("loads listed headless extensions into the group's host after the bridge", async () => {
+    const setup = await harness("success");
+    const extension = path.join(setup.dir, "provider.ts");
+    await fs.writeFile(extension, "export default function provider() {}\n");
+    await new HeadlessPiAgentGroupLauncher(
+      { ...setup.options, extensions: { paths: [extension] } },
+      setup.settings,
+    ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    const launched = JSON.parse(await fs.readFile(setup.argvFile, "utf8")) as { argv: string[] };
+    expect(path.basename(launched.argv[5] ?? "")).toMatch(/^agent-group-bridge\.(?:ts|js)$/);
+    expect(launched.argv.slice(6)).toEqual(["-e", extension, "--model", "fixture/model"]);
+  });
+
+  it("starts no group host when the listed headless extensions are invalid", async () => {
+    const setup = await harness("success");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        extensions: { error: "PI_WORKFLOWS_HEADLESS_EXTENSIONS is invalid: x." },
+      },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      "Pi agent group could not run: headless pi is unavailable. PI_WORKFLOWS_HEADLESS_EXTENSIONS is invalid: x.",
+    );
+    await expect(fs.access(setup.argvFile)).rejects.toThrow();
+  });
+
   it("names the complete log path after a long pi rejection, beyond the message cap", async () => {
     const setup = await harness("rejected-long");
     // A log directory whose path alone is longer than the 2,000-character cause cap.

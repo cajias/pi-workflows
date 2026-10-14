@@ -24,6 +24,7 @@ import type {
   WorkflowSource,
 } from "../workflows/types.js";
 import { HeadlessPiAgentGroupLauncher } from "./agent-group-launcher.js";
+import type { HeadlessExtensions } from "./headless-extensions.js";
 import type { HeadlessPiLaunch, HeadlessPiOptions } from "./headless-pi.js";
 import { RpcStepExecutor } from "./rpc-executor.js";
 import type { WorkflowRunnerLaunchEnvelope } from "./state.js";
@@ -52,6 +53,8 @@ type WorkflowRunnerBootstrap = {
   piArgs?: string[];
   /** The pi that the server pinned at its start. */
   headlessPi: HeadlessPiLaunch;
+  /** The opt-in extensions that the server read at its start. */
+  headlessExtensions: HeadlessExtensions;
   candidateInteraction?: {
     requestId: string;
     attemptId: string;
@@ -445,6 +448,7 @@ function headlessPiOptions(
   return {
     cwd: launch.projectPath,
     pi: bootstrap.headlessPi,
+    extensions: bootstrap.headlessExtensions,
     processGroup: "own",
     abortGraceMs: 1_000,
     registry: {

@@ -110,6 +110,11 @@ import {
   type ChannelEffectRecord,
 } from "./channel-effects.js";
 import { ChannelAdapterSupervisor } from "./channel-supervisor.js";
+import {
+  HEADLESS_EXTENSIONS_ENV,
+  readHeadlessExtensions,
+  type HeadlessExtensions,
+} from "./headless-extensions.js";
 import { pinHeadlessPi, type HeadlessPiPin } from "./headless-pi-resolution.js";
 import { describeHeadlessPi, type HeadlessPiLaunch } from "./headless-pi.js";
 import {
@@ -293,6 +298,8 @@ export class WorkflowServer {
   private headlessPi: HeadlessPiPin | null = null;
   /** The one retry of a pin that was unresolved at start. Runners wait for it. */
   private headlessPiRetry: Promise<void> | null = null;
+  /** Opt-in extensions for every headless child, read once at start. */
+  private headlessExtensions: HeadlessExtensions = { paths: [] };
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private viewTimer: ReturnType<typeof setInterval> | null = null;
@@ -386,6 +393,7 @@ export class WorkflowServer {
     await assertNoServingServer(this.lockPath, { socketPath: this.socketPath });
     this.headlessPiRetry = null;
     this.headlessPi = await pinHeadlessPi(this.options.headlessPi, this.headlessPiEnvironment());
+    this.headlessExtensions = readHeadlessExtensions(this.headlessPiEnvironment());
     try {
       const previousServer = this.serverState.serverStatus();
       this.claim = this.serverState.acquireServer({
@@ -407,6 +415,7 @@ export class WorkflowServer {
       this.started = true;
       this.log(`ready on ${this.socketPath} at epoch ${this.claim.epoch}`);
       this.logHeadlessPi(this.headlessPi, "");
+      this.logHeadlessExtensions();
       this.requestAutomaticStatePrune();
       void this.expireTimedOutDecision().finally(() => this.resumeAutomaticStatePruneIfDue());
       void this.claimOne().finally(() => this.resumeAutomaticStatePruneIfDue());
@@ -2270,6 +2279,16 @@ export class WorkflowServer {
     this.log(`headless pi from ${source}${note}: ${describeHeadlessPi(pin.pi)}`);
   }
 
+  private logHeadlessExtensions(): void {
+    const extensions = this.headlessExtensions;
+    if ("error" in extensions) this.log(`headless extensions unavailable: ${extensions.error}`);
+    else if (extensions.paths.length > 0) {
+      this.log(
+        `headless extensions from ${HEADLESS_EXTENSIONS_ENV}: ${extensions.paths.join(", ")}`,
+      );
+    }
+  }
+
   /**
    * Resolve a pin that was unresolved at start once more, when the next runner launches. A
    * Node probe can fail for a passing reason, such as a slow version manager under load, and
@@ -2337,6 +2356,7 @@ export class WorkflowServer {
       ...(this.headlessPi === null
         ? {}
         : { headlessPi: { source: this.headlessPi.source, ...this.headlessPi.pi } }),
+      headlessExtensions: this.headlessExtensions,
       lifecycleContradictions: violations.filter((item) => item.code === "queueState").length,
       stateViolations: violations,
     };
@@ -4356,6 +4376,7 @@ export class WorkflowServer {
           ...(candidateInteraction === undefined ? {} : { candidateInteraction }),
           ...(this.options.piArgs === undefined ? {} : { piArgs: this.options.piArgs }),
           headlessPi: this.pinnedHeadlessPi(),
+          headlessExtensions: this.headlessExtensions,
         } as JsonValue,
         undefined,
         revision,
