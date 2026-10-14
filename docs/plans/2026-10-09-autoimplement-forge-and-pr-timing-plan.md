@@ -1736,6 +1736,10 @@ These are out of scope for this plan.
     the latest 5 minutes after the refresh starts. Private marker files list each refresh in
     `server status` as `oauthRefreshes`. The group fails closed on a missing or changed entry, a
     lock or store failure, an unsupported Pi installation, and a marker failure.
+  - Final review fixes in `cbe3608` and `2185e96`: the docs say that a cancelled headless group
+    reports after its usual settle wait while the refresh process finishes on its own, and a
+    refresh process that fails before Pi could refresh is named as such instead of asking the
+    user to sign in again.
 - F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
@@ -1797,6 +1801,9 @@ These are out of scope for this plan.
     - `state status` reports the count and oldest age of undelivered terminal messages, and
       `state verify` lists them; both only report;
     - verification scripts must use an isolated workflow server.
+  - Final review fix in `5d5b3bd`: a scratch-database verification script also needs a scratch
+    `PI_WORKFLOWS_CONFIG_DIR`, so its server cannot load the real decision channels and
+    credentials.
 - F34: Remove the two stale terminal workflow messages from the live state DB in a maintenance
   window.
   - Deferred by the human. It needs explicit approval before any run against the live state, and
