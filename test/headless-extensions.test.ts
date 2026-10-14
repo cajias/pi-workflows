@@ -33,12 +33,46 @@ describe("readHeadlessExtensions", () => {
     expect(readHeadlessExtensions(listed(""))).toEqual({ paths: [] });
   });
 
-  it("accepts absolute extension files and package directories", async () => {
+  it("accepts absolute extension files", async () => {
     const file = await extensionPackage("@fixture/provider");
-    const directory = await extensionPackage("@fixture/other");
-    const env = listed(file.extension, "", `${directory.root}${path.sep}.${path.sep}`);
-    expect(readHeadlessExtensions(env)).toEqual({
-      paths: [file.extension, `${directory.root}${path.sep}`],
+    const other = await extensionPackage("@fixture/other");
+    const unnormalized = `${path.dirname(other.extension)}${path.sep}.${path.sep}provider.ts`;
+    expect(readHeadlessExtensions(listed(file.extension, "", unnormalized))).toEqual({
+      paths: [file.extension, other.extension],
+    });
+  });
+
+  it("refuses a directory, which Pi would resolve like a package", async () => {
+    const directory = (entry: string) =>
+      `${HEADLESS_EXTENSIONS_ENV} is invalid: ${entry} is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts. Fix it, ${RESTART}`;
+    // A plain provider package directory.
+    const plain = await extensionPackage("@fixture/provider");
+    expect(readHeadlessExtensions(listed(plain.root))).toEqual({ error: directory(plain.root) });
+    // A directory of extensions that holds a pi-workflows checkout, as ~/.pi/agent/extensions can.
+    const extensions = await makeTempDir("headless-extension-dir");
+    await fs.symlink(path.resolve("."), path.join(extensions, "pi-workflows"));
+    expect(readHeadlessExtensions(listed(extensions))).toEqual({ error: directory(extensions) });
+    // A wrapper package whose manifest points into pi-workflows.
+    const wrapper = await extensionPackage("@fixture/wrapper");
+    await fs.writeFile(
+      path.join(wrapper.root, "package.json"),
+      JSON.stringify({
+        name: "@fixture/wrapper",
+        pi: { extensions: [path.resolve("src", "extension", "index.ts")] },
+      }),
+    );
+    expect(readHeadlessExtensions(listed(wrapper.root))).toEqual({
+      error: directory(wrapper.root),
+    });
+    // This package's own root.
+    expect(readHeadlessExtensions(listed(path.resolve(".")))).toEqual({
+      error: directory(path.resolve(".")),
+    });
+  });
+
+  it("refuses an entry that is not a regular file", async () => {
+    expect(readHeadlessExtensions(listed("/dev/null"))).toMatchObject({
+      error: expect.stringContaining("/dev/null is not a regular file"),
     });
   });
 
@@ -59,18 +93,20 @@ describe("readHeadlessExtensions", () => {
   it("refuses pi-workflows itself", async () => {
     const refusal =
       "is part of pi-workflows, whose extension must not load beside the headless bridge";
-    // This package's extension, its root, and a symlink into it.
+    // This package's extension, and a symlink to it.
     const own = path.resolve("src", "extension", "index.ts");
     const link = path.join(await makeTempDir("headless-extension-link"), "extension.ts");
     await fs.symlink(own, link);
-    for (const entry of [own, path.resolve("."), link]) {
+    for (const entry of [own, link]) {
       expect(readHeadlessExtensions(listed(entry))).toMatchObject({
         error: expect.stringContaining(`${entry} ${refusal}`),
       });
     }
-    // Another installed copy, found by its package name.
+    // Another installed copy, found by its package name, and a symlink into it.
     const copy = await extensionPackage("@osolmaz/pi-workflows");
-    for (const entry of [copy.extension, copy.root]) {
+    const copyLink = path.join(await makeTempDir("headless-extension-copy-link"), "provider.ts");
+    await fs.symlink(copy.extension, copyLink);
+    for (const entry of [copy.extension, copyLink]) {
       expect(readHeadlessExtensions(listed(entry))).toMatchObject({
         error: expect.stringContaining(`${entry} ${refusal}`),
       });
@@ -122,7 +158,7 @@ describe("headless pi with listed extensions", () => {
   it("loads each listed extension after the bridge and before the server's Pi arguments", async () => {
     const one = await extensionPackage();
     const two = await extensionPackage();
-    const run = await launch({ paths: [one.extension, two.root] });
+    const run = await launch({ paths: [one.extension, two.extension] });
     await run.child.start();
     try {
       await waitUntil(() => run.exited() !== undefined, 10_000);
@@ -139,7 +175,7 @@ describe("headless pi with listed extensions", () => {
       "-e",
       one.extension,
       "-e",
-      two.root,
+      two.extension,
       "--model",
       "fixture",
     ]);

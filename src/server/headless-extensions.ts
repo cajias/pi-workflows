@@ -15,10 +15,12 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 
 /**
  * Read the opt-in list once, at server start. Entries are separated by `path.delimiter`, and
- * empty entries are skipped. Each entry must be an absolute path that exists and is not part
- * of pi-workflows, because the pi-workflows extension would compete with the bridge. A single
- * bad entry makes the whole list invalid: children then fail instead of running without an
- * extension that the operator asked for.
+ * empty entries are skipped. Each entry must be the absolute path of an extension file that
+ * is not part of pi-workflows, because the pi-workflows extension would compete with the
+ * bridge. A directory is refused: Pi would resolve it like a package and could load other
+ * files, including pi-workflows, plus skills, prompts, and themes. A single bad entry makes
+ * the whole list invalid: children then fail instead of running without an extension that
+ * the operator asked for.
  */
 export function readHeadlessExtensions(env: NodeJS.ProcessEnv): HeadlessExtensions {
   const paths: string[] = [];
@@ -55,6 +57,11 @@ function extensionProblem(entry: string): string | undefined {
   } catch {
     return `${entry} does not exist`;
   }
+  const stat = fs.statSync(real);
+  if (stat.isDirectory()) {
+    return `${entry} is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts`;
+  }
+  if (!stat.isFile()) return `${entry} is not a regular file`;
   if (isPiWorkflows(real)) {
     return `${entry} is part of pi-workflows, whose extension must not load beside the headless bridge`;
   }
@@ -68,8 +75,7 @@ function isPiWorkflows(real: string): boolean {
   const outside =
     relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
   if (!outside) return true;
-  const start = fs.statSync(real).isDirectory() ? real : path.dirname(real);
-  const name = nearestPackageManifest(start)?.manifest.name;
+  const name = nearestPackageManifest(path.dirname(real))?.manifest.name;
   return name !== undefined && name === nearestPackageManifest(root)?.manifest.name;
 }
 
