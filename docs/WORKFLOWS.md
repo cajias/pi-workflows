@@ -17,6 +17,22 @@ session whose reservation is taken fails with the identity of the active run;
 wait for that run, inspect it, or cancel it first. A headless run does not take
 the session reservation, so it can run beside an interactive run.
 
+An interactive run starts only from its live origin Pi session. The run sends
+its steps and its terminal result to that session, so the workflow server
+accepts an interactive `run.start` only with the session's current coordinator
+authority: the `targetSessionId` and `coordinatorEpoch` of the connection that
+owns the session and has reported its branch. `targetSessionId` must equal
+`originSessionId`. The server checks that authority before it looks up an
+earlier receipt, so a retried start also needs the live session. A start from
+another client, from another session, or for a session that never connected is
+rejected and creates no run. Without this check, such a start would create a
+terminal message that no session can receive; the message would stay pending
+and keep its run from retention. The extension sends its session's authority
+with every start. When the session is still connecting or reporting its branch,
+the start waits up to 15 seconds for it and then fails with `Workflow session
+coordinator is not ready`. A headless start (`executionMode: "headless"`) needs
+no Pi session and carries no session authority.
+
 Resume uses the run's original source and graph, including ordinary workflows
 without included workflows. Source and graph checks run before any durable
 mutation. `WorkflowEngine.resumeRun` has no `force` option. Restore the original

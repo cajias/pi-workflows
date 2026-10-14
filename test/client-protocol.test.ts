@@ -187,6 +187,7 @@ describe("client protocol fixtures", () => {
     "checkpoint.answer",
     "decision.answer",
     "run.restart",
+    "run.start",
   ] as const)(
     "%s fingerprints durable response identity, not the connection epoch",
     (operation) => {

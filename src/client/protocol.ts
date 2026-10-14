@@ -186,6 +186,7 @@ export function clientRequestFingerprint(request: ClientRequest): Buffer {
     "checkpoint.answer",
     "decision.answer",
     "run.restart",
+    "run.start",
   ].includes(request.operation);
   const payload =
     sessionResponse &&

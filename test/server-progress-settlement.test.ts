@@ -7,7 +7,7 @@ import { WorkflowServer } from "../src/server/server.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { WorkflowRunStore } from "../src/workflows/store.js";
 import type { WorkflowTraceEvent, WorkflowUpdateRecord } from "../src/workflows/types.js";
-import { makeTempDir, waitUntil } from "./helpers.js";
+import { makeTempDir, requestInteractiveStart, waitUntil } from "./helpers.js";
 
 const SESSION_ID = "cancel-progress-session";
 const OPEN_TRACKS = ["agents/review", "agents/review/a", "agents/review/b"];
@@ -83,7 +83,7 @@ async function startTrackRun(
   runId: string,
 ): Promise<void> {
   const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
-  const started = await client.request({
+  const started = await requestInteractiveStart(client, {
     operation: "run.start",
     runId,
     payload: {

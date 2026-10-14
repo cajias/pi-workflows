@@ -981,6 +981,10 @@ export class WorkflowServer {
             this.recoverDecisionChannel(request, session.targetSessionId),
           );
         }
+        case "run.start":
+          // Checked before receipt adoption, like every other session command.
+          this.requireInteractiveStartSession(connection, request);
+          return this.handleRequest(request, connection);
         case "run.restart":
         case "interaction.update":
         case "checkpoint.answer":
@@ -1166,6 +1170,28 @@ export class WorkflowServer {
       throw new Error("Workflow session branch must be reported before session control");
     }
     return { targetSessionId, coordinatorEpoch };
+  }
+
+  /**
+   * An interactive run hands its steps and terminal result to its origin session,
+   * so only that live session may start one. A start that names a session which
+   * never connects would leave a terminal message no session can receive.
+   */
+  private requireInteractiveStartSession(
+    connection: ClientConnection | undefined,
+    request: ClientRequest,
+  ): void {
+    const payload = requireRecord(request.payload, "run.start payload");
+    if (payload.executionMode === "headless") return;
+    if (payload.targetSessionId === undefined || payload.coordinatorEpoch === undefined) {
+      throw new Error(
+        'An interactive run.start requires the live Pi session coordinator of its origin session. Use executionMode "headless" for a run without a Pi session',
+      );
+    }
+    const session = this.requireSessionCommand(connection, request);
+    if (session.targetSessionId !== requireString(payload.originSessionId, "originSessionId")) {
+      throw new Error("An interactive run.start must name its own Pi session as originSessionId");
+    }
   }
 
   private reportWorkflowBranch(

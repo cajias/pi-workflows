@@ -61,6 +61,13 @@ const INTERACTION_POLL_MS = 1_000;
 /** Retry schedule for one session subscription whose view failed to build. */
 const SESSION_PROJECTION_BASE_RETRY_MS = 1_000;
 const SESSION_PROJECTION_MAX_RETRY_MS = 30_000;
+/**
+ * How long an interactive start waits for this session's coordinator. The first
+ * start can arrive while the session still connects to a workflow server that is
+ * starting or still reports its branch.
+ */
+const SESSION_COORDINATOR_READY_MS = 15_000;
+const SESSION_COORDINATOR_POLL_MS = 25;
 // Keep one model-facing tool result comfortably below Pi provider message limits.
 // The offset keeps every discovered workflow available across pages.
 const MAX_WORKFLOW_LIST_ITEMS = 50;
@@ -189,6 +196,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let sessionGeneration = 0;
   let sessionUnsubscribe: (() => Promise<void>) | null = null;
   let sessionConnectTask: Promise<void> | null = null;
+  // Asks the current session to connect now instead of at the next poll.
+  let connectCurrentSession: () => void = () => undefined;
   // A connection loss keeps the last view for display but removes authority.
   let sessionConnectionId: string | null = null;
   // A failed session projection retries with its own capped backoff, so one
@@ -388,7 +397,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       try {
         await presentInOrder(ctx);
         const parsed = parseWorkflowArgs(args);
-        const result = await executeCommand(client, ctx, parsed, randomUUID(), "human");
+        const result = await executeCommand(client, ctx, parsed, randomUUID(), "human", () =>
+          connectCurrentSession(),
+        );
         ctx.ui.notify(result.message, result.level ?? "info");
         await presentInOrder(ctx);
       } catch (error) {
@@ -588,7 +599,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           );
         }
         const parsed = toolInputToCommand(params);
-        const result = await executeCommand(client, ctx, parsed, toolCallId, "model");
+        const result = await executeCommand(client, ctx, parsed, toolCallId, "model", () =>
+          connectCurrentSession(),
+        );
         await presentInOrder(ctx);
         return toolResult(result.message, result.details);
       });
@@ -794,6 +807,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       if (sessionContext !== null) void presentInOrder(sessionContext).catch(() => undefined);
     }, INTERACTION_POLL_MS);
     pollTimer.unref?.();
+    connectCurrentSession = connectSession;
     connectSession();
   });
 
@@ -883,6 +897,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     sessionUnsubscribe = null;
     sessionConnectionId = null;
     sessionConnectTask = null;
+    connectCurrentSession = () => undefined;
     sessionSubscriptionFailures = 0;
     sessionSubscriptionRetryAt = 0;
     serverUnavailableNotified = false;
@@ -903,6 +918,7 @@ async function executeCommand(
   command: ParsedWorkflowArgs,
   idempotencyKey: string = randomUUID(),
   authority: "human" | "model" = "human",
+  connectSession: () => void = () => undefined,
 ): Promise<CommandResult> {
   switch (command.kind) {
     case "list": {
@@ -957,12 +973,15 @@ async function executeCommand(
       await client.ensureAvailable();
       const resolved = await client.resolveWorkflow({ cwd: ctx.cwd, workflowRef: command.ref });
       const runId = createRunId(resolved.workflowName);
+      // The server accepts an interactive start only from this live session.
+      const session = await readySessionCommandPayload(ctx, connectSession);
       const response = await requestAccepted(client, {
         operation: "run.start",
         requestId: `start-${idempotencyKey}`,
         idempotencyKey,
         runId,
         payload: {
+          ...session,
           projectPath: ctx.cwd,
           workflowName: resolved.workflowName,
           workflowSourceRef: resolved.workflowSourceRef,
@@ -971,7 +990,7 @@ async function executeCommand(
           definitionSnapshot: resolved.definitionSnapshot,
           input: jsonValue(command.input),
           launchOptions: {},
-          originSessionId: ctx.sessionManager.getSessionId(),
+          originSessionId: session.targetSessionId,
           executionMode: "interactive",
         },
       });
@@ -1337,6 +1356,27 @@ function sessionCommandPayload(ctx: ExtensionContext): {
     throw new Error("Workflow session coordinator is not ready");
   }
   return { targetSessionId, coordinatorEpoch: session.coordinatorEpoch };
+}
+
+/**
+ * Return this session's command authority once its coordinator is ready. A start
+ * can arrive before the first session connection or branch report finishes, so it
+ * asks for that connection and waits instead of failing at once.
+ */
+async function readySessionCommandPayload(
+  ctx: ExtensionContext,
+  connectSession: () => void,
+): Promise<{ targetSessionId: string; coordinatorEpoch: string }> {
+  const deadline = Date.now() + SESSION_COORDINATOR_READY_MS;
+  do {
+    try {
+      return sessionCommandPayload(ctx);
+    } catch {
+      connectSession();
+      await new Promise((resolve) => setTimeout(resolve, SESSION_COORDINATOR_POLL_MS));
+    }
+  } while (Date.now() < deadline);
+  return sessionCommandPayload(ctx);
 }
 
 function sessionRun(ctx: ExtensionContext, runId?: string): WorkflowRunQueueView | undefined {

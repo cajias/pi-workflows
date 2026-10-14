@@ -730,6 +730,14 @@ describe("pi-workflows workflow server extension", () => {
     expect(durableRequests.mock.calls.map(([options]) => options.operation)).toEqual(
       expect.arrayContaining(["run.start", "interaction.update", "interaction.submit"]),
     );
+    // The start comes from this live session's coordinator, which the server requires.
+    const start = durableRequests.mock.calls.find(([options]) => options.operation === "run.start");
+    expect(start?.[0].payload).toMatchObject({
+      targetSessionId: "session-one",
+      originSessionId: "session-one",
+      coordinatorEpoch: expect.stringMatching(/^session-epoch-/),
+      executionMode: "interactive",
+    });
     await fake.emit("session_shutdown");
     durableRequests.mockRestore();
   }, 60_000);
@@ -1781,8 +1789,15 @@ export default defineResourceManager({
         (event) => {
           listener(event);
           // One lost subscription: the client keeps its last snapshot for display
-          // and removes the authority to deliver from it.
-          if (dropped || event.event !== "session_snapshot") return;
+          // and removes the authority to deliver from it. The start itself needs
+          // the live session, so each subscription is lost once it shows the run.
+          if (
+            dropped ||
+            event.event !== "session_snapshot" ||
+            (event.payload as { run?: unknown } | null)?.run == null
+          ) {
+            return;
+          }
           dropped = true;
           listener({
             schema: CLIENT_PROTOCOL_SCHEMA,
@@ -1807,6 +1822,58 @@ export default defineResourceManager({
     await waitUntil(() => fake.widgets.some((value) => typeof value === "function"), 30_000);
     expect(renderedWidget(fake)).toContain("workflow server-validated");
     expect(fake.sent).toHaveLength(0);
+    await fake.emit("session_shutdown");
+  }, 60_000);
+
+  it("refuses an interactive start while the session never holds a coordinator", async () => {
+    const { cwd, workflowPath } = await setupProject();
+    const watchSession = WorkflowClient.prototype.watchSession;
+    // Every subscription is lost at its first snapshot, so the session never owns
+    // the coordinator authority that the server requires for an interactive start.
+    vi.spyOn(WorkflowClient.prototype, "watchSession").mockImplementation(async function (
+      this: WorkflowClient,
+      sessionId: string,
+      listener: (event: ClientEvent) => void,
+      options?: { subscriptionId?: string; coordinator?: boolean; nodeCursor?: number },
+    ) {
+      return await watchSession.call(
+        this,
+        sessionId,
+        (event) => {
+          listener(event);
+          if (event.event !== "session_snapshot") return;
+          listener({
+            schema: CLIENT_PROTOCOL_SCHEMA,
+            type: "event",
+            subscriptionId: event.subscriptionId,
+            event: "unavailable",
+            payload: {
+              schema: "pi-workflows.subscription-failure.v1",
+              reasonCode: "connection_lost",
+              message: "Workflow server connection is unavailable.",
+            },
+          });
+        },
+        options,
+      );
+    });
+    const durableRequests = vi.spyOn(WorkflowClient.prototype, "requestDurable");
+    const fake = makePi({ cwd });
+    await fake.emit("session_start");
+    await fake.runCommand(workflowPath);
+    expect(fake.notifications.at(-1)).toEqual({
+      message: "Workflow session coordinator is not ready",
+      level: "error",
+    });
+    expect(durableRequests.mock.calls.map(([options]) => options.operation)).not.toContain(
+      "run.start",
+    );
+    const store = new WorkflowRunQueueStore(workflowStatePath(), { readOnly: true, global: true });
+    try {
+      expect(store.listWorkflowRuns()).toEqual([]);
+    } finally {
+      store.close();
+    }
     await fake.emit("session_shutdown");
   }, 60_000);
 

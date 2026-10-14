@@ -9,7 +9,7 @@ import { ServerStateStore } from "../src/server/state.js";
 import { renderRunDetailLines } from "../src/viewer/render.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { readWorkflowRun } from "../src/workflows/store.js";
-import { makeTempDir, waitUntil } from "./helpers.js";
+import { makeTempDir, requestInteractiveStart, waitUntil } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 const FAKE_PI = path.resolve("test/fixtures/fake-agent-group-pi.mjs");
@@ -38,7 +38,7 @@ async function writeRepository(cwd: string, bin: string): Promise<void> {
 /** Start the built-in Sanity Check from an origin session, so it ends with a model turn. */
 async function startSanityCheck(client: WorkflowClient, cwd: string, runId: string): Promise<void> {
   const resolved = await client.resolveWorkflow({ cwd, workflowRef: "sanity-check" });
-  const response = await client.request({
+  const response = await requestInteractiveStart(client, {
     operation: "run.start",
     runId,
     payload: {

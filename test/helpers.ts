@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { WorkflowClient } from "../src/client/client.js";
+import { WorkflowClient } from "../src/client/client.js";
 import type { ClientResponse } from "../src/client/protocol.js";
-import { canonicalJson } from "../src/state/json.js";
+import { canonicalJson, type JsonObject } from "../src/state/json.js";
 import { resourceIdFor } from "../src/state/mutation.js";
 import { initializeViewerRun } from "../src/state/viewer.js";
 import type { HumanDecisionStore } from "../src/workflows/human-decision.js";
@@ -189,6 +189,62 @@ export async function reportBranch(
       hasPendingMessages: options.hasPendingMessages ?? false,
     },
   });
+}
+
+/** Become the live coordinator of one origin session and report its empty branch. */
+export async function ownSessionCoordinator(
+  client: WorkflowClient,
+  targetSessionId: string,
+  subscriptionId = `owner-${targetSessionId}`,
+): Promise<SessionAuthority> {
+  const watched = await client.request({
+    operation: "view.session.watch",
+    payload: { subscriptionId, sessionId: targetSessionId, coordinator: true },
+  });
+  const coordinatorEpoch = (watched.receipt as { coordinatorEpoch?: unknown } | undefined)
+    ?.coordinatorEpoch;
+  if (typeof coordinatorEpoch !== "string") {
+    throw new Error(`Session coordinator was refused: ${watched.error ?? watched.outcome}`);
+  }
+  const authority = { targetSessionId, coordinatorEpoch };
+  const reported = await reportBranch(client, authority);
+  if (reported.outcome !== "accepted") {
+    throw new Error(`Session branch report was refused: ${reported.error ?? reported.outcome}`);
+  }
+  return authority;
+}
+
+type StartRequest = Omit<Parameters<WorkflowClient["request"]>[0], "payload"> & {
+  payload: JsonObject;
+};
+
+/**
+ * Send an interactive `run.start` the way a live Pi session does: from the
+ * coordinator connection of its origin session. With `authority`, `client` already
+ * holds that coordinator. Without it, a short-lived connection with the same client
+ * identity owns the session for this start only, so the session is disconnected
+ * again afterwards, as it was before the server required that authority.
+ */
+export async function requestInteractiveStart(
+  client: WorkflowClient,
+  request: StartRequest,
+  authority?: SessionAuthority,
+): Promise<ClientResponse> {
+  if (authority !== undefined) {
+    return await client.request({ ...request, payload: { ...request.payload, ...authority } });
+  }
+  const originSessionId = request.payload.originSessionId;
+  if (typeof originSessionId !== "string") throw new Error("run.start needs originSessionId");
+  const starter = new WorkflowClient({
+    databasePath: client.databasePath,
+    clientId: client.clientId,
+  });
+  try {
+    const owned = await ownSessionCoordinator(starter, originSessionId, "interactive-start");
+    return await starter.request({ ...request, payload: { ...request.payload, ...owned } });
+  } finally {
+    await starter.close();
+  }
 }
 
 /** Poll until `predicate` is true, failing after `timeoutMs`. */

@@ -43,9 +43,11 @@ import type { InteractiveRequestRecord } from "../src/workflows/requests.js";
 import { SESSION_BINDING_SCHEMA, WorkflowRunStore } from "../src/workflows/store.js";
 import {
   ScriptedExecutor,
+  type SessionAuthority,
   currentWorkflowMessageId,
   makeTempDir,
   reportBranch,
+  requestInteractiveStart,
   waitUntil,
 } from "./helpers.js";
 
@@ -637,13 +639,16 @@ async function startRun(options: {
   workflowPath: string;
   runId: string;
   executionMode?: "headless" | "interactive";
+  /** The coordinator `client` already holds for the origin session. */
+  authority?: SessionAuthority;
 }): Promise<void> {
   const resolved = await options.client.resolveWorkflow({
     cwd: options.cwd,
     workflowRef: options.workflowPath,
   });
-  const response = await options.client.request({
-    operation: "run.start",
+  const executionMode = options.executionMode ?? "headless";
+  const request = {
+    operation: "run.start" as const,
     runId: options.runId,
     payload: {
       projectPath: options.cwd,
@@ -655,9 +660,13 @@ async function startRun(options: {
       input: { value: 1 },
       launchOptions: {},
       originSessionId: "server-test-session",
-      executionMode: options.executionMode ?? "headless",
+      executionMode,
     },
-  });
+  };
+  const response =
+    executionMode === "headless"
+      ? await options.client.request(request)
+      : await requestInteractiveStart(options.client, request, options.authority);
   expect(response.outcome).toBe("accepted");
 }
 
@@ -1952,13 +1961,15 @@ setInterval(() => {}, 1000);
       const coordinatorEpoch = (subscribed.receipt as { coordinatorEpoch?: string } | undefined)
         ?.coordinatorEpoch;
       if (coordinatorEpoch === undefined) throw new Error("coordinator epoch missing");
-      await reportBranch(client, { targetSessionId: "server-test-session", coordinatorEpoch });
+      const authority = { targetSessionId: "server-test-session", coordinatorEpoch };
+      await reportBranch(client, authority);
       await startRun({
         client,
         cwd,
         workflowPath: await writeChannelDecisionWorkflow(cwd),
         runId: "channel-crash-parent",
         executionMode: "interactive",
+        authority,
       });
       await waitUntil(() => {
         const state = new ServerStateStore(databasePath, { readOnly: true });
@@ -2998,7 +3009,7 @@ export { default } from ${JSON.stringify(path.resolve("examples/workflows/echo.w
     try {
       const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
       await fs.writeFile(workflowPath, `${originalSource}\n// changed before worker load\n`);
-      const response = await client.request({
+      const response = await requestInteractiveStart(client, {
         operation: "run.start",
         runId: "source-load-run",
         payload: {
