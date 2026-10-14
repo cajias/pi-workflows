@@ -107,6 +107,21 @@ describe("resolvePiFromPath", () => {
       error: expect.stringContaining('which failed: it reported "relative/node"'),
     });
   });
+
+  it("names a timeout when the Node probe does not answer in time", async () => {
+    const setup = await pathWithPi("#!/usr/bin/env node\n", { node: false });
+    await fs.writeFile(path.join(setup.bin, "node"), "#!/bin/sh\nexec sleep 5\n", {
+      mode: 0o755,
+    });
+    // The system directories stay on PATH so the fake node can run `sleep`.
+    const env = { PATH: [setup.bin, "/usr/bin", "/bin"].join(path.delimiter) };
+    expect(await resolvePiFromPath(env, 200)).toMatchObject({
+      kind: "unresolved",
+      error: expect.stringContaining(
+        `${setup.cli} starts with node, which timed out: it did not report its executable within 200 ms.`,
+      ),
+    });
+  });
 });
 
 describe("pinHeadlessPi", () => {

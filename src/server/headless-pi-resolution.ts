@@ -39,7 +39,10 @@ export async function pinHeadlessPi(
  * that picks the tool from the name it was started by, so its real file is not pi; the
  * child starts the found path with `pi` as its name, as a shell would.
  */
-export async function resolvePiFromPath(env: NodeJS.ProcessEnv): Promise<HeadlessPiLaunch> {
+export async function resolvePiFromPath(
+  env: NodeJS.ProcessEnv,
+  probeTimeoutMs = NODE_PROBE_TIMEOUT_MS,
+): Promise<HeadlessPiLaunch> {
   const found = findOnPath("pi", env);
   if (found === undefined) {
     return unresolved(`no executable pi is on the server's PATH (${env.PATH ?? ""})`);
@@ -48,10 +51,20 @@ export async function resolvePiFromPath(env: NodeJS.ProcessEnv): Promise<Headles
   const interpreter = nodeInterpreter(readShebang(cli));
   if (interpreter === undefined) return { kind: "executable", executable: found };
   try {
-    return { kind: "node", node: await nodeExecPath(interpreter, env), cli };
+    return { kind: "node", node: await nodeExecPath(interpreter, env, probeTimeoutMs), cli };
   } catch (error) {
-    return unresolved(`${cli} starts with ${interpreter}, which failed: ${errorMessage(error)}`);
+    return unresolved(
+      `${cli} starts with ${interpreter}, which ${probeFailure(error, probeTimeoutMs)}`,
+    );
   }
+}
+
+/** Why the Node probe failed. Node sets `killed` when it stopped the probe at its timeout. */
+function probeFailure(error: unknown, timeoutMs: number): string {
+  const killed = typeof error === "object" && error !== null && "killed" in error && error.killed;
+  return killed === true
+    ? `timed out: it did not report its executable within ${timeoutMs} ms`
+    : `failed: ${errorMessage(error)}`;
 }
 
 function unresolved(reason: string): HeadlessPiLaunch {
@@ -96,11 +109,15 @@ function nodeInterpreter(shebang: string | undefined): string | undefined {
   return undefined;
 }
 
-async function nodeExecPath(interpreter: string, env: NodeJS.ProcessEnv): Promise<string> {
+async function nodeExecPath(
+  interpreter: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<string> {
   const { stdout } = await execFileAsync(
     interpreter,
     ["-e", "process.stdout.write(`\\n${process.execPath}`)"],
-    { env, encoding: "utf8", timeout: NODE_PROBE_TIMEOUT_MS },
+    { env, encoding: "utf8", timeout: timeoutMs },
   );
   // A preload in NODE_OPTIONS may print first; the path is the last line.
   const reported = stdout.split("\n").at(-1) ?? "";

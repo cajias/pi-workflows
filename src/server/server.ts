@@ -291,6 +291,8 @@ export class WorkflowServer {
   private claim: ServerClaim | null = null;
   /** Pinned once at start; every runner receives it for its headless pi children. */
   private headlessPi: HeadlessPiPin | null = null;
+  /** The one retry of a pin that was unresolved at start. Runners wait for it. */
+  private headlessPiRetry: Promise<void> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private viewTimer: ReturnType<typeof setInterval> | null = null;
@@ -382,10 +384,8 @@ export class WorkflowServer {
     // check only reads. A fenced starter can then never remove, replace, or
     // restore the owner's lock file.
     await assertNoServingServer(this.lockPath, { socketPath: this.socketPath });
-    this.headlessPi = await pinHeadlessPi(this.options.headlessPi, {
-      ...process.env,
-      ...this.options.env,
-    });
+    this.headlessPiRetry = null;
+    this.headlessPi = await pinHeadlessPi(this.options.headlessPi, this.headlessPiEnvironment());
     try {
       const previousServer = this.serverState.serverStatus();
       this.claim = this.serverState.acquireServer({
@@ -406,8 +406,7 @@ export class WorkflowServer {
       this.startTimers();
       this.started = true;
       this.log(`ready on ${this.socketPath} at epoch ${this.claim.epoch}`);
-      const pinSource = this.headlessPi.source === "session" ? "the starting Pi session" : "PATH";
-      this.log(`headless pi from ${pinSource}: ${describeHeadlessPi(this.headlessPi.pi)}`);
+      this.logHeadlessPi(this.headlessPi, "");
       this.requestAutomaticStatePrune();
       void this.expireTimedOutDecision().finally(() => this.resumeAutomaticStatePruneIfDue());
       void this.claimOne().finally(() => this.resumeAutomaticStatePruneIfDue());
@@ -2260,6 +2259,33 @@ export class WorkflowServer {
     const deleting = store.requestDeletion(ref);
     store.enqueue(ref);
     return { outcome: "accepted", receipt: deleting as unknown as JsonValue };
+  }
+
+  private headlessPiEnvironment(): NodeJS.ProcessEnv {
+    return { ...process.env, ...this.options.env };
+  }
+
+  private logHeadlessPi(pin: HeadlessPiPin, note: string): void {
+    const source = pin.source === "session" ? "the starting Pi session" : "PATH";
+    this.log(`headless pi from ${source}${note}: ${describeHeadlessPi(pin.pi)}`);
+  }
+
+  /**
+   * Resolve a pin that was unresolved at start once more, when the next runner launches. A
+   * Node probe can fail for a passing reason, such as a slow version manager under load, and
+   * every headless child would otherwise fail until a restart. The retry overlaps the runner's
+   * own startup, and its result is kept and reported by `server.status`, resolved or not.
+   */
+  private retryUnresolvedHeadlessPi(): void {
+    if (this.headlessPiRetry !== null || this.headlessPi?.pi.kind !== "unresolved") return;
+    this.headlessPiRetry = pinHeadlessPi(this.options.headlessPi, this.headlessPiEnvironment())
+      .then((pin) => {
+        this.headlessPi = pin;
+        this.logHeadlessPi(pin, " after a retry");
+      })
+      .catch((error: unknown) => {
+        this.log(`headless pi retry failed: ${errorMessage(error)}`);
+      });
   }
 
   private pinnedHeadlessPi(): HeadlessPiLaunch {
@@ -4183,6 +4209,7 @@ export class WorkflowServer {
       protocolVersion: 1,
     };
     this.serverState.recordRunnerStart(envelope, this.claim.epoch);
+    this.retryUnresolvedHeadlessPi();
     let active: ActiveRun;
     const supervisor = new WorkflowRunnerSupervisor(envelope, {
       registry: this.registry,
@@ -4298,6 +4325,8 @@ export class WorkflowServer {
     message: WorkflowRunnerMessage,
   ): Promise<WorkflowRunnerResponse> {
     if (message.operation === "runner.ready") {
+      // A retried pin settles before this runner receives it.
+      if (this.headlessPiRetry !== null) await this.headlessPiRetry;
       if (
         !this.queue.verifyWorkflowRunClaim({ runId: message.runId, claimToken: active.claimToken })
       ) {
