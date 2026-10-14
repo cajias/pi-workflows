@@ -6,6 +6,10 @@ import { WorkflowClient } from "../src/client/client.js";
 import { serverLockPath } from "../src/server/lock.js";
 import { WorkflowServer } from "../src/server/server.js";
 import type { JsonValue } from "../src/state/json.js";
+import {
+  oauthRefreshMarkerDirectory,
+  writeOAuthRefreshMarker,
+} from "../src/state/oauth-refresh-markers.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
@@ -171,6 +175,22 @@ describe("workflow server headless pi pin", () => {
       // The retry already happened; the pin changes again only after a restart.
       expect((await statusOf(databasePath)).headlessPi).toMatchObject({ kind: "unresolved" });
       expect(logs.filter((line) => line.includes("after a retry"))).toHaveLength(1);
+    });
+  });
+
+  it("reports agent group OAuth refresh processes from their markers", async () => {
+    const configDir = await makeTempDir("server-oauth-refresh");
+    await withServer({ env: { PI_WORKFLOWS_CONFIG_DIR: configDir } }, async (databasePath) => {
+      expect((await statusOf(databasePath)).oauthRefreshes).toEqual([]);
+      const startedAt = new Date().toISOString();
+      writeOAuthRefreshMarker(oauthRefreshMarkerDirectory({ PI_WORKFLOWS_CONFIG_DIR: configDir }), {
+        pid: process.pid,
+        provider: "fixture",
+        startedAt,
+      });
+      expect((await statusOf(databasePath)).oauthRefreshes).toEqual([
+        { pid: process.pid, provider: "fixture", startedAt, running: true },
+      ]);
     });
   });
 

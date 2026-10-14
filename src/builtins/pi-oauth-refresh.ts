@@ -3,107 +3,48 @@
  * of its own.
  *
  * The headless pi process that runs an agent group starts this process detached, in its own
- * session and process group, and registers it nowhere. Stopping a group stops that headless pi
- * process with `SIGTERM` and then `SIGKILL`, and the workflow runner and the workflow server stop
- * their children the same way. None of those signals reach this process, so none of them can end
- * a refresh after the provider has rotated the refresh token and before Pi has saved it.
+ * session and process group, and registers it with no supervisor. The workflow server, the
+ * runner, and the agent group launcher stop their processes through process groups and
+ * registered process IDs, so no stop of theirs reaches this process, and none can end a refresh
+ * after the provider has rotated the refresh token and before Pi has saved it.
  *
  * The process is plain Node: it imports Pi by path from the installation that runs the group.
  * Pi's `AuthStorage` takes the `auth.json` lock, refreshes, and writes the result; this process
- * never writes credentials. It reports only an exit status, so no credential and no error text
- * leaves it. Its lifetime is bounded: it exits when the refresh does not start within
- * {@link OAUTH_REFRESH_START_DEADLINE_MS}, and once it starts, Pi bounds the lock wait and the
- * refresh.
+ * never writes credentials. It reports only an exit status (see `pi-oauth-refresh-contract.ts`),
+ * so no credential and no error text leaves it. While it runs it keeps a marker with its process
+ * ID, the provider ID, and its start time (see `state/oauth-refresh-markers.ts`).
  *
- * Only Node built-ins are imported statically, so Node can run the source file directly and the
- * agent group runner can import the contract below.
+ * Its lifetime is bounded twice: it exits when the refresh has not started within
+ * `OAUTH_REFRESH_START_DEADLINE_MS`, and once the refresh has started, it exits at
+ * `OAUTH_REFRESH_CEILING_MS` even when the refresh is still in flight.
  */
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import type { CredentialStore } from "@earendil-works/pi-ai";
-
-/** The environment variable that carries the request, as base64url JSON. */
-export const OAUTH_REFRESH_REQUEST_ENV = "PI_WORKFLOWS_OAUTH_REFRESH_REQUEST";
-const REQUEST_SCHEMA = "pi-workflows.oauth-refresh-request.v1";
-/**
- * How long the process may take to load Pi and the admitted extensions before the refresh
- * starts. Without a refresh in flight it is safe to stop, so a stuck extension cannot leave it
- * running forever.
- */
-export const OAUTH_REFRESH_START_DEADLINE_MS = 60_000;
-
-/** The exit status of a refresh process. */
-export const OAUTH_REFRESH_EXIT = {
-  /** Pi's authentication returned. The stored credential decides the outcome. */
-  done: 0,
-  /** Pi reported an OAuth failure: the refresh failed, or its token still expires too soon. */
-  refreshFailed: 3,
-  /** Pi could not lock, read, or write `auth.json`. */
-  storeFailed: 4,
-  /** Anything else, such as loading Pi or an extension. */
-  failed: 5,
-  /** The refresh did not start within the start deadline. */
-  notStarted: 6,
-} as const;
-
-export type OAuthRefreshRequest = {
-  schema: typeof REQUEST_SCHEMA;
-  /** The root of the Pi package that runs the group, from Pi's `getPackageDir()`. */
-  piPackageDir: string;
-  agentDir: string;
-  cwd: string;
-  provider: string;
-  /** The extensions that the group admits, because one of them can supply the OAuth refresh. */
-  extensionPaths: string[];
-  /** Pi refreshes the credential when it expires within this time. */
-  minValidityMs: number;
-};
-
-export function encodeOAuthRefreshRequest(request: Omit<OAuthRefreshRequest, "schema">): string {
-  return Buffer.from(JSON.stringify({ schema: REQUEST_SCHEMA, ...request }), "utf8").toString(
-    "base64url",
-  );
-}
-
-/** Load only the given extension paths, and no other resources or context. */
-export function isolatedResourceLoaderOptions(extensionPaths: readonly string[]) {
-  return {
-    additionalExtensionPaths: [...extensionPaths],
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-    systemPromptOverride: () => undefined,
-    appendSystemPromptOverride: () => [],
-  };
-}
-
-/** The Pi modules that the refresh uses: the public SDK and Pi's file-backed credential store. */
-export function piModulePaths(piPackageDir: string): { sdk: string; authStorage: string } {
-  return {
-    sdk: path.join(piPackageDir, "dist", "index.js"),
-    authStorage: path.join(piPackageDir, "dist", "core", "auth-storage.js"),
-  };
-}
-
-type PiSdk = typeof import("@earendil-works/pi-coding-agent");
-/** Pi's `AuthStorage` (`dist/core/auth-storage.js`), which Pi's SDK uses for `auth.json`. */
-export type PiAuthStorageModule = {
-  AuthStorage: { create(authPath: string): CredentialStore };
-};
-
-/** Import Pi's file-backed credential store from the installation that runs the group. */
-export async function importPiAuthStorage(piPackageDir: string): Promise<PiAuthStorageModule> {
-  return (await import(
-    pathToFileURL(piModulePaths(piPackageDir).authStorage).href
-  )) as PiAuthStorageModule;
-}
+import { fileURLToPath } from "node:url";
+import {
+  OAUTH_REFRESH_CEILING_MS,
+  OAUTH_REFRESH_START_DEADLINE_MS,
+  oauthRefreshMarkerDirectory,
+  removeOAuthRefreshMarker,
+  writeOAuthRefreshMarker,
+} from "../state/oauth-refresh-markers.js";
+import {
+  createPiCredentialStore,
+  decodeOAuthRefreshRequest,
+  isolatedResourceLoaderOptions,
+  loadPiSdk,
+  OAUTH_REFRESH_EXIT,
+  OAUTH_REFRESH_REQUEST_ENV,
+  OAUTH_REFRESH_TEST_CEILING_ENV,
+  oauthRefreshExitFor,
+  type OAuthRefreshRequest,
+} from "./pi-oauth-refresh-contract.js";
 
 async function refresh(request: OAuthRefreshRequest, started: () => void): Promise<void> {
-  const sdk = (await import(pathToFileURL(piModulePaths(request.piPackageDir).sdk).href)) as PiSdk;
-  const { AuthStorage } = await importPiAuthStorage(request.piPackageDir);
-  const store = AuthStorage.create(path.join(request.agentDir, "auth.json"));
+  const sdk = await loadPiSdk(request.piPackageDir);
+  const store = await createPiCredentialStore(
+    request.piPackageDir,
+    path.join(request.agentDir, "auth.json"),
+  );
   const modelRuntime = await sdk.ModelRuntime.create({
     allowModelNetwork: false,
     refreshOnCreate: false,
@@ -139,30 +80,29 @@ async function refresh(request: OAuthRefreshRequest, started: () => void): Promi
   await modelRuntime.getAuth(request.provider, { minOAuthValidityMs: request.minValidityMs });
 }
 
-/** Pi's `ModelsError` (pi-ai `utils/models-error.js`) carries a `code`, such as `oauth`. */
-function modelsErrorCode(error: unknown): string | undefined {
-  if (!(error instanceof Error) || error.name !== "ModelsError") return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
-}
-
-function readRequest(): OAuthRefreshRequest {
-  const encoded = process.env[OAUTH_REFRESH_REQUEST_ENV] ?? "";
-  const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as { schema?: unknown }).schema !== REQUEST_SCHEMA
-  ) {
-    throw new Error("invalid OAuth refresh request");
-  }
-  return value as OAuthRefreshRequest;
+function ceilingMs(): number {
+  const override = Number(process.env[OAUTH_REFRESH_TEST_CEILING_ENV]);
+  return Number.isSafeInteger(override) && override > 0 ? override : OAUTH_REFRESH_CEILING_MS;
 }
 
 async function main(): Promise<number> {
+  let request: OAuthRefreshRequest;
+  let marker: string;
+  try {
+    request = decodeOAuthRefreshRequest(process.env[OAUTH_REFRESH_REQUEST_ENV] ?? "");
+    // Without a marker the process would be impossible to find, so it does not refresh.
+    marker = writeOAuthRefreshMarker(oauthRefreshMarkerDirectory(), {
+      pid: process.pid,
+      provider: request.provider,
+      startedAt: new Date().toISOString(),
+    });
+  } catch {
+    return OAUTH_REFRESH_EXIT.failed;
+  }
+  process.on("exit", () => removeOAuthRefreshMarker(marker));
   let refreshing = false;
   // Nothing in Pi Workflows signals this process. A signal from elsewhere still waits for a
-  // refresh in flight.
+  // refresh in flight, up to the ceiling.
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(signal, () => {
       if (!refreshing) process.exit(OAUTH_REFRESH_EXIT.failed);
@@ -173,17 +113,15 @@ async function main(): Promise<number> {
     OAUTH_REFRESH_START_DEADLINE_MS,
   );
   try {
-    await refresh(readRequest(), () => {
+    await refresh(request, () => {
+      if (refreshing) return;
       refreshing = true;
       clearTimeout(deadline);
+      setTimeout(() => process.exit(OAUTH_REFRESH_EXIT.ceiling), ceilingMs());
     });
     return OAUTH_REFRESH_EXIT.done;
   } catch (error) {
-    // The error can quote the provider's token response, so only its kind leaves the process.
-    const code = modelsErrorCode(error);
-    if (code === "oauth") return OAUTH_REFRESH_EXIT.refreshFailed;
-    if (code === "auth") return OAUTH_REFRESH_EXIT.storeFailed;
-    return OAUTH_REFRESH_EXIT.failed;
+    return oauthRefreshExitFor(error);
   }
 }
 

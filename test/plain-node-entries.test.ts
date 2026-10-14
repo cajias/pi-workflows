@@ -165,7 +165,7 @@ const ANY_DYNAMIC_IMPORT = /(?<![\w$.])import\s*\(/gu;
  * Modules whose computed dynamic imports load Pi by absolute path from the Pi installation that
  * runs them. Those imports never resolve through this package's dependencies.
  */
-const PI_PATH_IMPORTERS = new Set([path.join("dist", "builtins", "pi-oauth-refresh.js")]);
+const PI_PATH_IMPORTERS = new Set([path.join("dist", "builtins", "pi-oauth-refresh-contract.js")]);
 
 /** Runtime specifiers of one emitted module. Type-only imports are already erased by tsc. */
 function runtimeSpecifiers(file: string, source: string): string[] {

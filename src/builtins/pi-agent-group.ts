@@ -20,6 +20,10 @@ import {
   type LoadExtensionsResult,
   type ResolvedResource,
 } from "@earendil-works/pi-coding-agent";
+import {
+  oauthRefreshMarkerDirectory,
+  pruneOAuthRefreshMarkers,
+} from "../state/oauth-refresh-markers.js";
 import { PROMPT_CEILING_CHARS } from "../workflows/prompt-evidence.js";
 import {
   PiAgentGroupError,
@@ -32,13 +36,15 @@ import {
   type PiAgentTool,
 } from "./pi-agent-launch.js";
 import {
+  createPiCredentialStore,
   encodeOAuthRefreshRequest,
-  importPiAuthStorage,
   isolatedResourceLoaderOptions,
   OAUTH_REFRESH_EXIT,
   OAUTH_REFRESH_REQUEST_ENV,
+  oauthRefreshEntryArgs,
   piModulePaths,
-} from "./pi-oauth-refresh.js";
+  UnsupportedPiInstallationError,
+} from "./pi-oauth-refresh-contract.js";
 
 // This module imports packages that only Pi supplies. Only processes that Pi starts may load
 // it: the agent group bridge that the workflow runner starts inside headless Pi, and tests.
@@ -561,15 +567,24 @@ async function prepareDispatchCredential(
     !existsSync(modules.sdk) ||
     !existsSync(modules.authStorage)
   ) {
-    throw couldNotRefresh(provider);
+    throw unsupportedPiInstallation(provider);
+  }
+  const entryArgs = oauthRefreshEntryArgs(path.dirname(fileURLToPath(import.meta.url)));
+  if (entryArgs === undefined) {
+    throw new PiAgentGroupError(
+      "group",
+      "cannot refresh OAuth credentials",
+      `${provider}; this Pi or Node installation cannot run the OAuth refresh process; configure an API key for the provider`,
+    );
   }
   // A cancelled group starts no refresh. Once one starts, the group waits for it to finish.
   if (signal.aborted) throw cancellationError("group", signal.reason);
-  const exit = await refreshInOwnProcess(input, piPackageDir);
+  const exit = await refreshInOwnProcess(input, piPackageDir, entryArgs);
   // The refresh has finished, or its process finishes it on its own, before the group reacts
   // to a cancellation.
   if (signal.aborted) throw cancellationError("group", signal.reason);
   if (exit === OAUTH_REFRESH_EXIT.storeFailed) throw credentialStoreFailure(provider);
+  if (exit === OAUTH_REFRESH_EXIT.unsupported) throw unsupportedPiInstallation(provider);
   const refreshed = await readPiCredential(piPackageDir, input.agentDir, provider);
   if (refreshed.expires - now() > requiredValidityMs) return refreshed;
   const unchanged =
@@ -600,18 +615,28 @@ function credentialStoreFailure(provider: string): PiAgentGroupError {
   );
 }
 
+function unsupportedPiInstallation(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "cannot refresh OAuth credentials",
+    `${provider}; this Pi installation does not provide the modules that agent groups use to refresh OAuth credentials; use Pi's Node package, or configure an API key for the provider`,
+  );
+}
+
 /**
  * Refresh the dispatch credential in a process of its own (`pi-oauth-refresh.ts`), started
- * detached and registered nowhere, so no stop of this headless pi process, its runner, or the
- * server can end a refresh before Pi saves it. The group waits at most
- * {@link OAUTH_REFRESH_WAIT_MS} for its exit status and never stops it. No credential and no
- * error text crosses the process boundary.
+ * detached and registered with no supervisor, so no stop that Pi Workflows issues can end a
+ * refresh before Pi saves it. Stale markers of earlier refresh processes are pruned first. The
+ * group waits at most {@link OAUTH_REFRESH_WAIT_MS} for the exit status and never stops the
+ * process. No credential and no error text crosses the process boundary.
  */
 async function refreshInOwnProcess(
   input: DispatchCredentialInput,
   piPackageDir: string,
+  entryArgs: string[],
 ): Promise<number | undefined> {
-  const child = spawn(process.execPath, [refreshEntryPath()], {
+  pruneOAuthRefreshMarkers(oauthRefreshMarkerDirectory());
+  const child = spawn(process.execPath, entryArgs, {
     cwd: input.cwd,
     detached: true,
     stdio: "ignore",
@@ -642,17 +667,11 @@ async function refreshInOwnProcess(
   });
 }
 
-/** The refresh entry beside this module: compiled JavaScript, or the source that Node strips. */
-function refreshEntryPath(): string {
-  const directory = path.dirname(fileURLToPath(import.meta.url));
-  const compiled = path.join(directory, "pi-oauth-refresh.js");
-  return existsSync(compiled) ? compiled : path.join(directory, "pi-oauth-refresh.ts");
-}
-
 /**
  * The dispatch provider's stored OAuth credential, read through Pi's file-backed `AuthStorage`
  * under its lock. `list` reports types without resolving configured key values, so only an
- * OAuth credential is read.
+ * OAuth credential is read. A Pi installation whose credential store cannot be loaded, or has a
+ * different shape, is reported apart from a lock or IO failure.
  */
 async function readPiCredential(
   piPackageDir: string,
@@ -663,12 +682,13 @@ async function readPiCredential(
   const options = { signal: new AbortController().signal };
   let stored: unknown;
   try {
-    const { AuthStorage } = await importPiAuthStorage(piPackageDir);
-    const store = AuthStorage.create(path.join(agentDir, "auth.json"));
+    const store = await createPiCredentialStore(piPackageDir, path.join(agentDir, "auth.json"));
     const entry = (await store.list(options)).find((item) => item.providerId === provider);
     stored = entry?.type === "oauth" ? await store.read(provider, options) : undefined;
-  } catch {
-    throw credentialStoreFailure(provider);
+  } catch (error) {
+    throw error instanceof UnsupportedPiInstallationError
+      ? unsupportedPiInstallation(provider)
+      : credentialStoreFailure(provider);
   }
   if (!isStoredCredential(stored) || stored.type !== "oauth") throw couldNotRefresh(provider);
   return structuredClone(stored);

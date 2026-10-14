@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { CANCEL_SETTLE_MS } from "../../src/server/agent-group-launcher.js";
+import { listOAuthRefreshMarkers } from "../../src/state/oauth-refresh-markers.js";
 import { makeTempDir, waitUntil } from "../helpers.js";
 import { startMockOpenAiServer } from "./mock-openai.js";
 
@@ -440,8 +441,14 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
           "fixture-legacy"
         ] as { access?: string } | undefined;
       expect((await stored())?.access).toBe(OAUTH_MARKERS.oldAccess);
-      // The refresh runs in its own process, which the stop did not reach. Released now, it
-      // finishes and Pi saves the rotated credential.
+      // The refresh runs in its own process, which the stop did not reach. Its marker names it.
+      const markers = listOAuthRefreshMarkers(path.join(root, "config", "oauth-refresh")).filter(
+        (marker) => marker.provider === "fixture-legacy" && marker.running,
+      );
+      expect(markers).toHaveLength(1);
+      const refreshPid = markers[0]!.pid;
+      expect(processGone(refreshPid)).toBe(false);
+      // Released now, it finishes and Pi saves the rotated credential.
       await fs.writeFile(gate, "", "utf8");
       const deadline = Date.now() + 30_000;
       let saved = (await stored())?.access;
@@ -450,6 +457,12 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
         saved = (await stored())?.access;
       }
       expect(saved).toBe(OAUTH_MARKERS.newAccess);
+      await waitUntil(() => processGone(refreshPid), 10_000);
+      expect(
+        listOAuthRefreshMarkers(path.join(root, "config", "oauth-refresh")).map(
+          (marker) => marker.pid,
+        ),
+      ).not.toContain(refreshPid);
       expect(await refreshCount(scenario.refreshLog)).toBe(1);
       expect(mock.requests).toHaveLength(0);
       await expectNoOAuthText(JSON.stringify(output), scenario.diagnosticsDir);

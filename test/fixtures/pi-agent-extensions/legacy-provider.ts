@@ -9,8 +9,9 @@ type FixtureOAuthCredentials = { access: string; refresh: string; expires: numbe
  * to PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE when it starts, then waits until the file
  * PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE exists, when that is set. PI_AGENT_FIXTURE_OAUTH_REFRESH
  * selects its outcome: `rotate` returns the PI_AGENT_FIXTURE_OAUTH_NEW_* tokens for two hours,
- * `short` returns them for one minute, and `fail` throws an error that quotes the refresh
- * token. Any other value means a refresh is a test failure.
+ * `short` returns them for one minute, `fail` throws an error that quotes the refresh token, and
+ * `hang` never returns and ignores its abort signal. Any other value means a refresh is a test
+ * failure. The gate wait gives up after 60 seconds.
  *
  * PI_AGENT_FIXTURE_OAUTH_AFTER_REFRESH changes `auth.json` after Pi saved the refreshed
  * credential, as another Pi process could: `remove` deletes the entry, and `api-key` replaces
@@ -26,10 +27,15 @@ function fixtureOAuth() {
       const counter = process.env.PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE;
       if (counter) fs.appendFileSync(counter, "refresh\n", "utf8");
       const gate = process.env.PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE;
+      // A test that fails before it opens the gate still lets this refresh end.
+      const gateDeadline = Date.now() + 60_000;
       while (gate && !fs.existsSync(gate)) {
+        if (Date.now() > gateDeadline) throw new Error("fixture OAuth refresh gate never opened");
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       const mode = process.env.PI_AGENT_FIXTURE_OAUTH_REFRESH;
+      // A refresh that ignores its abort signal and never returns.
+      if (mode === "hang") await new Promise<never>(() => undefined);
       if (mode === "fail") throw new Error(`refresh rejected for ${credentials.refresh}`);
       if (mode !== "rotate" && mode !== "short") {
         throw new Error("fixture OAuth must not refresh");

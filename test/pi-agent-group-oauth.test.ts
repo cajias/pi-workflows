@@ -3,8 +3,13 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { agentGroupErrorFields, runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
 import type { PiAgentLifecycleEvent, PiAgentRequest } from "../src/builtins/pi-agent-launch.js";
+import { OAUTH_REFRESH_TEST_CEILING_ENV } from "../src/builtins/pi-oauth-refresh-contract.js";
 import { agentGroupCauseText } from "../src/server/agent-group-diagnostics.js";
 import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
+import {
+  listOAuthRefreshMarkers,
+  oauthRefreshMarkerDirectory,
+} from "../src/state/oauth-refresh-markers.js";
 import { TimeoutError } from "../src/workflows/errors.js";
 import { startMockOpenAiServer, type MockModelScript } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
@@ -53,6 +58,8 @@ type Scenario = {
   cwd: string;
   authPath: string;
   refreshLog: string;
+  /** Where the scenario's refresh processes keep their markers. */
+  markerDir: string;
   mock: Awaited<ReturnType<typeof startMockOpenAiServer>>;
   events: PiAgentLifecycleEvent[];
 };
@@ -66,7 +73,7 @@ async function legacyOAuthScenario(
   name: string,
   options: {
     expiresInMs: number;
-    refresh?: "rotate" | "short" | "fail";
+    refresh?: "rotate" | "short" | "fail" | "hang";
     script?: MockModelScript;
     /** The fixture refresh waits until this file exists. */
     gate?: string;
@@ -108,7 +115,35 @@ async function legacyOAuthScenario(
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_NEW_REFRESH", MARKERS.newRefresh);
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE", options.gate);
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_AFTER_REFRESH", options.afterRefresh);
-  return { agentDir, cwd, authPath, refreshLog, mock, events: [] };
+  // Each scenario keeps its refresh markers apart from every other test.
+  vi.stubEnv("PI_WORKFLOWS_CONFIG_DIR", path.join(agentDir, "pi-workflows-config"));
+  const markerDir = oauthRefreshMarkerDirectory();
+  return { agentDir, cwd, authPath, refreshLog, markerDir, mock, events: [] };
+}
+
+/** The process ID of the scenario's one refresh process, once its marker exists. */
+async function refreshProcessPid(scenario: Scenario): Promise<number> {
+  let pid: number | undefined;
+  await waitFor(async () => {
+    pid = listOAuthRefreshMarkers(scenario.markerDir).find((marker) => marker.running)?.pid;
+    return pid !== undefined;
+  });
+  return pid!;
+}
+
+/** Wait until the refresh process has exited and removed its marker. */
+async function expectRefreshProcessGone(scenario: Scenario, pid: number): Promise<void> {
+  await waitFor(async () => !processRunning(pid));
+  expect(listOAuthRefreshMarkers(scenario.markerDir)).toEqual([]);
+}
+
+function processRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function waitFor(condition: () => Promise<boolean>): Promise<void> {
@@ -359,9 +394,8 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
     "lets a refresh in flight finish and save before the group reports %s",
     async (_name, reason, outcome) => {
       let scenario: Scenario | undefined;
+      const gate = path.join(await makeTempDir("pi-agent-oauth-gate"), "release");
       try {
-        const gateDir = await makeTempDir("pi-agent-oauth-gate");
-        const gate = path.join(gateDir, "release");
         scenario = await legacyOAuthScenario("abort-in-flight", {
           expiresInMs: NEAR_EXPIRY_MS,
           refresh: "rotate",
@@ -387,6 +421,7 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
           },
         );
         await waitFor(async () => (await refreshCount(scenario!)) === 1);
+        const pid = await refreshProcessPid(scenario);
         // The provider may already have rotated the refresh token, so the group keeps waiting.
         controller.abort(reason());
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -401,6 +436,94 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
         });
         expect(await refreshCount(scenario)).toBe(1);
         expect(scenario.mock.requests).toHaveLength(0);
+        await expectRefreshProcessGone(scenario, pid);
+      } finally {
+        // A failed assertion must not leave the refresh process waiting at the gate.
+        await fs.writeFile(gate, "", "utf8");
+        await close(scenario);
+      }
+    },
+  );
+
+  it("ends a refresh that never returns at the ceiling and removes its marker", async () => {
+    let scenario: Scenario | undefined;
+    try {
+      scenario = await legacyOAuthScenario("ceiling", {
+        expiresInMs: NEAR_EXPIRY_MS,
+        refresh: "hang",
+      });
+      vi.stubEnv(OAUTH_REFRESH_TEST_CEILING_ENV, "1000");
+      const before = await fs.readFile(scenario.authPath, "utf8");
+      const run = groupError(
+        runPiAgentGroup([request("ceiling", scenario.cwd)], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      );
+      const pid = await refreshProcessPid(scenario);
+      expect(listOAuthRefreshMarkers(scenario.markerDir)).toEqual([
+        expect.objectContaining({ pid, provider: "fixture-legacy", running: true }),
+      ]);
+      const markerText = await fs.readFile(path.join(scenario.markerDir, `${pid}.json`), "utf8");
+      expectNoCredentialText(markerText);
+      const error = await run;
+      expect(error.message).toBe(
+        "Pi agent group could not refresh OAuth credentials: fixture-legacy; sign in to the provider again in Pi, or configure an API key for it",
+      );
+      await expectRefreshProcessGone(scenario, pid);
+      expect(await refreshCount(scenario)).toBe(1);
+      // The process released Pi's lock as it exited, so the group read auth.json at once.
+      expect(await fs.readFile(scenario.authPath, "utf8")).toBe(before);
+      await expect(fs.stat(`${scenario.authPath}.lock`)).rejects.toThrow();
+    } finally {
+      await close(scenario);
+    }
+  });
+
+  it.each([
+    ["without Pi's credential store", { sdk: "export {};\n" }],
+    [
+      "with a Pi SDK that lacks the model runtime",
+      { sdk: "export {};\n", authStorage: "export const AuthStorage = {};\n" },
+    ],
+  ])(
+    "fails closed before any session starts %s",
+    async (_name, modules: { sdk: string; authStorage?: string }) => {
+      let scenario: Scenario | undefined;
+      try {
+        scenario = await legacyOAuthScenario("unsupported-pi", {
+          expiresInMs: NEAR_EXPIRY_MS,
+          refresh: "rotate",
+        });
+        const piPackageDir = await makeTempDir("pi-agent-oauth-stub-pi");
+        await fs.mkdir(path.join(piPackageDir, "dist", "core"), { recursive: true });
+        await fs.writeFile(path.join(piPackageDir, "dist", "index.js"), modules.sdk, "utf8");
+        if (modules.authStorage !== undefined) {
+          await fs.writeFile(
+            path.join(piPackageDir, "dist", "core", "auth-storage.js"),
+            modules.authStorage,
+            "utf8",
+          );
+        }
+        // Pi's getPackageDir() honours PI_PACKAGE_DIR, so the refresh loads the stub.
+        vi.stubEnv("PI_PACKAGE_DIR", piPackageDir);
+        const { cwd, events } = scenario;
+        const error = await groupError(
+          runPiAgentGroup([request("unsupported-pi", cwd)], {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+            onLifecycle: (event) => {
+              events.push(event);
+            },
+          }),
+        );
+        expect(error.message).toBe(
+          "Pi agent group cannot refresh OAuth credentials: fixture-legacy; this Pi installation does not provide the modules that agent groups use to refresh OAuth credentials; use Pi's Node package, or configure an API key for the provider",
+        );
+        expect(await refreshCount(scenario)).toBe(0);
+        expect(events).toEqual([]);
+        expect(scenario.mock.requests).toHaveLength(0);
+        expect(listOAuthRefreshMarkers(scenario.markerDir)).toEqual([]);
       } finally {
         await close(scenario);
       }

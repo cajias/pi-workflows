@@ -65,6 +65,10 @@ import { StateDatabase, workflowStatePath } from "../state/database.js";
 import { canonicalJson, type JsonValue } from "../state/json.js";
 import { resourceIdFor } from "../state/mutation.js";
 import {
+  listOAuthRefreshMarkers,
+  oauthRefreshMarkerDirectory,
+} from "../state/oauth-refresh-markers.js";
+import {
   AUTOMATIC_STATE_PRUNE_INTERVAL_MS,
   pruneState,
   pruneStateAutomatically,
@@ -2358,6 +2362,10 @@ export class WorkflowServer {
         ? {}
         : { headlessPi: { source: this.headlessPi.source, ...this.headlessPi.pi } }),
       headlessExtensions: this.headlessExtensions,
+      // Agent group OAuth refresh processes run unsupervised; their markers make them visible.
+      oauthRefreshes: listOAuthRefreshMarkers(
+        oauthRefreshMarkerDirectory(this.headlessPiEnvironment()),
+      ),
       lifecycleContradictions: violations.filter((item) => item.code === "queueState").length,
       stateViolations: violations,
     };
