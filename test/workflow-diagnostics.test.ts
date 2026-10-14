@@ -7,6 +7,7 @@ import { WorkflowMessageStore } from "../src/state/workflow-messages.js";
 import { checkpoint, defineWorkflow } from "../src/workflows/definition.js";
 import {
   UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+  workflowStateNoticeSummary,
   workflowStateNotices,
   workflowStateViolations,
 } from "../src/workflows/diagnostics.js";
@@ -145,7 +146,7 @@ describe("undelivered terminal workflow messages", () => {
         schema: "pi-workflows.state-notices.v1",
         undeliveredTerminalMessages: {
           minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
-          messages: [
+          entries: [
             {
               workflowMessageId: "terminal-made-up-one",
               runId: "made-up-one",
@@ -163,6 +164,17 @@ describe("undelivered terminal workflow messages", () => {
           ],
         },
       });
+      // The status form counts the same messages and names none of them.
+      const summary = workflowStateNoticeSummary(f.queue.state, now);
+      expect(summary).toEqual({
+        schema: "pi-workflows.state-notices.v1",
+        undeliveredTerminalMessages: {
+          minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+          count: 2,
+          oldestAgeMs: 30 * 60 * 60 * 1_000,
+        },
+      });
+      expect(JSON.stringify(summary)).not.toMatch(/made-up|terminal-/u);
       // The report is read-only: no message is cancelled, expired, or deleted.
       expect(tableRows(f.queue.state)).toBe(before);
       expect(f.messages.get("terminal-made-up-one")?.status).toBe("pending");
@@ -189,13 +201,18 @@ describe("undelivered terminal workflow messages", () => {
       f.deliver("earlier", "returning-session");
       f.terminal("later", "returning-session");
       const before = tableRows(f.queue.state);
-      expect(workflowStateNotices(f.queue.state, now).undeliveredTerminalMessages.messages).toEqual(
+      expect(workflowStateNotices(f.queue.state, now).undeliveredTerminalMessages.entries).toEqual(
         [],
       );
+      expect(workflowStateNoticeSummary(f.queue.state, now).undeliveredTerminalMessages).toEqual({
+        minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+        count: 0,
+        oldestAgeMs: null,
+      });
       expect(tableRows(f.queue.state)).toBe(before);
       // The threshold is inclusive once the full minimum age has passed.
       expect(
-        workflowStateNotices(f.queue.state, now + 1).undeliveredTerminalMessages.messages.map(
+        workflowStateNotices(f.queue.state, now + 1).undeliveredTerminalMessages.entries.map(
           (message) => message.runId,
         ),
       ).toEqual(["recent"]);
@@ -221,8 +238,11 @@ describe("undelivered terminal workflow messages", () => {
           "UPDATE workflow_messages SET status = 'pending', pi_session_entry_id = NULL WHERE run_id = 'turned'",
         )
         .run();
-      expect(workflowStateNotices(f.queue.state, now).undeliveredTerminalMessages.messages).toEqual(
+      expect(workflowStateNotices(f.queue.state, now).undeliveredTerminalMessages.entries).toEqual(
         [],
+      );
+      expect(workflowStateNoticeSummary(f.queue.state, now).undeliveredTerminalMessages.count).toBe(
+        0,
       );
     } finally {
       f.queue.close();

@@ -93,30 +93,53 @@ describe("undelivered terminal message notices", () => {
     await server.start();
     const client = new WorkflowClient({ databasePath, clientId: "state-notices" });
     try {
-      const expected = {
-        schema: "pi-workflows.state-notices.v1",
-        undeliveredTerminalMessages: {
-          minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
-          messages: [
-            {
-              workflowMessageId: "terminal-orphan",
-              runId: "orphan",
-              targetSessionId: "made-up-session",
-              createdAt: new Date(createdAt).toISOString(),
-              ageMs: expect.any(Number),
-            },
-          ],
-        },
-      };
       const status = await client.request({ operation: "state.status" });
-      expect(status).toMatchObject({ outcome: "accepted", receipt: { notices: expected } });
-      const age = (status.receipt as { notices: typeof expected }).notices
-        .undeliveredTerminalMessages.messages[0]?.ageMs;
-      expect(age).toBeGreaterThanOrEqual(2 * HOUR_MS);
-      // A notice is not a violation, so verification still accepts the state.
+      expect(status).toMatchObject({
+        outcome: "accepted",
+        receipt: {
+          notices: {
+            schema: "pi-workflows.state-notices.v1",
+            undeliveredTerminalMessages: {
+              minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+              count: 1,
+              oldestAgeMs: expect.any(Number),
+            },
+          },
+        },
+      });
+      const summary = (
+        status.receipt as {
+          notices: { undeliveredTerminalMessages: Record<string, unknown> };
+        }
+      ).notices.undeliveredTerminalMessages;
+      expect(Object.keys(summary).sort()).toEqual(["count", "minimumAgeMs", "oldestAgeMs"]);
+      expect(summary.oldestAgeMs).toBeGreaterThanOrEqual(2 * HOUR_MS);
+      // Status names no session, run, or message of any seeded row.
+      expect(JSON.stringify(status.receipt)).not.toMatch(
+        /made-up-session|returning-session|orphan|returning-|terminal-/u,
+      );
+      // Verification lists every message, and a notice does not fail it.
       await expect(client.request({ operation: "state.verify" })).resolves.toMatchObject({
         outcome: "accepted",
-        receipt: { valid: true, violations: [], notices: expected },
+        receipt: {
+          valid: true,
+          violations: [],
+          notices: {
+            schema: "pi-workflows.state-notices.v1",
+            undeliveredTerminalMessages: {
+              minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+              entries: [
+                {
+                  workflowMessageId: "terminal-orphan",
+                  runId: "orphan",
+                  targetSessionId: "made-up-session",
+                  createdAt: new Date(createdAt).toISOString(),
+                  ageMs: expect.any(Number),
+                },
+              ],
+            },
+          },
+        },
       });
     } finally {
       await client.close();
@@ -135,7 +158,7 @@ describe("undelivered terminal message notices", () => {
     state.close();
     const before = messageStatuses(backupPath);
     const notices = verifyInactiveBackup(backupPath, databasePath);
-    expect(notices.undeliveredTerminalMessages.messages.map((message) => message.runId)).toEqual([
+    expect(notices.undeliveredTerminalMessages.entries.map((message) => message.runId)).toEqual([
       "orphan",
     ]);
     expect(messageStatuses(backupPath)).toEqual(before);

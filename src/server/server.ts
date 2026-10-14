@@ -78,6 +78,7 @@ import { workflowMessageIdFor } from "../state/workflow-messages.js";
 import { humanDecisionChannelRequest } from "../workflows/decision-presentation.js";
 import {
   workflowStateNoticeLines,
+  workflowStateNoticeSummary,
   workflowStateNotices,
   workflowStateViolations,
 } from "../workflows/diagnostics.js";
@@ -2564,7 +2565,8 @@ export class WorkflowServer {
           "SELECT COUNT(*) AS count FROM effects WHERE status IN ('pending', 'applying', 'ambiguous')",
         ),
       },
-      notices: workflowStateNotices(this.state, now),
+      // Status names no session, run, or message; `state verify` lists them.
+      notices: workflowStateNoticeSummary(this.state, now),
     };
   }
 

@@ -188,7 +188,7 @@ work.
 `state status`, `state verify`, and inactive-backup verification also report
 notices. A notice needs an operator's attention but does not make the state
 invalid, so it never changes `valid`, the verification outcome, or the exit code.
-The only notice lists undelivered terminal messages.
+The only notice reports undelivered terminal messages.
 
 A terminal message is the post-workflow handoff to its origin session, and only
 that session's own coordinator can deliver it. A message addressed to a session
@@ -207,18 +207,33 @@ This is the narrowest rule that still finds a message no session will claim. A
 session that did report once keeps its pending result for when it comes back, so
 that result is not listed. Retention can remove an older run that held a
 session's only evidence, so check a listed session before you act on it. The
-report lists all matching messages, oldest first, with no limit. It only reads
-state. It never cancels, expires, or deletes a message.
+report only reads state. It never cancels, expires, or deletes a message.
 
-`state status` returns the report in `notices`, and `state verify` returns it in
-`notices` beside `valid` and `violations`:
+Both commands return the report in `notices`, a `pi-workflows.state-notices.v1`
+value, in one of two forms. `state status` keeps its rule of naming no session,
+run, or message, so its form has only the number of matching messages and the
+age of the oldest one. `oldestAgeMs` is null when no message matches:
 
 ```json
 {
   "schema": "pi-workflows.state-notices.v1",
   "undeliveredTerminalMessages": {
     "minimumAgeMs": 3600000,
-    "messages": [
+    "count": 1,
+    "oldestAgeMs": 108000000
+  }
+}
+```
+
+`state verify` returns `notices` beside `valid` and `violations`. Its form lists
+every matching message in `entries`, oldest first, with no limit:
+
+```json
+{
+  "schema": "pi-workflows.state-notices.v1",
+  "undeliveredTerminalMessages": {
+    "minimumAgeMs": 3600000,
+    "entries": [
       {
         "workflowMessageId": "workflow-message-example",
         "runId": "example-run",
@@ -231,8 +246,8 @@ state. It never cancels, expires, or deletes a message.
 }
 ```
 
-Where the output is text, each message is one line: after the violations of a
-rejected `state verify`, and after the valid line of inactive-backup
+Where verification output is text, each entry is one line: after the violations
+of a rejected `state verify`, and after the valid line of inactive-backup
 verification:
 
 ```text
@@ -469,11 +484,10 @@ pi-workflows state prune --before 2026-08-01T00:00:00Z --backup /absolute/path/t
 
 These commands send maintenance operations to the server when they target the active database. Only `pi-workflows state verify` with an explicit inactive backup opens SQLite in the command process. It rejects the active database, including another path to the same file.
 
-`status` reports only safe counts, file size, active leases, unsettled effects, and
-the [undelivered terminal message notices](#undelivered-terminal-messages). Those
-notices name the message, run, and target session of each listed message so an
-operator can find it, and they carry no message content. Apart from those IDs,
-`status` does not print actor IDs, channel references, payloads, or credentials.
+`status` reports only safe counts, file size, active leases, and unsettled effects.
+It does not print actor IDs, channel references, payloads, or credentials.
+Its [undelivered terminal message notice](#undelivered-terminal-messages) is a
+count and the age of the oldest message; `verify` names the messages.
 
 `prune --dry-run` reports complete terminal run trees older than the cutoff and the trees that safety checks block. It does not change the database. `prune --apply` requires a new absolute backup path. It verifies the backup, locks maintenance, rechecks the same selection in an exclusive transaction, deletes safe aggregates and unreferenced blobs, checkpoints the WAL, vacuums the file, and runs integrity and foreign-key checks. The manual command and automatic retention use the same blocker rules. Automatic retention starts after server recovery and does not create a backup.
 

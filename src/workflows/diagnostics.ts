@@ -97,23 +97,53 @@ export type UndeliveredTerminalMessage = {
   ageMs: number;
 };
 
-/** Facts that need an operator's attention but do not make the state invalid. */
+/**
+ * Facts that need an operator's attention but do not make the state invalid.
+ * `state verify` returns this complete form, which names every message.
+ */
 export type WorkflowStateNotices = {
   schema: typeof STATE_NOTICES_SCHEMA;
   undeliveredTerminalMessages: {
     minimumAgeMs: number;
-    messages: UndeliveredTerminalMessage[];
+    entries: UndeliveredTerminalMessage[];
   };
 };
 
 /**
- * List every pending terminal workflow message that has waited at least
+ * The form of the same notices that `state status` returns. It carries counts and
+ * ages only, so status output keeps its rule of naming no session, run, or message.
+ */
+export type WorkflowStateNoticeSummary = {
+  schema: typeof STATE_NOTICES_SCHEMA;
+  undeliveredTerminalMessages: {
+    minimumAgeMs: number;
+    count: number;
+    /** Age of the oldest listed message, or null when none is listed. */
+    oldestAgeMs: number | null;
+  };
+};
+
+/**
+ * Pending terminal workflow messages that have waited at least
  * `UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS` for a target session that left no
  * retained evidence of ever reporting to the workflow server: no sent workflow
  * message, no workflow turn, and no recorded session segment. Only that session's
- * own coordinator can deliver the message, so it can stay pending forever and keep
- * its run from retention. The report reads state only. It never cancels, expires,
- * or deletes a message, because a terminal message is the post-workflow handoff.
+ * own coordinator can deliver such a message, so it can stay pending forever and
+ * keep its run from retention. Bind the creation cutoff as the only parameter.
+ */
+const UNDELIVERED_TERMINAL_MESSAGES = `FROM workflow_messages m
+  WHERE m.kind = 'terminal' AND m.status = 'pending' AND m.created_at <= ?
+    AND NOT EXISTS (SELECT 1 FROM workflow_messages s
+      WHERE s.target_session_id = m.target_session_id AND s.status = 'sent')
+    AND NOT EXISTS (SELECT 1 FROM workflow_turns t
+      WHERE t.target_session_id = m.target_session_id)
+    AND NOT EXISTS (SELECT 1 FROM session_segments g
+      WHERE g.session_id = m.target_session_id)`;
+
+/**
+ * List every undelivered terminal message, oldest first. The report reads state
+ * only. It never cancels, expires, or deletes a message, because a terminal message
+ * is the post-workflow handoff.
  */
 export function workflowStateNotices(
   state: StateDatabase,
@@ -125,14 +155,7 @@ export function workflowStateNotices(
         .prepare(
           `SELECT m.workflow_message_id AS workflowMessageId, m.run_id AS runId,
              m.target_session_id AS targetSessionId, m.created_at AS createdAt
-           FROM workflow_messages m
-           WHERE m.kind = 'terminal' AND m.status = 'pending' AND m.created_at <= ?
-             AND NOT EXISTS (SELECT 1 FROM workflow_messages s
-               WHERE s.target_session_id = m.target_session_id AND s.status = 'sent')
-             AND NOT EXISTS (SELECT 1 FROM workflow_turns t
-               WHERE t.target_session_id = m.target_session_id)
-             AND NOT EXISTS (SELECT 1 FROM session_segments g
-               WHERE g.session_id = m.target_session_id)
+           ${UNDELIVERED_TERMINAL_MESSAGES}
            ORDER BY m.created_at, m.workflow_message_id`,
         )
         .all(now - UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS) as Array<
@@ -143,7 +166,7 @@ export function workflowStateNotices(
     schema: STATE_NOTICES_SCHEMA,
     undeliveredTerminalMessages: {
       minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
-      messages: rows.map((row) => ({
+      entries: rows.map((row) => ({
         ...row,
         createdAt: new Date(row.createdAt).toISOString(),
         ageMs: now - row.createdAt,
@@ -152,9 +175,36 @@ export function workflowStateNotices(
   };
 }
 
+/** Count the same messages and report the oldest age, without naming any of them. */
+export function workflowStateNoticeSummary(
+  state: StateDatabase,
+  now: number = Date.now(),
+): WorkflowStateNoticeSummary {
+  const row = state.readTransaction(
+    () =>
+      state.connection
+        .prepare(
+          `SELECT COUNT(*) AS count, MIN(m.created_at) AS oldestCreatedAt
+           ${UNDELIVERED_TERMINAL_MESSAGES}`,
+        )
+        .get(now - UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS) as {
+        count: number;
+        oldestCreatedAt: number | null;
+      },
+  );
+  return {
+    schema: STATE_NOTICES_SCHEMA,
+    undeliveredTerminalMessages: {
+      minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+      count: row.count,
+      oldestAgeMs: row.oldestCreatedAt === null ? null : now - row.oldestCreatedAt,
+    },
+  };
+}
+
 /** One text line for every notice, for output that does not carry the structured value. */
 export function workflowStateNoticeLines(notices: WorkflowStateNotices): string[] {
-  return notices.undeliveredTerminalMessages.messages.map(
+  return notices.undeliveredTerminalMessages.entries.map(
     (message) =>
       `notice undeliveredTerminalMessage ${message.workflowMessageId}: run ${message.runId}, target session ${message.targetSessionId} never reported; pending since ${message.createdAt} (${(message.ageMs / 3_600_000).toFixed(1)} h)`,
   );
