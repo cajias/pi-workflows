@@ -1704,11 +1704,11 @@ These are out of scope for this plan.
     `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
     not from a named external interface.
   - `PiAgentGroupError.detail` keeps the complete cause.
-  - Done with option C in `2658b97`, `76aa054`, `8528757`, `b9c5350`, and `cce280b`: agent errors
+  - Done with option C in `56d24c5`, `1551281`, `d08e022`, `9de9ddc`, and `8ad0cfd`: agent errors
     carry only codes and Pi Workflows' own facts, plus the full path of a private `0600` cause
     file, and nothing is truncated. Command-batch errors state only the exit status, and the item
     keeps its complete stdout and stderr.
-  - Second-round review fixes in `5fee020`, `6add745`, and `e233d92`: pi cleanup and start
+  - Second-round review fixes in `b530394`, `c4123be`, and `82bc63e`: pi cleanup and start
     failures keep the group's outcome, only the group runner's own agent errors keep visible
     facts, and a rejected complete-label update is retried.
 - F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
@@ -1724,14 +1724,14 @@ These are out of scope for this plan.
   - Review fixes in `be1f636` and `1f1da97`: children receive only the dispatch credential, and a
     test rejects a virtual dispatch model.
   - Superseded: `df024ad` added an interim gate that refused OAuth credentials for Pi-defined
-    providers, and the second-round review fix `bea8e3e` applied it to Pi providers that
+    providers, and the second-round review fix `fee7e2a` applied it to Pi providers that
     extensions re-register.
-  - OAuth done with the human's option A in `04d1f17` and `f9c2256`: before the group starts, Pi's
+  - OAuth done with the human's option A in `8c2cc74` and `35c451f`: before the group starts, Pi's
     own `AuthStorage` refreshes the dispatch provider's OAuth credential at most once, under its
     file lock, when the credential would not outlive the run bound plus a 10-minute margin. The
     group fails closed when the refresh fails or the token is still too short. Children never
     refresh, and legacy extension OAuth is covered.
-  - OAuth refresh hardening in `76b4658`, `7c00812`, `945f79f`, `27256c1`, and `fe662a6`: the
+  - OAuth refresh hardening in `c08a0e9`, `bbdc56d`, `5003478`, `aa0c6cd`, and `f04621f`: the
     refresh runs in its own process, which no pi-workflows stop reaches, and that process exits at
     the latest 5 minutes after the refresh starts. Private marker files list each refresh in
     `server status` as `oauthRefreshes`. The group fails closed on a missing or changed entry, a
@@ -1772,7 +1772,7 @@ These are out of scope for this plan.
   - Review fixes in `0bdafbe`, `bf33a4a`, and `96fcba7`: piArgs reject `--`, and the opt-in
     `PI_WORKFLOWS_HEADLESS_EXTENSIONS` loads the listed extensions for every server start path,
     including the auto-spawned server.
-  - Second-round review fixes in `455ee46`, `b06d30a`, `aa0743e`, `26428ed`, and `4d5afe0`:
+  - Second-round review fixes in `266bc1e`, `a0b69ad`, `75e551d`, `b445ef7`, and `beacb4c`:
     entries must be extension files, the server pins each realpath and rechecks it before each
     launch, the docs say that file contents are not pinned, and an entry that vanishes during its
     check fails closed with a clear error.
@@ -1780,13 +1780,18 @@ These are out of scope for this plan.
   - Done in `7ec4245`: lockfile regenerated so pi-style installs leave the checkout clean.
 - F32: Fail headless steps whose configured default model cannot be resolved instead of silently
   falling back. _(done)_
-  - Done in `d2afe66` (red reproduction), `7447089`, and `23f88d0`: headless pi stops before any
-    model request, and the step fails with an error that names the default and how to fix it.
-  - Second-round review fix in `15ddf8e`: the error names the server restart that picks up a
+  - Done in `5579bfd` and `ca7bfe1`: headless pi stops before any model request, and the step
+    fails with an error that names the default and how to fix it.
+  - Second-round review fix in `e0c78d0`: the error names the server restart that picks up a
     changed `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or changed extra Pi arguments.
+  - Round-4 fix in `1ff25d5`: a `--models` or `enabledModels` scope counts as an explicit choice.
+    The step runs on the first usable model in the scope, fails clearly when nothing in the scope
+    is usable, and never falls back to a model outside the scope. A step with no settings default
+    but a scope that matches nothing usable now fails; before, it ran on Pi's first available
+    model.
 - F33: Require the origin session for interactive run.start and report undelivered terminal
   messages. _(done)_
-  - Done in `a7bb8fd`, `0839408`, `483cc79`, `0979384`, `08b1fb8`, `c704399`, and `7cf2392`:
+  - Done in `a08ee63`, `2bce3fe`, `dbf2509`, `0101bdb`, `87f81ae`, `12b749b`, and `086f3a9`:
     - an interactive `run.start` requires a live session command for its origin session, and a
       start whose connection is lost retries with fresh authority and the same idempotency key;
     - `state status` reports the count and oldest age of undelivered terminal messages, and
@@ -1801,6 +1806,24 @@ These are out of scope for this plan.
   - Found during F33: both commands build their session authority once, so a retry after a lost
     connection carries the stale coordinator epoch and is rejected as replaced. A user retry can
     then queue a second follow-up or apply a settings patch twice.
+- F36: Isolate HOME, the Pi agent dir, and user config for every test process. _(done)_
+  - Done in `9bb3a13`, `945d7c2`, and `4a77241`: the global test setup points HOME,
+    `PI_CODING_AGENT_DIR`, the XDG directories, git's global config, and npm's cache and user
+    config at a temporary root, unsets inherited Pi session, headless-extension, herdr, and GitLab
+    host variables, and keeps `PI_WORKFLOWS_E2E_PI_ENTRY` as an explicit opt-in. A guard test
+    fails when any isolated path points outside the temporary root.
+  - Residual: test servers still read the header of the real `pi` on `PATH` (read-only); the
+    herdr-package e2e `npm pack` builds into the repo's `dist/`; the default macOS TMPDIR may
+    exceed the socket path limit; and npm's own cache from the gates' `npm ci` and `npx` is
+    tooling, not test state.
+- F37: Settle progress tracks left open when the server fails a run without the engine
+  (`failWorkflowRun`) or discards an attempt on resume.
+- F38: Report Pi's own reason when no model exists at all; headless steps now show only
+  `exited mid-step (code 1)`.
+- F39: Let user workflows that reuse built-in Sanity Check nodes reach the runner's agent group
+  launcher.
+- F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
+  builtin-autoimplement-forge.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
