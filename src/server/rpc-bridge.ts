@@ -14,9 +14,9 @@ import {
   WorkflowSubmissionToolParameters,
 } from "../workflows/tool-input.js";
 import {
-  describeUnusableDefaultModel,
-  findUnusableDefaultModel,
-  type DefaultModelSources,
+  describeHeadlessModelProblem,
+  findHeadlessModelProblem,
+  type ModelSettingSources,
 } from "./headless-step-model.js";
 import { encodeRpcModelError, RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
 
@@ -101,7 +101,7 @@ export function registerRpcBridge(pi: RpcBridgeApi, runtime: RpcBridgeRuntime): 
   pi.on("session_start", (_event, ctx) => {
     let error: string | undefined;
     try {
-      error = unusableDefaultModelError(pi, ctx, runtime);
+      error = headlessModelError(pi, ctx, runtime);
     } catch (cause) {
       error = `Headless pi could not check the model that it chose for workflow steps: ${errorMessage(cause)}`;
     }
@@ -109,30 +109,36 @@ export function registerRpcBridge(pi: RpcBridgeApi, runtime: RpcBridgeRuntime): 
   });
 }
 
-function unusableDefaultModelError(
+function headlessModelError(
   pi: RpcBridgeApi,
   ctx: RpcBridgeSessionContext,
   runtime: RpcBridgeRuntime,
 ): string | undefined {
   const settings = pi.getSettings();
+  const args = parseArgs([...runtime.argv]);
   const registry = ctx.modelRegistry;
-  const unusable = findUnusableDefaultModel({
-    explicitModel: Boolean(parseArgs([...runtime.argv]).model),
+  const problem = findHeadlessModelProblem({
+    explicitModel: Boolean(args.model),
+    // The same patterns that Pi resolved into `ctx.scopedModels` (Pi 1.1.0 `main.js` 658).
+    scope: {
+      patterns: args.models ?? settings.enabledModels ?? [],
+      fromCommandLine: args.models !== undefined,
+      models: ctx.scopedModels.map((scoped) => scoped.model),
+    },
     defaultProvider: settings.defaultProvider,
     defaultModel: settings.defaultModel,
     selected: ctx.model,
-    scoped: ctx.scopedModels.map((scoped) => scoped.model),
     find: (provider, id) => registry.find(provider, id),
     hasProvider: (provider) => registry.getAll().some((model) => model.provider === provider),
     hasConfiguredAuth: (model) => registry.hasConfiguredAuth(model),
   });
-  return unusable === undefined
+  return problem === undefined
     ? undefined
-    : describeUnusableDefaultModel(unusable, defaultModelSources(ctx, runtime.agentDir));
+    : describeHeadlessModelProblem(problem, modelSettingSources(ctx, runtime.agentDir));
 }
 
-/** The settings file that sets each default field, read the way the session read them. */
-function defaultModelSources(ctx: RpcBridgeSessionContext, agentDir: string): DefaultModelSources {
+/** The settings file that sets each model setting, read the way the session read them. */
+function modelSettingSources(ctx: RpcBridgeSessionContext, agentDir: string): ModelSettingSources {
   const cwd = path.resolve(ctx.cwd);
   const settings = SettingsManager.create(cwd, agentDir, {
     projectTrusted: ctx.isProjectTrusted(),
@@ -141,9 +147,13 @@ function defaultModelSources(ctx: RpcBridgeSessionContext, agentDir: string): De
   const global = settings.getGlobalSettings();
   const projectPath = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
   const globalPath = path.join(path.resolve(agentDir), "settings.json");
-  const sourceOf = (key: "defaultProvider" | "defaultModel"): string | undefined => {
+  const sourceOf = (key: keyof ModelSettingSources): string | undefined => {
     if (project[key] !== undefined) return projectPath;
     return global[key] === undefined ? undefined : globalPath;
   };
-  return { defaultProvider: sourceOf("defaultProvider"), defaultModel: sourceOf("defaultModel") };
+  return {
+    defaultProvider: sourceOf("defaultProvider"),
+    defaultModel: sourceOf("defaultModel"),
+    enabledModels: sourceOf("enabledModels"),
+  };
 }

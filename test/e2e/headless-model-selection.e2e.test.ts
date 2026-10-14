@@ -323,6 +323,64 @@ describe("headless agent steps and the configured Pi model", () => {
     expect(fallbackRequests().slice(before)).not.toContain(FALLBACK_MODEL);
   });
 
+  it("runs a step on the first usable scoped model when the default is unusable", async () => {
+    // Pi's first available model is FALLBACK_MODEL, so a request for SCOPED_MODEL shows that
+    // Pi chose inside the scope. The unmatched extension pattern only warns.
+    const viaSettings = await makeHome(
+      "scope-settings",
+      {
+        defaultProvider: EXTENSION_PROVIDER,
+        defaultModel: EXTENSION_MODEL,
+        enabledModels: [`${EXTENSION_PROVIDER}/*`, `${FALLBACK_PROVIDER}/${SCOPED_MODEL}`],
+      },
+      [FALLBACK_MODEL, SCOPED_MODEL],
+    );
+    const viaCommandLine = await makeHome(
+      "scope-command-line",
+      { defaultProvider: EXTENSION_PROVIDER, defaultModel: EXTENSION_MODEL },
+      [FALLBACK_MODEL, SCOPED_MODEL],
+    );
+    for (const [home, id, piArgs] of [
+      [viaSettings, "scope-settings", []],
+      [viaCommandLine, "scope-command-line", ["--models", `${FALLBACK_PROVIDER}/${SCOPED_MODEL}`]],
+    ] as const) {
+      const before = mock.requests.length;
+      await expect(runStep(home, id, [...piArgs])).resolves.toBeDefined();
+      expect(fallbackRequests().slice(before)).toContain(SCOPED_MODEL);
+      expect(fallbackRequests().slice(before)).not.toContain(FALLBACK_MODEL);
+    }
+  });
+
+  it("fails a step whose model scope holds no usable model", async () => {
+    // Pi would otherwise run on the usable default, which is outside the scope.
+    const usableDefault = await makeHome("empty-scope-settings", {
+      defaultProvider: FALLBACK_PROVIDER,
+      defaultModel: FALLBACK_MODEL,
+      enabledModels: [`${EXTENSION_PROVIDER}/*`],
+    });
+    const before = mock.requests.length;
+    const error = await runStep(usableDefault, "empty-scope-settings").then(
+      () => "the step ran",
+      (failure: unknown) => (failure instanceof Error ? failure.message : String(failure)),
+    );
+    expect(error).toContain(
+      `inside the model scope "${EXTENSION_PROVIDER}/*" from the \`enabledModels\` Pi setting in ${path.join(usableDefault.agentDir, "settings.json")}: no model that headless pi can use matches it.`,
+    );
+    expect(error).toContain(`Pi would have used "${FALLBACK_PROVIDER}/${FALLBACK_MODEL}" instead`);
+    // A --models scope wins over enabledModels and fails the same way.
+    const commandLine = await makeHome("empty-scope-command-line", {
+      defaultProvider: EXTENSION_PROVIDER,
+      defaultModel: EXTENSION_MODEL,
+      enabledModels: [`${FALLBACK_PROVIDER}/*`],
+    });
+    await expect(
+      runStep(commandLine, "empty-scope-command-line", ["--models", `${EXTENSION_PROVIDER}/*`]),
+    ).rejects.toThrow(
+      `inside the model scope "${EXTENSION_PROVIDER}/*" from \`--models\` in the server's extra Pi arguments: no model that headless pi can use matches it.`,
+    );
+    expect(fallbackRequests().slice(before)).toEqual([]);
+  });
+
   it("keeps Pi's first available model when no default is configured", async () => {
     const home = await makeHome("no-default", {});
     const before = mock.requests.length;

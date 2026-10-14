@@ -10,7 +10,7 @@ import { RPC_SUBMISSION_PREFIX } from "../src/server/rpc-protocol.js";
 import { makeTempDir } from "./helpers.js";
 
 type Model = { provider: string; id: string };
-type Settings = { defaultProvider?: string; defaultModel?: string };
+type Settings = { defaultProvider?: string; defaultModel?: string; enabledModels?: string[] };
 
 const FALLBACK: Model = { provider: "fallback", id: "fallback-model" };
 const CUSTOM: Model = { provider: "custom", id: "custom-model" };
@@ -55,6 +55,8 @@ function startSession(options: {
   settings: Settings | Error;
   selected?: Model;
   models?: Model[];
+  /** The scope that Pi resolved from `--models` or `enabledModels`. */
+  scoped?: Model[];
   argv?: string[];
   projectTrusted?: boolean;
 }): { stops: string[]; tools: Tool[] } {
@@ -87,7 +89,7 @@ function startSession(options: {
   sessionStart?.({ type: "session_start", reason: "startup" }, {
     cwd: project,
     model: options.selected ?? FALLBACK,
-    scopedModels: [],
+    scopedModels: (options.scoped ?? []).map((model) => ({ model })),
     modelRegistry: registry,
     isProjectTrusted: () => options.projectTrusted ?? false,
   } as unknown as RpcBridgeSessionContext);
@@ -164,5 +166,42 @@ describe("rpc-bridge default model check", () => {
     expect(startSession({ settings: new Error("settings are not bound") }).stops).toEqual([
       "Headless pi could not check the model that it chose for workflow steps: settings are not bound",
     ]);
+  });
+
+  it("lets Pi start on a model in the scope when the default is not available", () => {
+    const settings = {
+      defaultProvider: "custom",
+      defaultModel: "custom-model",
+      enabledModels: ["fallback/*"],
+    };
+    expect(startSession({ settings, scoped: [FALLBACK] }).stops).toEqual([]);
+    expect(
+      startSession({
+        settings: { defaultProvider: "custom", defaultModel: "custom-model" },
+        scoped: [FALLBACK],
+        argv: [...PI_ARGS, "--models", "fallback/*"],
+      }).stops,
+    ).toEqual([]);
+  });
+
+  it("stops Pi when no model in the enabledModels scope is usable", async () => {
+    const settings = { enabledModels: ["custom/*"] };
+    await writeSettings(path.join(project, ".pi", "settings.json"), settings);
+    const { stops } = startSession({ settings, projectTrusted: true });
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toContain(
+      `inside the model scope "custom/*" from the \`enabledModels\` Pi setting in ${path.join(project, ".pi", "settings.json")}: no model that headless pi can use matches it.`,
+    );
+    expect(stops[0]).toContain('Pi would have used "fallback/fallback-model" instead');
+  });
+
+  it("stops Pi when no model in the --models scope is usable, ahead of enabledModels", () => {
+    const { stops } = startSession({
+      settings: { enabledModels: ["fallback/*"] },
+      argv: [...PI_ARGS, "--models", "custom/*,other"],
+    });
+    expect(stops[0]).toContain(
+      'inside the model scope "custom/*", "other" from `--models` in the server\'s extra Pi arguments:',
+    );
   });
 });

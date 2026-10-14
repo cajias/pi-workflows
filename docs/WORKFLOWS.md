@@ -239,7 +239,8 @@ on its own `PATH` once. The pin stays until the server restarts, and
 [Headless Pi command](WORKFLOW_SERVER.md#headless-pi-command).
 
 A headless agent step fails before any model request when its Pi child cannot use the default
-model from Pi settings. See [Headless step model](#headless-step-model).
+model from Pi settings, or when no usable model matches its model scope. See
+[Headless step model](#headless-step-model).
 
 Pause stops the runner and parks at the last durable boundary. Resume takes a
 new generation. Cancellation can stop a live runner or atomically claim and
@@ -1491,22 +1492,28 @@ complete rules.
 A headless agent step runs in `pi --mode rpc --no-session --no-extensions -e <rpc-bridge>`, followed by `-e` for each of the [headless extensions](#headless-extensions) and the server's [extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments). Headless runs use it, including the runs that resource managers start. Pi chooses the child's model once, when the child starts:
 
 1. `--model`, with or without `--provider`, from the extra Pi arguments. Pi exits with an error when it cannot resolve them, so the step fails with the child's exit.
-2. Otherwise, when `--models` or the `enabledModels` setting sets a model scope, the settings default if the scope holds it, else the first scoped model.
+2. Otherwise, when a model scope is set, the settings default if the scope holds it, else the first scoped model. The scope comes from `--models` in the extra Pi arguments, or else from the `enabledModels` setting; `--models` replaces `enabledModels` rather than adding to it. Pi matches the scope's patterns only against models it can use, so the scope holds only usable models. When no pattern matches one, Pi warns on stderr, treats the scope as empty, and goes on to step 3.
 3. Otherwise, the settings default: `defaultProvider` and `defaultModel` from the user's `<agent dir>/settings.json`, overridden by the run project's `.pi/settings.json` when Pi trusts that project. Headless pi has no trust prompt, so it trusts a project only from a remembered decision or the `defaultProjectTrust` setting.
 4. Otherwise, Pi's first available model with configured authentication.
 
 Workflow definitions, step contracts, and the RPC executor never choose a model. The executor sends no `set_model`.
 
-Pi moves from step 3 to step 4 without a diagnostic when it cannot use the default. Headless pi loads no extension except the bridge, the [headless extensions](#headless-extensions), and those in the extra Pi arguments, so a default whose provider only a user extension registers would otherwise run the step on another model. The bridge therefore checks the session's model when Pi emits `session_start`, after Pi chose the model and before it reads any RPC command. It stops pi when all of these hold:
+Pi moves from step 3 to step 4 without a diagnostic when it cannot use the default, and from step 2 to step 3 with only a warning when no model in the scope is usable. Headless pi loads no extension except the bridge, the [headless extensions](#headless-extensions), and those in the extra Pi arguments, so a default or scope whose provider only a user extension registers would otherwise run the step on another model. The bridge therefore checks the session's model when Pi emits `session_start`, after Pi chose the model and before it reads any RPC command. It compares the session's model with the scope that Pi resolved, the same `--models` or `enabledModels` patterns, and with the effective settings. A `--model` on the command line is never checked further.
 
-- the command line names no `--model`;
+With a model scope, the scope is the user's choice. Any model that Pi resolved into it is accepted, even when the settings default is unusable or set to a model outside the scope. The bridge stops pi only when:
+
+- no model that headless pi can use matches the scope, so Pi would fall back to the default or to its first available model, outside the scope; or
+- the session started outside the resolved scope, or on a scoped model whose provider has no configured authentication.
+
+Without a model scope, the bridge stops pi when all of these hold:
+
 - the effective settings set both `defaultProvider` and `defaultModel`;
 - the session did not start on that model; and
-- the child cannot use the default: it has no such provider, the provider has no such model, or the provider has no configured authentication. A usable default that a model scope leaves out is Pi's normal step 2 choice and is not an error.
+- the child cannot use the default: it has no such provider, the provider has no such model, or the provider has no configured authentication.
 
-The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default, the settings file that sets each field, the reason, the model that Pi would have used, and the fixes: load the provider's extension through `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or with `-e`, name a model with `--provider` and `--model`, or change the default. It also says that the server reads `PI_WORKFLOWS_HEADLESS_EXTENSIONS` and its extra Pi arguments only when it starts, so a change needs `pi-workflows server stop`, and that `pi-workflows server status` shows the loaded `headlessExtensions`. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
+The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default or the scope's patterns, where they are set (the settings file that sets each default field or `enabledModels`, or `--models` in the server's extra Pi arguments), the reason, the model that Pi would have used, and the fixes: load the provider's extension through `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or with `-e`, name a model with `--provider` and `--model`, or change the default or the scope. It also says that the server reads `PI_WORKFLOWS_HEADLESS_EXTENSIONS` and its extra Pi arguments only when it starts, so a change needs `pi-workflows server stop`, and that `pi-workflows server status` shows the loaded `headlessExtensions`. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
 
-With no settings default, or with only one of the two fields, Pi ignores the default, as it does in an interactive session, and the step runs on Pi's first available model. Headless pi may lack the extension providers of an interactive session, so this choice can differ from the interactive one. Name a model with `--provider` and `--model` in the extra Pi arguments when the choice matters. If no model is available at all, Pi itself exits at start and the step fails with that exit.
+With no model scope and no settings default, or with only one of the two default fields, Pi ignores the default, as it does in an interactive session, and the step runs on Pi's first available model. Headless pi may lack the extension providers of an interactive session, so this choice can differ from the interactive one. Name a model with `--provider` and `--model` in the extra Pi arguments when the choice matters. If no model is available at all, Pi itself exits at start and the step fails with that exit.
 
 The [Sanity Check](#built-in-sanity-check) agent group host loads the agent group bridge instead and makes no model request itself. Its child sessions check their own exact model.
 
