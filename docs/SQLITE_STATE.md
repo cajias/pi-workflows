@@ -235,9 +235,14 @@ COMMIT
 
 Any failed check rolls back the complete command.
 
-One command increments the run resource revision more than once: the queue's run
-cancellation (`WorkflowRunQueueStore.cancelWorkflowRun`, through `terminalRun` or
-`cancelStaleWorkflowRun`, and their shared `cancelWorkflowRunDependents`). A workflow server
+A command that combines several domain writes in one transaction advances the run resource
+revision once for each event it writes. For example, an `interaction.update` claims the waiting
+run for control, publishes the update, and parks the run again, which is +3. Failing a run whose
+missing-submission reminders ran out claims the run and then fails it, which is +2.
+
+The queue's run cancellation (`WorkflowRunQueueStore.cancelWorkflowRun`, through `terminalRun` or
+`cancelStaleWorkflowRun`, and their shared `cancelWorkflowRunDependents`) advances the run
+revision by N + 1, where N is the number of progress tracks it settles. A workflow server
 cancellation commits outside the engine and stops the runner, so the cancelled attempt cannot
 settle its own progress tracks. The transaction settles them itself: every open progress track
 of an attempt it cancels gets a terminal `cancelled` record. Each record is an ordinary

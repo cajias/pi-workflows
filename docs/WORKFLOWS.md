@@ -1231,17 +1231,24 @@ estimate no longer applies.
   [SQLite state](SQLITE_STATE.md#write-contract) describes.
 - A parked attempt is abandoned for resume, not ended, so its tracks stay open.
   This includes a runner that the workflow server stops for a pause, a
-  handoff, or a server shutdown. When the node runs again, its new attempt
-  publishes its tracks again. If the run is cancelled while it is parked, the
-  cancellation settles them.
+  handoff, or a server shutdown. If the run is cancelled while it is parked,
+  the cancellation settles them.
 
-Known limitation: a run that the workflow server fails without the engine
-keeps the open tracks of its last attempt. This covers
-`WorkflowRunStore.markRunInterrupted`, which fails an abandoned run as
-interrupted, and `WorkflowRunQueueStore.failWorkflowRun`, which the server uses
-when the missing-submission reminders run out or a runner cannot load its
-workflow source. Those tracks keep the last state that their attempt
-published, while the run and node status show the failure.
+Known limitations:
+
+- When a parked run resumes and the node runs again under a new attempt, the
+  discarded attempt's open tracks are not settled. A track is replaced only
+  when the new attempt publishes the same key again. A key that the new
+  attempt never publishes keeps its last open state, also after the run later
+  completes or is cancelled.
+- A run that the workflow server fails without the engine keeps the open
+  tracks of its last attempt. The server does this with
+  `WorkflowRunQueueStore.failWorkflowRun` when the missing-submission
+  reminders run out or a runner cannot load its workflow source. Those tracks
+  keep the last state that their attempt published, while the run and node
+  status show the failure. `WorkflowRunStore.markRunInterrupted`, which fails
+  an abandoned run as interrupted, behaves the same way, but nothing in
+  production calls it at present.
 
 ## Wake recovery
 
