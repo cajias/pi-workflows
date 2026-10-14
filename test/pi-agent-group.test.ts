@@ -1388,6 +1388,43 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
     }
   });
 
+  it("rejects a virtual model as the dispatch model before any request", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const agentDir = await makeTempDir("pi-agent-group-virtual-model");
+    const cwd = await makeTempDir("pi-agent-group-virtual-model-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      // The admitted extension lists `fixture-virtual` under the dispatch provider. Its router
+      // would send requests to a physical model, so the dispatch is not exact.
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("virtual"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "fixture-virtual" },
+              thinkingLevel: "high",
+            },
+          ],
+          {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+            behaviorExtensionPaths: [fixtureExtension("virtual-model")],
+          },
+        ),
+      ).rejects.toThrow(`Pi agent virtual has no model: ${BUILTIN_PROVIDER}/fixture-virtual`);
+      expect(mock.requests).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
   it("runs an extension provider without a cached model catalog while offline", async () => {
     const agentDir = await makeTempDir("pi-agent-group-extension-offline");
     const cwd = await makeTempDir("pi-agent-group-extension-offline-project");
