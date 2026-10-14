@@ -195,7 +195,14 @@ follows the database. Use one of these isolations:
 - **A scratch database.** Pass
   `new WorkflowClient({ databasePath: "/var/tmp/<scratch>/state.sqlite" })` and
   call `ensureAvailable()`. The client starts a server for that database with
-  its own socket under `<scratch>/server/`.
+  its own socket under `<scratch>/server/`. Also set `PI_WORKFLOWS_CONFIG_DIR` to
+  a scratch directory, or to one without `channels.json` and `credentials.json`,
+  in the script's environment or the client's `env` option. The started server
+  inherits that environment, and at start it loads the decision channels and
+  their credentials from `PI_WORKFLOWS_CONFIG_DIR`, or from
+  `~/.config/pi-workflows` when it is unset. With the real configuration, the
+  scratch server would start live Telegram adapters with the real bot
+  credentials.
 - **A scratch HOME.** Run the whole script with `HOME` (`USERPROFILE` on Windows)
   set to a scratch directory and `PI_WORKFLOWS_CONFIG_DIR` set to a scratch
   directory. The default database and its socket then move under the scratch
