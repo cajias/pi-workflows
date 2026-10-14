@@ -18,7 +18,7 @@ import {
 import { serverLockPath, stopRecordedServer } from "../src/server/lock.js";
 import { WorkflowServer } from "../src/server/server.js";
 import type { JsonValue } from "../src/state/json.js";
-import { makeTempDir, waitUntil } from "./helpers.js";
+import { makeStateDatabasePath, makeTempDir, waitUntil } from "./helpers.js";
 
 describe("WorkflowClient", () => {
   it("reports a socket path above the operating system limit as a blocker", async () => {
@@ -967,7 +967,9 @@ describe("WorkflowClient", () => {
   });
 
   it("hydrates repeated content references once and preserves escaped user values", async () => {
-    const client = new WorkflowClient();
+    const client = new WorkflowClient({
+      databasePath: await makeStateDatabasePath("client-content-hydration"),
+    });
     const content = Buffer.from('{"answer":"complete"}', "utf8");
     const opaqueContent = Buffer.from(
       '{"$artifact":{"path":"user-path","mediaType":"user-type","bytes":1,"sha256":"user-digest"}}',
@@ -1076,7 +1078,9 @@ describe("WorkflowClient", () => {
   });
 
   it("rejects invalid and failed exact run responses", async () => {
-    const client = new WorkflowClient();
+    const client = new WorkflowClient({
+      databasePath: await makeStateDatabasePath("client-exact-run-errors"),
+    });
     const request = vi.spyOn(client, "request");
     request.mockResolvedValueOnce({
       schema: CLIENT_PROTOCOL_SCHEMA,
