@@ -110,6 +110,28 @@ process whose start identity still matches, and then removes the root. A
 killed run can still leave a server behind, so check `ps` after an interrupted
 run.
 
+Every test process runs with an isolated user environment. `test/global-setup.ts`,
+which both Vitest configurations load, points these at the run's temporary root:
+
+- `HOME` and `PI_CODING_AGENT_DIR`, so the workflow database, global workflows,
+  global resource managers, and Pi settings, auth, and models never resolve to
+  the developer's `~/.pi/agent`;
+- the XDG base directories and `PI_WORKFLOWS_CONFIG_DIR`;
+- Git's global configuration, which is an empty file, with system configuration
+  off;
+- npm's cache and user configuration, with the update notifier off.
+
+It also unsets `PI_CODING_AGENT_SESSION_DIR`, `PI_WORKFLOWS_E2E_PI_ENTRY`,
+`PI_WORKFLOWS_HEADLESS_EXTENSIONS`, `HERDR_ENV`, and `GITLAB_HOST`, so a parent Pi
+or Herdr session cannot change what the suite runs. Children that inherit the
+environment, such as workflow servers, resolvers, runners, and `npm pack`, see
+the same values. `test/test-isolation.test.ts` fails when any of these paths
+resolves outside the temporary root. No global Git identity exists, so a test
+that commits sets `user.name` and `user.email` in its own repository.
+
+The gate commands themselves are tooling, not tests. `npm ci` and `npx` still use
+npm's own cache under the developer's home.
+
 Slophammer runs in CI (coverage, complexity max 8, DRY max 0 findings,
 dependency boundaries). Run it locally with:
 
