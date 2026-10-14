@@ -64,28 +64,33 @@ export function availableHeadlessExtensions(extensions: HeadlessExtensions): str
   });
 }
 
+/**
+ * Check one entry and return the real file behind it. The path is resolved and examined once,
+ * and a file that disappears between those steps counts as missing rather than as an error.
+ */
 function inspectExtension(entry: string): { realpath: string } | { problem: string } {
-  const problem = extensionProblem(entry);
-  return problem === undefined ? { realpath: fs.realpathSync(entry) } : { problem };
-}
-
-function extensionProblem(entry: string): string | undefined {
-  if (!path.isAbsolute(entry)) return `${JSON.stringify(entry)} is not an absolute path`;
+  if (!path.isAbsolute(entry))
+    return { problem: `${JSON.stringify(entry)} is not an absolute path` };
   let real: string;
+  let stat: fs.Stats;
   try {
     real = fs.realpathSync(entry);
+    stat = fs.statSync(real);
   } catch {
-    return `${entry} does not exist`;
+    return { problem: `${entry} does not exist` };
   }
-  const stat = fs.statSync(real);
   if (stat.isDirectory()) {
-    return `${entry} is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts`;
+    return {
+      problem: `${entry} is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts`,
+    };
   }
-  if (!stat.isFile()) return `${entry} is not a regular file`;
+  if (!stat.isFile()) return { problem: `${entry} is not a regular file` };
   if (isPiWorkflows(real)) {
-    return `${entry} is part of pi-workflows, whose extension must not load beside the headless bridge`;
+    return {
+      problem: `${entry} is part of pi-workflows, whose extension must not load beside the headless bridge`,
+    };
   }
-  return undefined;
+  return { realpath: real };
 }
 
 /** Inside this package's root, or inside any package with this package's name. */

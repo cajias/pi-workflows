@@ -1,6 +1,7 @@
+import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HEADLESS_EXTENSIONS_ENV,
   availableHeadlessExtensions,
@@ -29,6 +30,17 @@ async function extensionPackage(name?: string): Promise<{ root: string; extensio
   }
   return { root, extension };
 }
+
+/** Make the next stat fail as if the file vanished after its path was resolved. */
+function vanishOnNextStat(): void {
+  vi.spyOn(syncFs, "statSync").mockImplementationOnce(() => {
+    throw Object.assign(new Error("ENOENT: no such file or directory, stat"), { code: "ENOENT" });
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("readHeadlessExtensions", () => {
   it("lists nothing unless the opt-in is set", () => {
@@ -76,6 +88,14 @@ describe("readHeadlessExtensions", () => {
     // This package's own root.
     expect(readHeadlessExtensions(listed(path.resolve(".")))).toEqual({
       error: directory(path.resolve(".")),
+    });
+  });
+
+  it("reports a file that vanishes while it is checked instead of throwing", async () => {
+    const file = await extensionPackage();
+    vanishOnNextStat();
+    expect(readHeadlessExtensions(listed(file.extension))).toEqual({
+      error: `${HEADLESS_EXTENSIONS_ENV} is invalid: ${file.extension} does not exist. Fix it, ${RESTART}`,
     });
   });
 
@@ -149,6 +169,17 @@ describe("availableHeadlessExtensions", () => {
     expect(() => availableHeadlessExtensions(pinned)).toThrow(
       changed(file.extension, `${file.extension} ${DIRECTORY}`),
     );
+  });
+
+  it("fails closed when a pinned file vanishes during the launch check", async () => {
+    const file = await extensionPackage();
+    const pinned = readHeadlessExtensions(listed(file.extension));
+    vanishOnNextStat();
+    expect(() => availableHeadlessExtensions(pinned)).toThrow(
+      changed(file.extension, `${file.extension} does not exist`),
+    );
+    // The file is still there, so the next launch check passes again.
+    expect(availableHeadlessExtensions(pinned)).toEqual([await fs.realpath(file.extension)]);
   });
 
   it("fails closed when a symlink points elsewhere after start", async () => {
