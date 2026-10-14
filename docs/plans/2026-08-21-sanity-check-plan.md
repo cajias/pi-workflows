@@ -8,6 +8,8 @@ status: implemented
 
 # Run Sanity Check with Provider Extensions
 
+> **Superseded in part:** follow-up F22 replaced this plan's provider-owner and model-catalog rules. Agent groups now also accept providers that Pi defines itself, built in or configured in `models.json`, and the cached model catalog is optional. A provider that neither an extension nor Pi defines fails with `has unknown provider`. See [Built-in sanity check](../WORKFLOWS.md#built-in-sanity-check) for the current behavior.
+
 ## Goal
 
 Use direct Pi SDK sessions for the built-in `sanity-check` workflow. Each reviewer gets an independent in-memory context. Each child can load the extension that owns its exact configured model provider, while only the parent workflow action can control workflow state.
