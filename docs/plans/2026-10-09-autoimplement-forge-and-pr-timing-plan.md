@@ -1697,13 +1697,17 @@ These are out of scope for this plan.
   - Fix: the engine finalizes progress for aborted attempts.
   - Done in `d522def` and `0eaabfe`: the engine and the queue's cancellation transaction give each
     open track of the ended attempt a final `failed` (`timed out`) or `cancelled` record.
-- F21: Revisit the 2,000-character agent error cap as a product decision.
+  - Review fixes in `4941bd5` and `d61a63f`: the docs state the actual revision steps and the
+    remaining limitations, and a real server test covers settlement after an action times out.
+- F21: Revisit the 2,000-character agent error cap as a product decision. _(done)_
   - `MAX_ERROR_CHARS` (`src/builtins/pi-agent-launch.ts:59`, moved from
     `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
     not from a named external interface.
   - `PiAgentGroupError.detail` keeps the complete cause.
-  - product decision pending: options sent to the human (keep cap with documented exception /
-    remove cap / keep full cause in a private 0600 file with no raw text in state).
+  - Done with option C in `2658b97`, `76aa054`, `8528757`, `b9c5350`, and `cce280b`: agent errors
+    carry only codes and Pi Workflows' own facts, plus the full path of a private `0600` cause
+    file, and nothing is truncated. Command-batch errors state only the exit status, and the item
+    keeps its complete stdout and stderr.
 - F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
@@ -1714,6 +1718,9 @@ These are out of scope for this plan.
     (`models-store.json` snapshot).
   - Done in `a7ef6fc`: groups also accept providers that Pi defines itself, resolve the model
     without a cached catalog, and run with `PI_OFFLINE=1`.
+  - Review fixes in `df024ad`, `be1f636`, and `1f1da97`: an interim OAuth gate for Pi-defined
+    providers, pending the human's choice between a pre-refresh and a shared locked store;
+    children receive only the dispatch credential; and a test rejects a virtual dispatch model.
 - F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
@@ -1731,6 +1738,8 @@ These are out of scope for this plan.
     `#!/usr/bin/env node`. A server started with a mise shim on `PATH` would run that Node.
   - Done in `138b41f` and `1f357e2`: the server pins pi and Node once at start, and
     `server status` reports the pin as `headlessPi`.
+  - Review fixes in `43197be` and `44f3df9`: a `PATH` shim keeps its own name as `argv0`, and a
+    probe timeout is named, with one retry of an unresolved pin.
 - F26: Make the timing-sensitive agent group test robust under load. _(done)_
   - `test/pi-agent-group.test.ts:1170` ("discovers a legacy provider owner and uses its configured
     authentication") runs a real SDK session with the helper's `timeoutMs: 1_000`
@@ -1744,10 +1753,16 @@ These are out of scope for this plan.
     test timeout, so only a real hang fails by timeout.
 - F27: Let headless Pi load a provider that only an extension registers. _(done)_
   - Done in `b666986` and `e05d4b2`: server piArgs can load an extension-only provider through
-    absolute `-e` paths, documented and validated. Opt-in for the auto-spawned server is pending
-    a decision.
+    absolute `-e` paths, documented and validated.
+  - Review fixes in `0bdafbe`, `bf33a4a`, and `96fcba7`: piArgs reject `--`, and the opt-in
+    `PI_WORKFLOWS_HEADLESS_EXTENSIONS` loads the listed extensions for every server start path,
+    including the auto-spawned server.
 - F28: Keep the checkout clean after pi-style installs. _(done)_
   - Done in `7ec4245`: lockfile regenerated so pi-style installs leave the checkout clean.
+- F32: Fail headless steps whose configured default model cannot be resolved instead of silently
+  falling back. _(done)_
+  - Done in `d2afe66` (red reproduction), `7447089`, and `23f88d0`: headless pi stops before any
+    model request, and the step fails with an error that names the default and how to fix it.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
