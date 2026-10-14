@@ -1388,6 +1388,50 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
     }
   });
 
+  it("gives each child only the dispatch provider's stored credential", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: '{"answer":"probe"}' }));
+    const agentDir = await makeTempDir("pi-agent-group-credential-scope");
+    const cwd = await makeTempDir("pi-agent-group-credential-scope-project");
+    const probeFile = path.join(agentDir, "credential-probe.log");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    // Stored API keys for two other built-in providers, which Pi resolves from auth.json.
+    await fs.writeFile(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify({
+        [BUILTIN_PROVIDER]: { type: "api_key", key: BUILTIN_PROVIDER_KEY },
+        openai: { type: "api_key", key: "other-openai-key" },
+        groq: { type: "api_key", key: "other-groq-key" },
+      }),
+      "utf8",
+    );
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("OPENAI_API_KEY", undefined);
+    vi.stubEnv("GROQ_API_KEY", undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    vi.stubEnv("PI_AGENT_CREDENTIAL_PROBE_FILE", probeFile);
+    vi.stubEnv("PI_AGENT_CREDENTIAL_PROBE_PROVIDERS", `${BUILTIN_PROVIDER},openai,groq`);
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("credential-scope"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+          behaviorExtensionPaths: [fixtureExtension("credential-probe")],
+        }),
+      ).resolves.toEqual([expect.objectContaining({ text: '{"answer":"probe"}' })]);
+      expect((await fs.readFile(probeFile, "utf8")).trim().split("\n")).toEqual([
+        `${BUILTIN_PROVIDER}=present`,
+        "openai=absent",
+        "groq=absent",
+      ]);
+      expect(mock.authorizations).toEqual([`Bearer ${BUILTIN_PROVIDER_KEY}`]);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
   it("rejects a virtual model as the dispatch model before any request", async () => {
     const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
     const agentDir = await makeTempDir("pi-agent-group-virtual-model");

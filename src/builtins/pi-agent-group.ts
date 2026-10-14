@@ -360,11 +360,12 @@ async function createSdkGroupPlan(
   );
   if (!profile.providerExtension) await assertPiProvider(dispatch.provider, signal);
   const credentials = await createEphemeralCredentialStore(signal);
-  const credentialSnapshot = new Map<string, StoredCredential>();
-  for (const { providerId } of await credentials.list()) {
-    const credential = await credentials.read(providerId);
-    if (credential !== undefined) credentialSnapshot.set(providerId, cloneCredential(credential)!);
-  }
+  // Children receive only the dispatch provider's stored credential. Pi resolves a provider's
+  // authentication from its own entry, and the dispatch is the only provider a child may use.
+  const credential = await credentials.read(dispatch.provider);
+  const credentialSnapshot: CredentialSnapshot = new Map(
+    credential === undefined ? [] : [[dispatch.provider, credential]],
+  );
   // The cached catalog is optional. Providers built into Pi and providers that declare their
   // models resolve without it, so a group also runs offline before any catalog refresh.
   const models = await createEphemeralModelStore(signal);
@@ -998,8 +999,11 @@ async function createSdkSession(
         },
         { projectTrusted: false },
       );
+      // Skip the create-time refresh: createAgentSessionServices refreshes once, offline,
+      // after it registers the admitted provider extension.
       const modelRuntime = await ModelRuntime.create({
         allowModelNetwork: false,
+        refreshOnCreate: false,
         signal,
         credentials: credentialStoreFromSnapshot(plan.credentialSnapshot, signal),
         modelsStore: modelStoreFromSnapshot(plan.dispatch.provider, plan.modelSnapshot, signal),
