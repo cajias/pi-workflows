@@ -1398,8 +1398,12 @@ const { state } = await engine.run(workflow, { task: "..." });
 
 The installed-package end-to-end test packs this repository and installs the
 archive in a temporary consumer project the way `pi install` installs an npm
-package: production dependencies only, with `--legacy-peer-deps`. The packages
-that Pi supplies to extensions are therefore absent, as they are for a user, and
+package: production dependencies only, with `--legacy-peer-deps`. Pi installs an
+npm package with `npm install <spec> --prefix <root> --legacy-peer-deps`. The test
+also passes `--omit=dev`, the flag that Pi adds for a git package's dependencies,
+as a safety margin. That changes nothing, because the generated consumer
+`package.json` declares no dependencies. Without peer installation, the packages
+that Pi supplies to extensions are absent, as they are for a user, and
 the test fails if Node could resolve any of them from the installed package. Pi
 provides them at run time only to code that it loads itself, so a plain Node
 workflow process that imports one fails in this test. The test then starts the

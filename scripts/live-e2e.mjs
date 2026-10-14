@@ -529,10 +529,16 @@ function assertOneFrame(output, workflowName, status) {
 
 /**
  * npm arguments that install the packed candidate the way `pi install` installs an npm package:
- * Pi runs `npm install <spec> --prefix <root> --legacy-peer-deps`, and adds `--omit=dev` when it
- * installs a git package's dependencies. Without peer installation, the packages that Pi
- * supplies are absent, as for a user. Pi provides them at run time only to code it loads itself,
- * so a plain Node process that imports one fails here as it would after `pi install`.
+ * Pi runs `npm install <spec> --prefix <root> --legacy-peer-deps`. Without peer installation, the
+ * packages that Pi supplies are absent, as for a user. Pi provides them at run time only to code
+ * it loads itself, so a plain Node process that imports one fails here as it would after
+ * `pi install`.
+ *
+ * `--omit=dev` is not part of that npm-package command. It deliberately borrows the flag that Pi
+ * adds when it installs a git package's dependencies, as a safety margin that keeps development
+ * packages out of the tree. It is harmless here: the generated consumer `package.json` declares
+ * no dependencies, and npm never installs a dependency's own devDependencies, so the installed
+ * tree is the same as with the exact npm-package command.
  */
 export function candidateInstallArgs(archivePath, consumer) {
   return [
