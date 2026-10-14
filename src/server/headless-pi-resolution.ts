@@ -31,9 +31,13 @@ export async function pinHeadlessPi(
 }
 
 /**
- * Resolve `pi` on `PATH` the way a shell would start it, then pin the result. The command
- * resolves to its real file. A Node script also pins the Node that its `#!` line selects,
- * asked for its own `process.execPath` so a version manager shim resolves once, here.
+ * Resolve `pi` on `PATH` the way a shell would start it, then pin the result. A Node script
+ * pins its real file, symlinks resolved, and the Node that its `#!` line selects, asked for
+ * its own `process.execPath` so a version manager shim for Node resolves once, here.
+ *
+ * Any other file keeps the path found on `PATH`. A shim such as mise or Volta is one binary
+ * that picks the tool from the name it was started by, so its real file is not pi; the
+ * child starts the found path with `pi` as its name, as a shell would.
  */
 export async function resolvePiFromPath(env: NodeJS.ProcessEnv): Promise<HeadlessPiLaunch> {
   const found = findOnPath("pi", env);
@@ -42,7 +46,7 @@ export async function resolvePiFromPath(env: NodeJS.ProcessEnv): Promise<Headles
   }
   const cli = fs.realpathSync(found);
   const interpreter = nodeInterpreter(readShebang(cli));
-  if (interpreter === undefined) return { kind: "executable", executable: cli };
+  if (interpreter === undefined) return { kind: "executable", executable: found };
   try {
     return { kind: "node", node: await nodeExecPath(interpreter, env), cli };
   } catch (error) {

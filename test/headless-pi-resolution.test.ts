@@ -6,14 +6,16 @@ import {
   availableHeadlessPi,
   describeHeadlessPi,
   headlessPiSpawnArgs,
+  HeadlessPiProcess,
+  type HeadlessPiExit,
 } from "../src/server/headless-pi.js";
-import { makeTempDir } from "./helpers.js";
+import { makeTempDir, waitUntil } from "./helpers.js";
 
 /** A `bin` directory for `PATH`, with a symlinked `pi` and, optionally, a `node`. */
 async function pathWithPi(
   script: string,
   options: { node?: boolean } = {},
-): Promise<{ bin: string; cli: string; env: NodeJS.ProcessEnv }> {
+): Promise<{ bin: string; found: string; cli: string; env: NodeJS.ProcessEnv }> {
   const root = await makeTempDir("headless-pi-path");
   const cli = path.join(root, "package", "dist", "cli.js");
   await fs.mkdir(path.dirname(cli), { recursive: true });
@@ -22,7 +24,12 @@ async function pathWithPi(
   await fs.mkdir(bin);
   await fs.symlink(path.relative(bin, cli), path.join(bin, "pi"));
   if (options.node !== false) await fs.symlink(process.execPath, path.join(bin, "node"));
-  return { bin, cli: await fs.realpath(cli), env: { PATH: ["", bin, ""].join(path.delimiter) } };
+  return {
+    bin,
+    found: path.join(bin, "pi"),
+    cli: await fs.realpath(cli),
+    env: { PATH: ["", bin, ""].join(path.delimiter) },
+  };
 }
 
 describe("resolvePiFromPath", () => {
@@ -53,9 +60,10 @@ describe("resolvePiFromPath", () => {
       "\u007fELF",
     ]) {
       const setup = await pathWithPi(script, { node: false });
+      // Not the real file: a multicall shim behind the symlink would not know it is pi.
       expect(await resolvePiFromPath(setup.env)).toEqual({
         kind: "executable",
-        executable: setup.cli,
+        executable: setup.found,
       });
     }
   });
@@ -68,7 +76,7 @@ describe("resolvePiFromPath", () => {
     const env = {
       PATH: [other, path.join(other, "nested"), setup.bin].join(path.delimiter),
     };
-    expect(await resolvePiFromPath(env)).toEqual({ kind: "executable", executable: setup.cli });
+    expect(await resolvePiFromPath(env)).toEqual({ kind: "executable", executable: setup.found });
   });
 
   it("reports a missing pi with the PATH it searched", async () => {
@@ -108,7 +116,7 @@ describe("pinHeadlessPi", () => {
     const setup = await pathWithPi("#!/bin/sh\n", { node: false });
     expect(await pinHeadlessPi(undefined, setup.env)).toEqual({
       source: "path",
-      pi: { kind: "executable", executable: setup.cli },
+      pi: { kind: "executable", executable: setup.found },
     });
   });
 });
@@ -120,10 +128,66 @@ describe("headless pi launch", () => {
       command: "/n/node",
       args: ["/p/cli.js", ...args],
     });
-    expect(headlessPiSpawnArgs({ kind: "executable", executable: "/p/pi" }, args)).toEqual({
-      command: "/p/pi",
+    // An executable starts under its own file name, as a shell would start it.
+    expect(headlessPiSpawnArgs({ kind: "executable", executable: "/p/bin/pi" }, args)).toEqual({
+      command: "/p/bin/pi",
       args,
+      argv0: "pi",
     });
+  });
+
+  it("starts a multicall shim from PATH under the name pi", async () => {
+    // Like mise or Volta: `bin/pi` is a symlink to one shared program that picks the tool
+    // from the name it was started by. Its real file name is not pi.
+    const root = await makeTempDir("headless-pi-multicall");
+    const shim = path.join(root, "shims", "multicall");
+    const argsFile = path.join(root, "args.txt");
+    await fs.mkdir(path.dirname(shim));
+    await fs.writeFile(
+      shim,
+      `#!/bin/sh
+case "$(basename "$0")" in
+  pi) printf '%s\\n' "$@" > ${JSON.stringify(argsFile)} ;;
+  *) echo "multicall: no tool named $(basename "$0")" >&2; exit 64 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    const bin = path.join(root, "bin");
+    await fs.mkdir(bin);
+    await fs.symlink(shim, path.join(bin, "pi"));
+    const pi = await resolvePiFromPath({ PATH: bin });
+    expect(pi).toEqual({ kind: "executable", executable: path.join(bin, "pi") });
+
+    const stderr: string[] = [];
+    let exit: HeadlessPiExit | undefined;
+    const child = new HeadlessPiProcess(
+      "/bridge.js",
+      { cwd: root, pi, piArgs: ["--model", "fixture"], abortGraceMs: 300 },
+      {
+        onStderrLine: (line) => stderr.push(line),
+        onExit: (settled) => {
+          exit = settled;
+        },
+      },
+    );
+    await child.start();
+    try {
+      await waitUntil(() => exit !== undefined, 10_000);
+    } finally {
+      await child.close();
+    }
+    expect({ exit, stderr }).toEqual({ exit: { code: 0, signal: null }, stderr: [] });
+    expect((await fs.readFile(argsFile, "utf8")).split("\n").slice(0, 8)).toEqual([
+      "--mode",
+      "rpc",
+      "--no-session",
+      "--no-extensions",
+      "-e",
+      "/bridge.js",
+      "--model",
+      "fixture",
+    ]);
   });
 
   it("describes every pin kind", () => {

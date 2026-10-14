@@ -110,14 +110,18 @@ export function describeHeadlessPi(pi: HeadlessPiLaunch): string {
   return `unresolved: ${pi.error}`;
 }
 
-/** The program and arguments that start the pinned pi with pi's own `args`. */
+/**
+ * The program and arguments that start the pinned pi with pi's own `args`. An executable
+ * starts under its own file name, as a shell would start it, because a multicall shim such
+ * as mise or Volta picks the tool from that name.
+ */
 export function headlessPiSpawnArgs(
   pi: HeadlessPiCommand,
   args: readonly string[],
-): { command: string; args: string[] } {
+): { command: string; args: string[]; argv0?: string } {
   return pi.kind === "node"
     ? { command: pi.node, args: [pi.cli, ...args] }
-    : { command: pi.executable, args: [...args] };
+    : { command: pi.executable, args: [...args], argv0: path.basename(pi.executable) };
 }
 
 /**
@@ -196,6 +200,7 @@ export class HeadlessPiProcess {
       ...(this.options.piArgs ?? []),
     ]);
     const child = spawn(launch.command, launch.args, {
+      ...(launch.argv0 === undefined ? {} : { argv0: launch.argv0 }),
       cwd: this.options.cwd,
       env: { ...process.env, ...this.options.env },
       stdio: ["pipe", "pipe", "pipe"],
