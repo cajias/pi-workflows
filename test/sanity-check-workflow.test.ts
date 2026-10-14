@@ -251,6 +251,67 @@ describe("sanity-check workflow", () => {
     expect(calls[0]?.requests.map((request) => request.id)).toEqual(areas);
   });
 
+  it("fits long agent labels to the progress schema and keeps the complete label", async () => {
+    const runWithModel = async (model: string) => {
+      setPiAgentGroupLauncher(async (requests, options) => {
+        for (const request of requests) {
+          for (const state of ["running", "completed"] as const) {
+            await options.onLifecycle?.({
+              id: request.id,
+              role: request.role,
+              elapsedMs: 1,
+              model,
+              state,
+              phase: state,
+            });
+          }
+        }
+        return requests.map((request) => ({
+          id: request.id,
+          text: JSON.stringify(request.id === "verification" ? finalResult("keep") : review()),
+          model,
+          thinkingLevel: "high" as const,
+          durationMs: 1,
+        }));
+      });
+      const result = await runAgentProbe("serial");
+      expect(result.state.status).toBe("completed");
+      return result.state.updates ?? [];
+    };
+    const track = (updates: WorkflowUpdateRecord[], type: string, key: string) =>
+      updates.find((update) => update.type === type && update.key === key)?.data;
+
+    // A model ID that pushes the label past 200 characters.
+    const longModel = `provider/${"m".repeat(250)}`;
+    const long = await runWithModel(longModel);
+    const complete = `Combined review · ${longModel}`;
+    const label = track(long, "progress", "agents/review/review")?.label as string;
+    expect(label).toBe(`${complete.slice(0, 199)}…`);
+    expect(label).toHaveLength(200);
+    expect(track(long, "sanity-check.agent-label", "agents/review/review")).toEqual({
+      schema: "pi-workflows.sanity-check-agent-label.v1",
+      label: complete,
+    });
+    // One complete-label record per track, even though the track updated several times.
+    expect(
+      long.filter((update) => update.type === "sanity-check.agent-label").map((u) => u.key),
+    ).toEqual(["agents/review/review", "agents/verification/verification"]);
+
+    // The cut never ends on half of a surrogate pair.
+    const emojiModel = `p/${"x".repeat(178)}${"😀".repeat(20)}`;
+    const emoji = await runWithModel(emojiModel);
+    expect(track(emoji, "progress", "agents/review/review")?.label).toBe(
+      `${`Combined review · ${emojiModel}`.slice(0, 198)}…`,
+    );
+
+    // A label within the limit stays whole and needs no complete-label record.
+    const short = await runWithModel("fixture/model");
+    expect(track(short, "progress", "agents/review/review")?.label).toBe(
+      "Combined review · fixture/model",
+    );
+    expect(short.some((update) => update.type === "sanity-check.agent-label")).toBe(false);
+  });
+
   it("fails the review action with the launcher error and marks its progress failed", async () => {
     installFakeHost(() => new Error("Pi agent review failed: provider unavailable"));
     const result = await runAgentProbe("serial");
