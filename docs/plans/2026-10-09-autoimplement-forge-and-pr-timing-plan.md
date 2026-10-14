@@ -1740,6 +1740,12 @@ These are out of scope for this plan.
     reports after its usual settle wait while the refresh process finishes on its own, and a
     refresh process that fails before Pi could refresh is named as such instead of asking the
     user to sign in again.
+  - Public SDK only, in `7326394` and `3f306e3`: the human rejected importing Pi's internal
+    `AuthStorage` module and chose B′. The refresh goes through the public
+    `ModelRuntime.create({ authPath })` and `getAuth`, and the re-read through the public
+    `readStoredCredential`. The refresh process resolves Pi's public entry from the `exports` of
+    Pi's `package.json`. The re-read is unlocked, a torn read fails closed, and the 5-minute
+    ceiling now also covers Pi's lock wait.
 - F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
@@ -1831,6 +1837,9 @@ These are out of scope for this plan.
   launcher.
 - F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
   builtin-autoimplement-forge.
+- F41: Switch the agent-group OAuth re-read to a locked public Pi API once Pi exports
+  `AuthStorage` or a locked credential read.
+  - A draft upstream issue exists locally; it is not filed.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
