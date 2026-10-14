@@ -184,6 +184,7 @@ export class HeadlessPiProcess {
   private exitState: HeadlessPiExit | null = null;
   private registeredPid: number | null = null;
   private closePromise: Promise<void> | null = null;
+  private stderrClosed: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly extensionPath: string,
@@ -198,6 +199,22 @@ export class HeadlessPiProcess {
   /** The exit, or null while the child runs. A method so callers re-read it after awaits. */
   currentExit(): HeadlessPiExit | null {
     return this.exitState;
+  }
+
+  /**
+   * Wait until stderr has delivered its last line, for at most `timeoutMs`. Node can report
+   * the exit before it reads the stderr that the child wrote last, and a descendant that
+   * inherited stderr can keep the pipe open after the child exits.
+   */
+  async stderrDrained(timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.stderrClosed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   async start(): Promise<void> {
@@ -237,6 +254,11 @@ export class HeadlessPiProcess {
       stderr.push(chunk);
     });
     child.stderr?.on("end", () => stderr.end());
+    const stderrStream = child.stderr;
+    this.stderrClosed =
+      stderrStream === null
+        ? Promise.resolve()
+        : new Promise((resolve) => stderrStream.once("close", () => resolve()));
     // stdout carries the RPC event stream. It is drained even without a reader
     // so the pipe never blocks the child.
     const stdout = new LineSplitter(this.handlers.onStdoutLine);

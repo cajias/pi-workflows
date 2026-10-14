@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ServerProcessRegistry } from "../src/server/processes.js";
 import { RpcStepExecutor } from "../src/server/rpc-executor.js";
+import { encodeRpcModelError } from "../src/server/rpc-protocol.js";
 import type { AgentStepRequest } from "../src/workflows/types.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -53,6 +54,11 @@ function updateLine(step: string, attempt: string): string {
     idempotencyKey: "tool-1",
     update: { type: "progress", key: "job", data: {} },
   })}\\n`;
+}
+
+/** A model error line as the bridge frames it, escaped for a shell `printf`. */
+function modelErrorLine(error: string): string {
+  return encodeRpcModelError(error).replaceAll("\n", "\\n");
 }
 
 describe("RpcStepExecutor submissions", () => {
@@ -191,6 +197,61 @@ sleep 2
     await expect(
       executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
     ).rejects.toThrow(/exited \(code 3/);
+    await executor.close();
+  });
+
+  it("fails every step with the bridge's model error when the bridge stops pi", async () => {
+    // A descendant writes the error line after pi exits, so the executor must wait for
+    // stderr to deliver it instead of reporting the bare exit.
+    const { fakePi, stdinLog } = await makeFakePi(
+      `(sleep 0.3; printf '${modelErrorLine("default model is missing")}' >&2) &\nexit 1\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(/^default model is missing$/);
+    await expect(
+      executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
+    ).rejects.toThrow(/^default model is missing$/);
+    await executor.close();
+    expect(await fs.readFile(stdinLog, "utf8")).not.toContain("request-work-a2");
+  });
+
+  it("fails the step on a model error before the child exits", async () => {
+    const { fakePi } = await makeFakePi(
+      `printf 'noise without newline' >&2\nprintf '${modelErrorLine("no model")}' >&2\nsleep 30\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(/^no model$/);
+    // The next step fails at once without prompting the stopped child again.
+    await expect(
+      executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
+    ).rejects.toThrow(/^no model$/);
+    await executor.close();
+  });
+
+  it("reports the exit when a model error line is malformed", async () => {
+    const { fakePi } = await makeFakePi(
+      `printf 'PI_WORKFLOWS_STEP_MODEL_ERROR {broken\\n' >&2\nprintf 'PI_WORKFLOWS_STEP_MODEL_ERROR {"error":1}\\n' >&2\nexit 1\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(/exited mid-step \(code 1\)/);
     await executor.close();
   });
 });

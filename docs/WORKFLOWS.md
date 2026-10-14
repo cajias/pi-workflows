@@ -210,6 +210,9 @@ on its own `PATH` once. The pin stays until the server restarts, and
 `pi-workflows server status` reports it as `headlessPi`. See
 [Headless Pi command](WORKFLOW_SERVER.md#headless-pi-command).
 
+A headless agent step fails before any model request when its Pi child cannot use the default
+model from Pi settings. See [Headless step model](#headless-step-model).
+
 Pause stops the runner and parks at the last durable boundary. Resume takes a
 new generation. Cancellation can stop a live runner or atomically claim and
 cancel an expired running row. Resume refuses changed workflow source.
@@ -1391,6 +1394,30 @@ listed extension after its bridge. Select the extension's provider with
 
 See [Headless extensions](WORKFLOW_SERVER.md#headless-extensions) for the
 complete rules.
+
+## Headless step model
+
+A headless agent step runs in `pi --mode rpc --no-session --no-extensions -e <rpc-bridge>`, followed by the server's [extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments). Headless runs use it, including the runs that resource managers start. Pi chooses the child's model once, when the child starts:
+
+1. `--model`, with or without `--provider`, from the extra Pi arguments. Pi exits with an error when it cannot resolve them, so the step fails with the child's exit.
+2. Otherwise, when `--models` or the `enabledModels` setting sets a model scope, the settings default if the scope holds it, else the first scoped model.
+3. Otherwise, the settings default: `defaultProvider` and `defaultModel` from the user's `<agent dir>/settings.json`, overridden by the run project's `.pi/settings.json` when Pi trusts that project. Headless pi has no trust prompt, so it trusts a project only from a remembered decision or the `defaultProjectTrust` setting.
+4. Otherwise, Pi's first available model with configured authentication.
+
+Workflow definitions, step contracts, and the RPC executor never choose a model. The executor sends no `set_model`.
+
+Pi moves from step 3 to step 4 without a diagnostic when it cannot use the default. Headless pi loads no extension except the bridge and those in the extra Pi arguments, so a default whose provider only a user extension registers would otherwise run the step on another model. The bridge therefore checks the session's model when Pi emits `session_start`, after Pi chose the model and before it reads any RPC command. It stops pi when all of these hold:
+
+- the command line names no `--model`;
+- the effective settings set both `defaultProvider` and `defaultModel`;
+- the session did not start on that model; and
+- the child cannot use the default: it has no such provider, the provider has no such model, or the provider has no configured authentication. A usable default that a model scope leaves out is Pi's normal step 2 choice and is not an error.
+
+The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default, the settings file that sets each field, the reason, the model that Pi would have used, and the fixes: load the provider's extension with `-e`, name a model with `--provider` and `--model`, or change the default. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
+
+With no settings default, or with only one of the two fields, Pi ignores the default, as it does in an interactive session, and the step runs on Pi's first available model. Headless pi may lack the extension providers of an interactive session, so this choice can differ from the interactive one. Name a model with `--provider` and `--model` in the extra Pi arguments when the choice matters. If no model is available at all, Pi itself exits at start and the step fails with that exit.
+
+The [Sanity Check](#built-in-sanity-check) agent group host loads the agent group bridge instead and makes no model request itself. Its child sessions check their own exact model.
 
 ## Host-provided Pi packages
 
