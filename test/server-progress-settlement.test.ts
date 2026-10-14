@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { WorkflowClient } from "../src/client/client.js";
 import type { ClientEvent } from "../src/client/protocol.js";
 import { WorkflowServer } from "../src/server/server.js";
+import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { WorkflowRunStore } from "../src/workflows/store.js";
 import type { WorkflowTraceEvent, WorkflowUpdateRecord } from "../src/workflows/types.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
@@ -11,8 +12,11 @@ import { makeTempDir, waitUntil } from "./helpers.js";
 const SESSION_ID = "cancel-progress-session";
 const OPEN_TRACKS = ["agents/review", "agents/review/a", "agents/review/b"];
 
-/** An action that publishes open and finished tracks, then waits until its runner stops. */
-async function writeTrackWorkflow(cwd: string): Promise<string> {
+/**
+ * An action that publishes open and finished tracks, then never settles: the
+ * runner stops it, or its timeout ends the attempt.
+ */
+async function writeTrackWorkflow(cwd: string, timeoutMs?: number): Promise<string> {
   const workflowPath = path.join(cwd, "tracks.workflow.ts");
   await fs.writeFile(
     workflowPath,
@@ -25,7 +29,9 @@ export default defineWorkflow({
   startAt: "review",
   nodes: {
     review: action({
-      effect: idempotentEffect("test.server-cancel-progress"),
+      effect: idempotentEffect("test.server-cancel-progress"),${
+        timeoutMs === undefined ? "" : `\n      timeoutMs: ${timeoutMs},`
+      }
       run: async ({ publishUpdate }) => {
         await publishUpdate({ type: "progress", key: "agents/review", data: progress("running", { phase: "review" }) });
         await publishUpdate({ type: "progress", key: "agents/review/a", data: progress("running", { phase: "thinking" }) });
@@ -53,6 +59,15 @@ function readRun(databasePath: string, runId: string) {
   }
 }
 
+function queueStatus(databasePath: string, runId: string): string | undefined {
+  const queue = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
+  try {
+    return queue.getWorkflowRun(runId)?.status;
+  } finally {
+    queue.close();
+  }
+}
+
 function statuses(updates: readonly { key: string; type?: string; data: unknown }[] | undefined) {
   return Object.fromEntries(
     (updates ?? [])
@@ -61,7 +76,33 @@ function statuses(updates: readonly { key: string; type?: string; data: unknown 
   );
 }
 
-describe("workflow server cancellation", () => {
+async function startTrackRun(
+  client: WorkflowClient,
+  cwd: string,
+  workflowPath: string,
+  runId: string,
+): Promise<void> {
+  const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
+  const started = await client.request({
+    operation: "run.start",
+    runId,
+    payload: {
+      projectPath: cwd,
+      workflowName: resolved.workflowName,
+      workflowSourceRef: resolved.workflowSourceRef,
+      workflowSource: resolved.workflowSource,
+      definitionDigest: resolved.definitionDigest,
+      definitionSnapshot: resolved.definitionSnapshot,
+      input: {},
+      launchOptions: {},
+      originSessionId: SESSION_ID,
+      executionMode: "interactive",
+    },
+  });
+  expect(started.outcome).toBe("accepted");
+}
+
+describe("workflow server progress settlement", () => {
   it("settles open progress tracks with the cancellation of an active run", async () => {
     const cwd = await makeTempDir("server-cancel-progress-project");
     const databasePath = path.join(
@@ -74,24 +115,7 @@ describe("workflow server cancellation", () => {
     const runId = "server-cancel-progress-run";
     await server.start();
     try {
-      const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
-      const started = await client.request({
-        operation: "run.start",
-        runId,
-        payload: {
-          projectPath: cwd,
-          workflowName: resolved.workflowName,
-          workflowSourceRef: resolved.workflowSourceRef,
-          workflowSource: resolved.workflowSource,
-          definitionDigest: resolved.definitionDigest,
-          definitionSnapshot: resolved.definitionSnapshot,
-          input: {},
-          launchOptions: {},
-          originSessionId: SESSION_ID,
-          executionMode: "interactive",
-        },
-      });
-      expect(started.outcome).toBe("accepted");
+      await startTrackRun(client, cwd, workflowPath, runId);
       await waitUntil(
         () => (readRun(databasePath, runId).loaded?.state.updates?.length ?? 0) === 4,
         30_000,
@@ -162,4 +186,82 @@ describe("workflow server cancellation", () => {
       await server.stop();
     }
   }, 60_000);
+  it("settles open progress tracks in the runner when an action times out", async () => {
+    const cwd = await makeTempDir("server-timeout-progress-project");
+    const databasePath = path.join(
+      await makeTempDir("server-timeout-progress-state"),
+      "state.sqlite",
+    );
+    // The timer starts when the runner dispatches the action. The action needs
+    // only a few update round trips before it waits, so a long limit keeps a
+    // loaded machine from timing out first.
+    const workflowPath = await writeTrackWorkflow(cwd, 8_000);
+    const server = new WorkflowServer({ databasePath, claimPollMs: 10 });
+    const client = new WorkflowClient({ databasePath, clientId: "timeout-progress-client" });
+    const runId = "server-timeout-progress-run";
+    await server.start();
+    try {
+      await startTrackRun(client, cwd, workflowPath, runId);
+      // Read once the server has also settled the queue row, its last write for the run.
+      await waitUntil(() => queueStatus(databasePath, runId) === "failed", 45_000);
+
+      const after = readRun(databasePath, runId);
+      const state = after.loaded?.state;
+      expect(state?.results.review?.outcome).toBe("timed_out");
+      const attemptId = state?.results.review?.attemptId;
+      expect(attemptId).toBeDefined();
+      const timedOut = { status: "failed", phase: "timed out" };
+      const updates = state?.updates ?? [];
+      expect(
+        Object.fromEntries(
+          updates.map((update) => [
+            update.key,
+            { status: update.data.status, phase: update.data.phase },
+          ]),
+        ),
+      ).toEqual({
+        "agents/review": timedOut,
+        "agents/review/a": timedOut,
+        "agents/review/b": timedOut,
+        "agents/review/c": { status: "completed", phase: "completed" },
+      });
+      expect(updates.every((update) => update.attemptId === attemptId)).toBe(true);
+
+      // Every revision has one event, in order, and the run revision is the last one.
+      const trace: WorkflowTraceEvent[] = after.loaded?.traceEvents ?? [];
+      expect(trace.map((event) => event.seq)).toEqual(
+        Array.from({ length: trace.length }, (_, index) => index + 1),
+      );
+      expect(after.revision).toBe(trace.at(-1)?.seq);
+      const attemptEvents = trace.filter((event) => event.attemptId === attemptId);
+      expect(attemptEvents.map((event) => event.type)).toEqual([
+        "node_started",
+        ...Array<string>(4 + OPEN_TRACKS.length).fill("update_published"),
+        "node_failed",
+      ]);
+      const settlement = attemptEvents.slice(5, 5 + OPEN_TRACKS.length);
+      expect(settlement.map((event) => event.payload.key)).toEqual(OPEN_TRACKS);
+      for (const event of settlement) {
+        const record = updates.find((update) => update.key === event.payload.key);
+        expect(record).toMatchObject({ seq: event.seq, attemptId, data: event.payload.data });
+      }
+      expect(attemptEvents.at(-1)?.payload.outcome).toBe("timed_out");
+      const failedAt = trace.indexOf(attemptEvents.at(-1)!);
+      expect(trace.slice(failedAt + 1).map((event) => event.type)).toContain("run_timed_out");
+
+      const view = await client.getRun(runId);
+      expect(view?.runRevision).toBe(after.revision);
+      expect(statuses(view?.updates as WorkflowUpdateRecord[] | undefined)).toEqual({
+        "agents/review": "failed",
+        "agents/review/a": "failed",
+        "agents/review/b": "failed",
+        "agents/review/c": "completed",
+      });
+      const verified = await client.request({ operation: "state.verify" });
+      expect(verified).toMatchObject({ outcome: "accepted", receipt: { valid: true } });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  }, 90_000);
 });
