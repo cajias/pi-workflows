@@ -32,6 +32,12 @@ export const OAUTH_REFRESH_START_DEADLINE_MS = 60_000;
  * process then exits even though the refresh is in flight. Exiting releases Pi's lock.
  */
 export const OAUTH_REFRESH_CEILING_MS = 5 * 60_000;
+/**
+ * The shortest ceiling that a production refresh process accepts: Pi's lock wait of up to 30
+ * seconds plus its 15-second refresh timeout. A shorter one could end a refresh that Pi would
+ * still finish, after the provider rotated the refresh token and before Pi saved it.
+ */
+export const OAUTH_REFRESH_MIN_CEILING_MS = 45_000;
 /** No refresh process lives longer than this, so an older marker is stale even if its PID runs. */
 const MARKER_MAX_AGE_MS = OAUTH_REFRESH_START_DEADLINE_MS + OAUTH_REFRESH_CEILING_MS + 60_000;
 

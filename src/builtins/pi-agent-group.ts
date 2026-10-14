@@ -42,6 +42,7 @@ import {
   OAUTH_REFRESH_EXIT,
   OAUTH_REFRESH_REQUEST_ENV,
   oauthRefreshEntryArgs,
+  oauthRefreshProcessEnv,
   piModulePaths,
   UnsupportedPiInstallationError,
 } from "./pi-oauth-refresh-contract.js";
@@ -585,6 +586,13 @@ async function prepareDispatchCredential(
   if (signal.aborted) throw cancellationError("group", signal.reason);
   if (exit === OAUTH_REFRESH_EXIT.storeFailed) throw credentialStoreFailure(provider);
   if (exit === OAUTH_REFRESH_EXIT.unsupported) throw unsupportedPiInstallation(provider);
+  if (exit === OAUTH_REFRESH_EXIT.markerFailed) {
+    throw new PiAgentGroupError(
+      "group",
+      "cannot record the OAuth refresh process",
+      `${provider}; make ${oauthRefreshMarkerDirectory()} a private directory of this user`,
+    );
+  }
   const refreshed = await readPiCredential(piPackageDir, input.agentDir, provider);
   if (refreshed.expires - now() > requiredValidityMs) return refreshed;
   const unchanged =
@@ -640,8 +648,7 @@ async function refreshInOwnProcess(
     cwd: input.cwd,
     detached: true,
     stdio: "ignore",
-    env: {
-      ...process.env,
+    env: oauthRefreshProcessEnv(process.env, {
       PI_CODING_AGENT_DIR: input.agentDir,
       [OAUTH_REFRESH_REQUEST_ENV]: encodeOAuthRefreshRequest({
         piPackageDir,
@@ -651,7 +658,7 @@ async function refreshInOwnProcess(
         extensionPaths: [...input.extensionPaths],
         minValidityMs: input.requiredValidityMs,
       }),
-    },
+    }),
   });
   child.unref();
   return await new Promise((resolve) => {

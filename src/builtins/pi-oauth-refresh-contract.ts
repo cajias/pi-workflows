@@ -11,14 +11,25 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
+import {
+  OAUTH_REFRESH_CEILING_MS,
+  OAUTH_REFRESH_MIN_CEILING_MS,
+} from "../state/oauth-refresh-markers.js";
 
 /** The environment variable that carries the request, as base64url JSON. */
 export const OAUTH_REFRESH_REQUEST_ENV = "PI_WORKFLOWS_OAUTH_REFRESH_REQUEST";
 /**
- * Read only by the refresh process: a shorter ceiling, in milliseconds, for tests. Production
- * uses `OAUTH_REFRESH_CEILING_MS`.
+ * Read only by the refresh process: a shorter ceiling, in milliseconds, for tests. It reaches
+ * the process only together with {@link OAUTH_REFRESH_TEST_SWITCH_ENV}; production uses
+ * `OAUTH_REFRESH_CEILING_MS`.
  */
 export const OAUTH_REFRESH_TEST_CEILING_ENV = "PI_WORKFLOWS_TEST_OAUTH_REFRESH_CEILING_MS";
+/**
+ * The explicit test switch, `1`, that lets a test ceiling reach the refresh process and go below
+ * `OAUTH_REFRESH_MIN_CEILING_MS`. A test ceiling exported on its own, for example left in a shell
+ * that later starts the workflow server, never shortens a production refresh.
+ */
+export const OAUTH_REFRESH_TEST_SWITCH_ENV = "PI_WORKFLOWS_TEST_SHORT_OAUTH_REFRESH_CEILING";
 const REQUEST_SCHEMA = "pi-workflows.oauth-refresh-request.v1";
 
 /** The exit status of a refresh process. */
@@ -37,6 +48,8 @@ export const OAUTH_REFRESH_EXIT = {
   unsupported: 7,
   /** The refresh ran into the ceiling and the process exited with it still in flight. */
   ceiling: 8,
+  /** The process could not write its marker, so it did not refresh. */
+  markerFailed: 9,
 } as const;
 
 export type OAuthRefreshExit = (typeof OAUTH_REFRESH_EXIT)[keyof typeof OAUTH_REFRESH_EXIT];
@@ -70,6 +83,31 @@ export function decodeOAuthRefreshRequest(encoded: string): OAuthRefreshRequest 
   }
   const { schema: _schema, ...request } = value as OAuthRefreshRequest & { schema: string };
   return request;
+}
+
+/**
+ * The environment of a refresh process: the group's own, the given variables, and a test
+ * ceiling only when the explicit test switch is also set.
+ */
+export function oauthRefreshProcessEnv(
+  env: NodeJS.ProcessEnv,
+  variables: Record<string, string>,
+): NodeJS.ProcessEnv {
+  const processEnv: NodeJS.ProcessEnv = { ...env, ...variables };
+  if (env[OAUTH_REFRESH_TEST_SWITCH_ENV] !== "1") delete processEnv[OAUTH_REFRESH_TEST_CEILING_ENV];
+  return processEnv;
+}
+
+/**
+ * The ceiling of a refresh process. A test ceiling below `OAUTH_REFRESH_MIN_CEILING_MS`, Pi's own
+ * bound, applies only with the explicit test switch.
+ */
+export function oauthRefreshCeilingMs(env: NodeJS.ProcessEnv): number {
+  const override = Number(env[OAUTH_REFRESH_TEST_CEILING_ENV]);
+  if (!Number.isSafeInteger(override) || override <= 0) return OAUTH_REFRESH_CEILING_MS;
+  return env[OAUTH_REFRESH_TEST_SWITCH_ENV] === "1"
+    ? override
+    : Math.max(override, OAUTH_REFRESH_MIN_CEILING_MS);
 }
 
 /** A Pi installation without a module or an API that the refresh needs. */

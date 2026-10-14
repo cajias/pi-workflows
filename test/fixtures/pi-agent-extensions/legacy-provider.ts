@@ -26,6 +26,12 @@ function fixtureOAuth() {
     async refreshToken(credentials: FixtureOAuthCredentials): Promise<FixtureOAuthCredentials> {
       const counter = process.env.PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE;
       if (counter) fs.appendFileSync(counter, "refresh\n", "utf8");
+      // Only the refresh process runs this, so it reports what reached that process.
+      const probe = process.env.PI_AGENT_FIXTURE_OAUTH_CEILING_PROBE;
+      if (probe) {
+        const ceiling = process.env.PI_WORKFLOWS_TEST_OAUTH_REFRESH_CEILING_MS;
+        fs.writeFileSync(probe, ceiling === undefined ? "absent" : "present", "utf8");
+      }
       const gate = process.env.PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE;
       // A test that fails before it opens the gate still lets this refresh end.
       const gateDeadline = Date.now() + 60_000;

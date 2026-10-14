@@ -21,7 +21,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  OAUTH_REFRESH_CEILING_MS,
   OAUTH_REFRESH_START_DEADLINE_MS,
   oauthRefreshMarkerDirectory,
   removeOAuthRefreshMarker,
@@ -34,7 +33,7 @@ import {
   loadPiSdk,
   OAUTH_REFRESH_EXIT,
   OAUTH_REFRESH_REQUEST_ENV,
-  OAUTH_REFRESH_TEST_CEILING_ENV,
+  oauthRefreshCeilingMs,
   oauthRefreshExitFor,
   type OAuthRefreshRequest,
 } from "./pi-oauth-refresh-contract.js";
@@ -80,16 +79,15 @@ async function refresh(request: OAuthRefreshRequest, started: () => void): Promi
   await modelRuntime.getAuth(request.provider, { minOAuthValidityMs: request.minValidityMs });
 }
 
-function ceilingMs(): number {
-  const override = Number(process.env[OAUTH_REFRESH_TEST_CEILING_ENV]);
-  return Number.isSafeInteger(override) && override > 0 ? override : OAUTH_REFRESH_CEILING_MS;
-}
-
 async function main(): Promise<number> {
   let request: OAuthRefreshRequest;
   let marker: string;
   try {
     request = decodeOAuthRefreshRequest(process.env[OAUTH_REFRESH_REQUEST_ENV] ?? "");
+  } catch {
+    return OAUTH_REFRESH_EXIT.failed;
+  }
+  try {
     // Without a marker the process would be impossible to find, so it does not refresh.
     marker = writeOAuthRefreshMarker(oauthRefreshMarkerDirectory(), {
       pid: process.pid,
@@ -97,7 +95,7 @@ async function main(): Promise<number> {
       startedAt: new Date().toISOString(),
     });
   } catch {
-    return OAUTH_REFRESH_EXIT.failed;
+    return OAUTH_REFRESH_EXIT.markerFailed;
   }
   process.on("exit", () => removeOAuthRefreshMarker(marker));
   let refreshing = false;
@@ -117,7 +115,10 @@ async function main(): Promise<number> {
       if (refreshing) return;
       refreshing = true;
       clearTimeout(deadline);
-      setTimeout(() => process.exit(OAUTH_REFRESH_EXIT.ceiling), ceilingMs());
+      setTimeout(
+        () => process.exit(OAUTH_REFRESH_EXIT.ceiling),
+        oauthRefreshCeilingMs(process.env),
+      );
     });
     return OAUTH_REFRESH_EXIT.done;
   } catch (error) {

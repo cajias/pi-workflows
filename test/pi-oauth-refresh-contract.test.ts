@@ -8,11 +8,19 @@ import {
   encodeOAuthRefreshRequest,
   loadPiSdk,
   OAUTH_REFRESH_EXIT,
+  OAUTH_REFRESH_TEST_CEILING_ENV,
+  OAUTH_REFRESH_TEST_SWITCH_ENV,
+  oauthRefreshCeilingMs,
   oauthRefreshEntryArgs,
   oauthRefreshExitFor,
+  oauthRefreshProcessEnv,
   piModulePaths,
   UnsupportedPiInstallationError,
 } from "../src/builtins/pi-oauth-refresh-contract.js";
+import {
+  OAUTH_REFRESH_CEILING_MS,
+  OAUTH_REFRESH_MIN_CEILING_MS,
+} from "../src/state/oauth-refresh-markers.js";
 import { makeTempDir } from "./helpers.js";
 
 /** An error shaped like pi-ai's `ModelsError`, which carries a `code`. */
@@ -48,6 +56,36 @@ describe("OAuth refresh process contract", () => {
     // Every status is distinct, so the group can tell the outcomes apart.
     const statuses = Object.values(OAUTH_REFRESH_EXIT);
     expect(new Set(statuses).size).toBe(statuses.length);
+  });
+
+  it("passes a test ceiling only with the explicit test switch, and floors it otherwise", () => {
+    const variables = { PI_CODING_AGENT_DIR: "/agent" };
+    const stray = { HOME: "/home", [OAUTH_REFRESH_TEST_CEILING_ENV]: "1000" };
+    const production = oauthRefreshProcessEnv(stray, variables);
+    expect(production).toEqual({ HOME: "/home", PI_CODING_AGENT_DIR: "/agent" });
+    expect(OAUTH_REFRESH_TEST_CEILING_ENV in production).toBe(false);
+    // The group's own environment is not changed.
+    expect(stray[OAUTH_REFRESH_TEST_CEILING_ENV]).toBe("1000");
+    const test = { ...stray, [OAUTH_REFRESH_TEST_SWITCH_ENV]: "1" };
+    expect(oauthRefreshProcessEnv(test, variables)).toEqual({ ...test, ...variables });
+    expect(
+      oauthRefreshProcessEnv({ ...stray, [OAUTH_REFRESH_TEST_SWITCH_ENV]: "yes" }, variables),
+    ).not.toHaveProperty(OAUTH_REFRESH_TEST_CEILING_ENV);
+
+    expect(oauthRefreshCeilingMs({})).toBe(OAUTH_REFRESH_CEILING_MS);
+    expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "soon" })).toBe(
+      OAUTH_REFRESH_CEILING_MS,
+    );
+    expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "0" })).toBe(
+      OAUTH_REFRESH_CEILING_MS,
+    );
+    // Without the switch, no ceiling goes below Pi's own 45-second bound.
+    expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "1000" })).toBe(
+      OAUTH_REFRESH_MIN_CEILING_MS,
+    );
+    expect(OAUTH_REFRESH_MIN_CEILING_MS).toBe(45_000);
+    expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "120000" })).toBe(120_000);
+    expect(oauthRefreshCeilingMs({ ...test })).toBe(1_000);
   });
 
   it("round-trips a request and rejects anything else", () => {

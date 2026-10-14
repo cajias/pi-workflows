@@ -3,7 +3,10 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { agentGroupErrorFields, runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
 import type { PiAgentLifecycleEvent, PiAgentRequest } from "../src/builtins/pi-agent-launch.js";
-import { OAUTH_REFRESH_TEST_CEILING_ENV } from "../src/builtins/pi-oauth-refresh-contract.js";
+import {
+  OAUTH_REFRESH_TEST_CEILING_ENV,
+  OAUTH_REFRESH_TEST_SWITCH_ENV,
+} from "../src/builtins/pi-oauth-refresh-contract.js";
 import { agentGroupCauseText } from "../src/server/agent-group-diagnostics.js";
 import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import {
@@ -453,6 +456,9 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
         refresh: "hang",
       });
       vi.stubEnv(OAUTH_REFRESH_TEST_CEILING_ENV, "1000");
+      vi.stubEnv(OAUTH_REFRESH_TEST_SWITCH_ENV, "1");
+      const probe = path.join(scenario.agentDir, "ceiling-probe");
+      vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_CEILING_PROBE", probe);
       const before = await fs.readFile(scenario.authPath, "utf8");
       const run = groupError(
         runPiAgentGroup([request("ceiling", scenario.cwd)], {
@@ -472,9 +478,71 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
       );
       await expectRefreshProcessGone(scenario, pid);
       expect(await refreshCount(scenario)).toBe(1);
+      expect(await fs.readFile(probe, "utf8")).toBe("present");
       // The process released Pi's lock as it exited, so the group read auth.json at once.
       expect(await fs.readFile(scenario.authPath, "utf8")).toBe(before);
       await expect(fs.stat(`${scenario.authPath}.lock`)).rejects.toThrow();
+    } finally {
+      await close(scenario);
+    }
+  });
+
+  it("never passes a test ceiling to a refresh process without the explicit test switch", async () => {
+    let scenario: Scenario | undefined;
+    try {
+      scenario = await legacyOAuthScenario("ceiling-stripped", {
+        expiresInMs: NEAR_EXPIRY_MS,
+        refresh: "rotate",
+      });
+      // A stray export, for example left in the shell that started the workflow server.
+      vi.stubEnv(OAUTH_REFRESH_TEST_CEILING_ENV, "1");
+      vi.stubEnv(OAUTH_REFRESH_TEST_SWITCH_ENV, undefined);
+      const probe = path.join(scenario.agentDir, "ceiling-probe");
+      vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_CEILING_PROBE", probe);
+      await expect(
+        runPiAgentGroup([request("ceiling-stripped", scenario.cwd)], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toHaveLength(1);
+      expect(await fs.readFile(probe, "utf8")).toBe("absent");
+      expect(scenario.mock.authorizations).toEqual([`Bearer ${MARKERS.newAccess}`]);
+    } finally {
+      await close(scenario);
+    }
+  });
+
+  it("fails closed when the refresh process cannot record its marker", async () => {
+    let scenario: Scenario | undefined;
+    try {
+      scenario = await legacyOAuthScenario("marker-failure", {
+        expiresInMs: NEAR_EXPIRY_MS,
+        refresh: "rotate",
+      });
+      // The marker directory is a symbolic link to a directory with someone else's file.
+      const target = path.join(scenario.agentDir, "elsewhere");
+      await fs.mkdir(target);
+      await fs.writeFile(path.join(target, "1234.json"), "not a marker", "utf8");
+      await fs.mkdir(path.dirname(scenario.markerDir), { recursive: true });
+      await fs.symlink(target, scenario.markerDir);
+      const { cwd, events } = scenario;
+      const error = await groupError(
+        runPiAgentGroup([request("marker-failure", cwd)], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+          onLifecycle: (event) => {
+            events.push(event);
+          },
+        }),
+      );
+      expect(error.message).toBe(
+        `Pi agent group cannot record the OAuth refresh process: fixture-legacy; make ${scenario.markerDir} a private directory of this user`,
+      );
+      expect(await refreshCount(scenario)).toBe(0);
+      expect(events).toEqual([]);
+      expect(scenario.mock.requests).toHaveLength(0);
+      // Pruning left the link's target alone.
+      expect(await fs.readdir(target)).toEqual(["1234.json"]);
     } finally {
       await close(scenario);
     }
