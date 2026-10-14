@@ -76,7 +76,11 @@ import {
 import { recordViewerDeltas } from "../state/viewer.js";
 import { workflowMessageIdFor } from "../state/workflow-messages.js";
 import { humanDecisionChannelRequest } from "../workflows/decision-presentation.js";
-import { workflowStateViolations } from "../workflows/diagnostics.js";
+import {
+  workflowStateNoticeLines,
+  workflowStateNotices,
+  workflowStateViolations,
+} from "../workflows/diagnostics.js";
 import { errorMessage } from "../workflows/errors.js";
 import { HumanDecisionStore } from "../workflows/human-decision.js";
 import { WorkflowRunQueueStore, type WorkflowRunQueueRecord } from "../workflows/queue.js";
@@ -1000,13 +1004,19 @@ export class WorkflowServer {
         case "state.verify": {
           this.state.integrityCheck();
           const violations = workflowStateViolations(this.state);
+          // Notices are reported beside the result and never make the state invalid.
+          const notices = workflowStateNotices(this.state);
+          const valid = violations.length === 0;
           return clientResponse(
             request.requestId,
-            violations.length === 0 ? "accepted" : "rejected",
-            { valid: violations.length === 0, violations },
-            violations.length === 0
+            valid ? "accepted" : "rejected",
+            { valid, violations, notices },
+            valid
               ? undefined
-              : violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`).join("\n"),
+              : [
+                  ...violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`),
+                  ...workflowStateNoticeLines(notices),
+                ].join("\n"),
           );
         }
         case "state.backup":
@@ -2554,6 +2564,7 @@ export class WorkflowServer {
           "SELECT COUNT(*) AS count FROM effects WHERE status IN ('pending', 'applying', 'ambiguous')",
         ),
       },
+      notices: workflowStateNotices(this.state, now),
     };
   }
 

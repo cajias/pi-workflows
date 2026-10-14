@@ -1,13 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { StateDatabase, workflowStatePath } from "../state/database.js";
-import { workflowStateViolations } from "../workflows/diagnostics.js";
+import {
+  type WorkflowStateNotices,
+  workflowStateNoticeLines,
+  workflowStateNotices,
+  workflowStateViolations,
+} from "../workflows/diagnostics.js";
 
-/** Verify only an explicit inactive backup. Active state is verified through WorkflowClient. */
+/**
+ * Verify only an explicit inactive backup and return its notices. Active state is
+ * verified through WorkflowClient.
+ */
 export function verifyInactiveBackup(
   databasePath: string,
   activeDatabasePath: string = workflowStatePath(),
-): void {
+): WorkflowStateNotices {
   const resolved = path.resolve(databasePath);
   const active = path.resolve(activeDatabasePath);
   if (sameFile(resolved, active)) {
@@ -17,11 +25,16 @@ export function verifyInactiveBackup(
   try {
     state.integrityCheck();
     const violations = workflowStateViolations(state);
+    const notices = workflowStateNotices(state);
     if (violations.length > 0) {
       throw new Error(
-        violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`).join("\n"),
+        [
+          ...violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`),
+          ...workflowStateNoticeLines(notices),
+        ].join("\n"),
       );
     }
+    return notices;
   } finally {
     state.close();
   }

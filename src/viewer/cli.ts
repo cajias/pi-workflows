@@ -9,6 +9,7 @@ import { syncHerdrPlugin } from "../herdr/setup.js";
 import { assertAbsoluteExtensionPaths } from "../server/headless-pi.js";
 import { serverLockPath, stopRecordedServer } from "../server/lock.js";
 import type { JsonValue } from "../state/json.js";
+import { workflowStateNoticeLines } from "../workflows/diagnostics.js";
 import { verifyInactiveBackup } from "./backup.js";
 import { renderClientView, runViewer } from "./tui.js";
 
@@ -212,8 +213,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       args.stateAction === "verify" &&
       args.verifyBackup !== undefined
     ) {
-      verifyInactiveBackup(args.verifyBackup);
-      process.stdout.write(`Inactive SQLite backup is valid: ${path.resolve(args.verifyBackup)}\n`);
+      const notices = verifyInactiveBackup(args.verifyBackup);
+      process.stdout.write(
+        [
+          `Inactive SQLite backup is valid: ${path.resolve(args.verifyBackup)}`,
+          ...workflowStateNoticeLines(notices),
+        ]
+          .map((line) => `${line}\n`)
+          .join(""),
+      );
       return 0;
     }
 

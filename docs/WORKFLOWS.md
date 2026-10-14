@@ -1399,6 +1399,8 @@ The server checks for cleanup after startup recovery and after workflow runners 
 
 Automatic cleanup does not create a backup. The explicit `pi-workflows state prune` apply command still requires a new absolute verified backup. Both paths use the same eligibility, deletion, and blob-reference rules.
 
+An undelivered terminal result is protected work, so its run stays until its session receives it. A terminal message addressed to a session that never connects therefore keeps its run forever. `pi-workflows state status` and `pi-workflows state verify` list each such message as a notice once it has been pending for an hour and its session has left no evidence of reporting to the server. A notice changes nothing and does not fail verification. [SQLite state](SQLITE_STATE.md#undelivered-terminal-messages) describes the rule, the output, and the manual removal procedure for a maintenance window.
+
 Deleting a run tree removes its unreferenced blobs. SQLite can reuse those pages immediately. Automatic `VACUUM` runs only while the server remains idle, at least 64 MiB is reclaimable, and at least 20 percent of pages are free. A failed or skipped compaction does not restore deleted history or make free pages unusable.
 
 Retained runs keep complete resume and viewer behavior through the existing bounded reads. An expired deleted run no longer appears in lists and a direct view returns not found. Pi session history is not changed.

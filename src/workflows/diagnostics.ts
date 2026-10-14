@@ -76,3 +76,86 @@ export function workflowStateViolations(state: StateDatabase): WorkflowStateViol
     ),
   );
 }
+
+/**
+ * A pending terminal message is reported only after it has waited this long. A
+ * connected session receives its terminal message within seconds of becoming
+ * idle, so one hour leaves out every normal delivery delay.
+ */
+export const UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS = 60 * 60 * 1_000;
+
+export const STATE_NOTICES_SCHEMA = "pi-workflows.state-notices.v1";
+
+/** One pending terminal workflow message that its target session never received. */
+export type UndeliveredTerminalMessage = {
+  workflowMessageId: string;
+  runId: string;
+  targetSessionId: string;
+  /** ISO 8601 time the message was created. */
+  createdAt: string;
+  /** Milliseconds from `createdAt` to the time of the report. */
+  ageMs: number;
+};
+
+/** Facts that need an operator's attention but do not make the state invalid. */
+export type WorkflowStateNotices = {
+  schema: typeof STATE_NOTICES_SCHEMA;
+  undeliveredTerminalMessages: {
+    minimumAgeMs: number;
+    messages: UndeliveredTerminalMessage[];
+  };
+};
+
+/**
+ * List every pending terminal workflow message that has waited at least
+ * `UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS` for a target session that left no
+ * retained evidence of ever reporting to the workflow server: no sent workflow
+ * message, no workflow turn, and no recorded session segment. Only that session's
+ * own coordinator can deliver the message, so it can stay pending forever and keep
+ * its run from retention. The report reads state only. It never cancels, expires,
+ * or deletes a message, because a terminal message is the post-workflow handoff.
+ */
+export function workflowStateNotices(
+  state: StateDatabase,
+  now: number = Date.now(),
+): WorkflowStateNotices {
+  const rows = state.readTransaction(
+    () =>
+      state.connection
+        .prepare(
+          `SELECT m.workflow_message_id AS workflowMessageId, m.run_id AS runId,
+             m.target_session_id AS targetSessionId, m.created_at AS createdAt
+           FROM workflow_messages m
+           WHERE m.kind = 'terminal' AND m.status = 'pending' AND m.created_at <= ?
+             AND NOT EXISTS (SELECT 1 FROM workflow_messages s
+               WHERE s.target_session_id = m.target_session_id AND s.status = 'sent')
+             AND NOT EXISTS (SELECT 1 FROM workflow_turns t
+               WHERE t.target_session_id = m.target_session_id)
+             AND NOT EXISTS (SELECT 1 FROM session_segments g
+               WHERE g.session_id = m.target_session_id)
+           ORDER BY m.created_at, m.workflow_message_id`,
+        )
+        .all(now - UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS) as Array<
+        Omit<UndeliveredTerminalMessage, "createdAt" | "ageMs"> & { createdAt: number }
+      >,
+  );
+  return {
+    schema: STATE_NOTICES_SCHEMA,
+    undeliveredTerminalMessages: {
+      minimumAgeMs: UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS,
+      messages: rows.map((row) => ({
+        ...row,
+        createdAt: new Date(row.createdAt).toISOString(),
+        ageMs: now - row.createdAt,
+      })),
+    },
+  };
+}
+
+/** One text line for every notice, for output that does not carry the structured value. */
+export function workflowStateNoticeLines(notices: WorkflowStateNotices): string[] {
+  return notices.undeliveredTerminalMessages.messages.map(
+    (message) =>
+      `notice undeliveredTerminalMessage ${message.workflowMessageId}: run ${message.runId}, target session ${message.targetSessionId} never reported; pending since ${message.createdAt} (${(message.ageMs / 3_600_000).toFixed(1)} h)`,
+  );
+}

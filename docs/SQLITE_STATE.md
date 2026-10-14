@@ -183,6 +183,103 @@ themselves. A pending settlement effect also explains a terminal result whose qu
 has not yet settled. Expired claims remain recovery facts, not proof of completed
 work.
 
+### Undelivered terminal messages
+
+`state status`, `state verify`, and inactive-backup verification also report
+notices. A notice needs an operator's attention but does not make the state
+invalid, so it never changes `valid`, the verification outcome, or the exit code.
+The only notice lists undelivered terminal messages.
+
+A terminal message is the post-workflow handoff to its origin session, and only
+that session's own coordinator can deliver it. A message addressed to a session
+that never connects stays `pending` forever and keeps its run tree from
+retention. The report lists every workflow message that meets all of these
+conditions:
+
+- its kind is `terminal` and its status is `pending`;
+- it was created at least one hour (`minimumAgeMs`, 3,600,000) before the report.
+  A connected session receives its terminal message within seconds of becoming
+  idle, so the hour leaves out every normal delivery delay;
+- its target session has no retained evidence of ever reporting to the server:
+  no `sent` workflow message, no workflow turn, and no session segment.
+
+This is the narrowest rule that still finds a message no session will claim. A
+session that did report once keeps its pending result for when it comes back, so
+that result is not listed. Retention can remove an older run that held a
+session's only evidence, so check a listed session before you act on it. The
+report lists all matching messages, oldest first, with no limit. It only reads
+state. It never cancels, expires, or deletes a message.
+
+`state status` returns the report in `notices`, and `state verify` returns it in
+`notices` beside `valid` and `violations`:
+
+```json
+{
+  "schema": "pi-workflows.state-notices.v1",
+  "undeliveredTerminalMessages": {
+    "minimumAgeMs": 3600000,
+    "messages": [
+      {
+        "workflowMessageId": "workflow-message-example",
+        "runId": "example-run",
+        "targetSessionId": "example-session",
+        "createdAt": "2026-01-10T12:00:00.000Z",
+        "ageMs": 108000000
+      }
+    ]
+  }
+}
+```
+
+Where the output is text, each message is one line: after the violations of a
+rejected `state verify`, and after the valid line of inactive-backup
+verification:
+
+```text
+notice undeliveredTerminalMessage workflow-message-example: run example-run, target session example-session never reported; pending since 2026-01-10T12:00:00.000Z (30.0 h)
+```
+
+### Removing undeliverable terminal messages
+
+No command removes a listed message, because the server cannot prove that a
+session will never connect. Deleting only the message does not work either: at
+startup, the server creates the missing terminal message of a terminal
+interactive run again. When an operator has confirmed that the target session
+does not exist, remove the whole run tree in a maintenance window:
+
+1. Check that no work is active with `pi-workflows server status` and
+   `pi-workflows state status`.
+2. While the server runs, back up with
+   `pi-workflows state backup /absolute/path/to/before-cleanup.sqlite`. Check the
+   backup with `pi-workflows state verify /absolute/path/to/before-cleanup.sqlite`,
+   which also lists the notices it contains.
+3. Stop the server with `pi-workflows server stop`. A Pi session or `piw` starts a
+   new server when it connects, so close them first.
+4. In one writable connection with `PRAGMA foreign_keys = ON`, run one
+   `BEGIN IMMEDIATE` transaction for each listed run, with a client that stops at
+   the first error and rolls back. The transaction first checks its guards. The
+   server holds no claim (`workflow_server_state.server_id IS NULL`). The message
+   is still a pending terminal message of that run and session, and the session
+   still has no sent message, turn, or session segment. The run is a terminal
+   root run with a settled queue row. No other run names it as parent, root, or
+   recovery root, or names one of its messages as a recovery source. None of its
+   effects is pending, applying, or ambiguous. The transaction then deletes the
+   run aggregate in the same order as retention prune (`deleteRunAggregates` in
+   `src/state/prune.ts`). That order is the effects of the run's related
+   resources, the events of those resources, the run, those resources, and any
+   project left without a run or managed resource. The related resources are the
+   resources of the run, its session segments, decisions, settings scopes, and
+   follow-ups, and of their effects. Deleting the run removes its workflow
+   messages, queue row, binding, requests, and turns through their foreign keys.
+   A temporary guard table with `CHECK (ok = 1)` makes a failed guard an error.
+5. Run `PRAGMA integrity_check` and `PRAGMA foreign_key_check`, and check that
+   the listed messages are gone and that every other run is still present.
+6. Start the server again, then run `pi-workflows state verify` and
+   `pi-workflows state status`.
+
+The unreferenced blobs of the deleted run stay until the next retention sweep
+removes them.
+
 ### Active execution time
 
 `node_attempts.started_at` is historical data and never changes. `timeout_ms`
@@ -372,8 +469,11 @@ pi-workflows state prune --before 2026-08-01T00:00:00Z --backup /absolute/path/t
 
 These commands send maintenance operations to the server when they target the active database. Only `pi-workflows state verify` with an explicit inactive backup opens SQLite in the command process. It rejects the active database, including another path to the same file.
 
-`status` reports only safe counts, file size, active leases, and unsettled effects.
-It does not print actor IDs, channel references, payloads, or credentials.
+`status` reports only safe counts, file size, active leases, unsettled effects, and
+the [undelivered terminal message notices](#undelivered-terminal-messages). Those
+notices name the message, run, and target session of each listed message so an
+operator can find it, and they carry no message content. Apart from those IDs,
+`status` does not print actor IDs, channel references, payloads, or credentials.
 
 `prune --dry-run` reports complete terminal run trees older than the cutoff and the trees that safety checks block. It does not change the database. `prune --apply` requires a new absolute backup path. It verifies the backup, locks maintenance, rechecks the same selection in an exclusive transaction, deletes safe aggregates and unreferenced blobs, checkpoints the WAL, vacuums the file, and runs integrity and foreign-key checks. The manual command and automatic retention use the same blocker rules. Automatic retention starts after server recovery and does not create a backup.
 
