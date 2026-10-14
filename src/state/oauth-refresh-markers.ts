@@ -27,19 +27,21 @@ const PENDING_MARKER_MAX_AGE_MS = 10_000;
 export const OAUTH_REFRESH_START_DEADLINE_MS = 60_000;
 /**
  * How long a refresh process may run once it has called Pi's authentication, which includes
- * Pi's wait for the `auth.json` lock. Pi waits at most 30 seconds for that lock and gives the
- * provider's refresh a 15-second abort signal, and the agent group waits two minutes for the
- * process. A refresh still running five minutes after the call is stuck, for example in a
- * provider refresh that ignores its abort signal, so the process then exits even though the
- * refresh is in flight. Exiting releases Pi's lock.
+ * Pi's waits for the `auth.json` lock. Pi can wait for that lock twice, up to 30 seconds each:
+ * once to read the credential when `auth.json` changed since the runtime loaded it, and once to
+ * update it. It gives the provider's refresh a 15-second abort signal, and the agent group waits
+ * two minutes for the process. A refresh still running five minutes after the call is stuck, for
+ * example in a provider refresh that ignores its abort signal, so the process then exits even
+ * though the refresh is in flight. Exiting releases Pi's lock.
  */
 export const OAUTH_REFRESH_CEILING_MS = 5 * 60_000;
 /**
- * The shortest ceiling that a production refresh process accepts: Pi's lock wait of up to 30
- * seconds plus its 15-second refresh timeout. A shorter one could end a refresh that Pi would
- * still finish, after the provider rotated the refresh token and before Pi saved it.
+ * The shortest ceiling that a production refresh process accepts: Pi's two lock waits of up to
+ * 30 seconds each, for the read and the update, plus its 15-second refresh timeout, which is 75
+ * seconds, with a 15-second margin. A shorter one could end a refresh that Pi would still
+ * finish, after the provider rotated the refresh token and before Pi saved it.
  */
-export const OAUTH_REFRESH_MIN_CEILING_MS = 45_000;
+export const OAUTH_REFRESH_MIN_CEILING_MS = 90_000;
 /** No refresh process lives longer than this, so an older marker is stale even if its PID runs. */
 const MARKER_MAX_AGE_MS = OAUTH_REFRESH_START_DEADLINE_MS + OAUTH_REFRESH_CEILING_MS + 60_000;
 

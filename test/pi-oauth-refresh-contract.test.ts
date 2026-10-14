@@ -113,11 +113,13 @@ describe("OAuth refresh process contract", () => {
     expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "0" })).toBe(
       OAUTH_REFRESH_CEILING_MS,
     );
-    // Without the switch, no ceiling goes below Pi's own 45-second bound.
+    // Without the switch, no ceiling goes below Pi's own bound: two 30-second lock waits plus
+    // the 15-second refresh timeout, with a margin.
     expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "1000" })).toBe(
       OAUTH_REFRESH_MIN_CEILING_MS,
     );
-    expect(OAUTH_REFRESH_MIN_CEILING_MS).toBe(45_000);
+    expect(OAUTH_REFRESH_MIN_CEILING_MS).toBe(90_000);
+    expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "75000" })).toBe(90_000);
     expect(oauthRefreshCeilingMs({ [OAUTH_REFRESH_TEST_CEILING_ENV]: "120000" })).toBe(120_000);
     expect(oauthRefreshCeilingMs({ ...test })).toBe(1_000);
   });
