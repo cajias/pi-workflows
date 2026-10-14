@@ -175,6 +175,7 @@ async function oauthScenario(
   name: string,
   baseUrl: string,
   refresh: "rotate" | "fail",
+  gate?: string,
 ): Promise<{
   env: Record<string, string>;
   authPath: string;
@@ -213,6 +214,7 @@ async function oauthScenario(
       PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE: refreshLog,
       PI_AGENT_FIXTURE_OAUTH_NEW_ACCESS: OAUTH_MARKERS.newAccess,
       PI_AGENT_FIXTURE_OAUTH_NEW_REFRESH: OAUTH_MARKERS.newRefresh,
+      ...(gate === undefined ? {} : { PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE: gate }),
     },
     authPath,
     refreshLog,
@@ -413,6 +415,46 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
       await expectNoOAuthText(JSON.stringify(output), scenario.diagnosticsDir);
       await waitUntil(() => output.pids.every(processGone), 10_000);
     } finally {
+      await mock.close();
+    }
+  }, 120_000);
+
+  it("finishes and saves a refresh in flight after the headless pi host is stopped", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const gate = path.join(root, "oauth-in-flight-gate");
+    const scenario = await oauthScenario("oauth-in-flight", mock.baseUrl, "rotate", gate);
+    try {
+      // The runner cancels once the refresh has started, and stops waiting for the bridge
+      // after 200 ms, so the launcher stops headless pi while the refresh is still blocked.
+      const output = await runReview({
+        ...scenario.env,
+        PI_WORKFLOWS_TEST_CANCEL_WHEN_FILE: scenario.refreshLog,
+        PI_WORKFLOWS_TEST_CANCEL_SETTLE_MS: "200",
+      });
+
+      expect(output.error).toBe("Pi agent group cancelled: test cancellation");
+      expect(output.pids).toHaveLength(1);
+      await waitUntil(() => output.pids.every(processGone), 10_000);
+      const stored = async () =>
+        (JSON.parse(await fs.readFile(scenario.authPath, "utf8")) as Record<string, unknown>)[
+          "fixture-legacy"
+        ] as { access?: string } | undefined;
+      expect((await stored())?.access).toBe(OAUTH_MARKERS.oldAccess);
+      // The refresh runs in its own process, which the stop did not reach. Released now, it
+      // finishes and Pi saves the rotated credential.
+      await fs.writeFile(gate, "", "utf8");
+      const deadline = Date.now() + 30_000;
+      let saved = (await stored())?.access;
+      while (saved !== OAUTH_MARKERS.newAccess && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        saved = (await stored())?.access;
+      }
+      expect(saved).toBe(OAUTH_MARKERS.newAccess);
+      expect(await refreshCount(scenario.refreshLog)).toBe(1);
+      expect(mock.requests).toHaveLength(0);
+      await expectNoOAuthText(JSON.stringify(output), scenario.diagnosticsDir);
+    } finally {
+      await fs.writeFile(gate, "", "utf8");
       await mock.close();
     }
   }, 120_000);

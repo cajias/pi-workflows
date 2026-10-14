@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +12,7 @@ import {
   DefaultResourceLoader,
   ExtensionRunner,
   getAgentDir,
+  getPackageDir,
   ModelRegistry,
   ModelRuntime,
   SessionManager,
@@ -28,6 +31,14 @@ import {
   type PiAgentThinkingLevel,
   type PiAgentTool,
 } from "./pi-agent-launch.js";
+import {
+  encodeOAuthRefreshRequest,
+  importPiAuthStorage,
+  isolatedResourceLoaderOptions,
+  OAUTH_REFRESH_EXIT,
+  OAUTH_REFRESH_REQUEST_ENV,
+  piModulePaths,
+} from "./pi-oauth-refresh.js";
 
 // This module imports packages that only Pi supplies. Only processes that Pi starts may load
 // it: the agent group bridge that the workflow runner starts inside headless Pi, and tests.
@@ -62,6 +73,12 @@ const MODELS_LOAD_FAILURE = "Could not load Pi model catalog for isolated agents
  * a timeout, slot scheduling, and timer delays.
  */
 const OAUTH_GROUP_MARGIN_MS = 10 * 60_000;
+/**
+ * How long a group waits for its OAuth refresh process. It covers the process's 60-second start
+ * deadline, Pi's lock wait of up to 30 seconds, and Pi's 15-second refresh timeout. After this
+ * wait the group only stops waiting and fails closed; it never stops the process.
+ */
+const OAUTH_REFRESH_WAIT_MS = 2 * 60_000;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 type PiAgentEvent = Record<string, unknown>;
@@ -526,31 +543,40 @@ type DispatchCredentialInput = {
 /**
  * The dispatch credential that children receive. Children never refresh OAuth credentials, so
  * an OAuth credential that could expire while a child still needs it is refreshed here, once,
- * before any session starts, through Pi's own locked credential store. A credential that is
- * still too short afterwards fails the group.
+ * before any session starts, through Pi's own locked credential store. Afterwards the group
+ * reads the stored credential again through that store. It fails closed when the credential is
+ * gone, is no longer an OAuth credential, or still expires too soon: the group never switches
+ * to another kind of authentication on its own.
  */
 async function prepareDispatchCredential(
   input: DispatchCredentialInput,
 ): Promise<StoredCredential | undefined> {
-  const { credential, provider, requiredValidityMs, now } = input;
+  const { credential, provider, requiredValidityMs, now, signal } = input;
   if (credential?.type !== "oauth") return credential;
   if (credential.expires - now() > requiredValidityMs) return credential;
-  await refreshThroughPi(input);
-  const refreshed = await (await createEphemeralCredentialStore(input.signal)).read(provider);
-  if (refreshed?.type !== "oauth" || refreshed.expires - now() > requiredValidityMs) {
-    return refreshed;
+  const piPackageDir = getPackageDir();
+  const modules = piModulePaths(piPackageDir);
+  if (
+    process.versions.bun !== undefined ||
+    !existsSync(modules.sdk) ||
+    !existsSync(modules.authStorage)
+  ) {
+    throw couldNotRefresh(provider);
   }
+  // A cancelled group starts no refresh. Once one starts, the group waits for it to finish.
+  if (signal.aborted) throw cancellationError("group", signal.reason);
+  const exit = await refreshInOwnProcess(input, piPackageDir);
+  // The refresh has finished, or its process finishes it on its own, before the group reacts
+  // to a cancellation.
+  if (signal.aborted) throw cancellationError("group", signal.reason);
+  if (exit === OAUTH_REFRESH_EXIT.storeFailed) throw credentialStoreFailure(provider);
+  const refreshed = await readPiCredential(piPackageDir, input.agentDir, provider);
+  if (refreshed.expires - now() > requiredValidityMs) return refreshed;
   const unchanged =
     refreshed.access === credential.access &&
     refreshed.refresh === credential.refresh &&
     refreshed.expires === credential.expires;
-  if (unchanged) {
-    throw new PiAgentGroupError(
-      "group",
-      "could not refresh OAuth credentials",
-      `${provider}; sign in to the provider again in Pi, or configure an API key for it`,
-    );
-  }
+  if (unchanged) throw couldNotRefresh(provider);
   throw new PiAgentGroupError(
     "group",
     "has OAuth credentials that expire too soon",
@@ -558,57 +584,94 @@ async function prepareDispatchCredential(
   );
 }
 
+function couldNotRefresh(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not refresh OAuth credentials",
+    `${provider}; sign in to the provider again in Pi, or configure an API key for it`,
+  );
+}
+
+function credentialStoreFailure(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not lock or update Pi credentials",
+    `${provider}; another Pi process may be holding auth.json, or Pi could not write it; retry the agent group`,
+  );
+}
+
 /**
- * Ask Pi to refresh the dispatch provider's OAuth credential. The model runtime gets no
- * credential store, so it uses Pi's default file-backed `AuthStorage` for `auth.json`. Pi then
- * refreshes under that file's lock, skips the refresh when another Pi process already
- * refreshed, and writes the result itself, as in any Pi session. The admitted extensions are
- * registered as in each child, because a provider extension can supply the OAuth refresh.
+ * Refresh the dispatch credential in a process of its own (`pi-oauth-refresh.ts`), started
+ * detached and registered nowhere, so no stop of this headless pi process, its runner, or the
+ * server can end a refresh before Pi saves it. The group waits at most
+ * {@link OAUTH_REFRESH_WAIT_MS} for its exit status and never stops it. No credential and no
+ * error text crosses the process boundary.
  */
-async function refreshThroughPi(input: DispatchCredentialInput): Promise<void> {
-  const { cwd, agentDir, provider, extensionPaths, requiredValidityMs, signal } = input;
-  const modelRuntime = await ModelRuntime.create({
-    allowModelNetwork: false,
-    refreshOnCreate: false,
-    signal,
-    modelsStore: emptyModelStore(signal),
+async function refreshInOwnProcess(
+  input: DispatchCredentialInput,
+  piPackageDir: string,
+): Promise<number | undefined> {
+  const child = spawn(process.execPath, [refreshEntryPath()], {
+    cwd: input.cwd,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      PI_CODING_AGENT_DIR: input.agentDir,
+      [OAUTH_REFRESH_REQUEST_ENV]: encodeOAuthRefreshRequest({
+        piPackageDir,
+        agentDir: input.agentDir,
+        cwd: input.cwd,
+        provider: input.provider,
+        extensionPaths: [...input.extensionPaths],
+        minValidityMs: input.requiredValidityMs,
+      }),
+    },
   });
-  const refresh = async () => {
-    try {
-      await modelRuntime.getAuth(provider, { minOAuthValidityMs: requiredValidityMs, signal });
-    } catch {
-      // A refresh error can quote the provider's token response, so its text is kept nowhere.
-      // The credential that Pi stored afterwards decides the outcome.
-    }
-  };
-  if (extensionPaths.length === 0) {
-    await refresh();
-    return;
-  }
-  const services = await createAgentSessionServices({
-    cwd,
-    agentDir,
-    settingsManager: isolatedSettings({}),
-    modelRuntime,
-    modelRuntimeSignal: signal,
-    resourceLoaderOptions: isolatedResourceLoaderOptions(extensionPaths),
+  child.unref();
+  return await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), OAUTH_REFRESH_WAIT_MS);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code ?? undefined);
+    });
+    child.once("error", () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
   });
-  const extensions = services.resourceLoader.getExtensions();
-  let cleanupFailed = false;
+}
+
+/** The refresh entry beside this module: compiled JavaScript, or the source that Node strips. */
+function refreshEntryPath(): string {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const compiled = path.join(directory, "pi-oauth-refresh.js");
+  return existsSync(compiled) ? compiled : path.join(directory, "pi-oauth-refresh.ts");
+}
+
+/**
+ * The dispatch provider's stored OAuth credential, read through Pi's file-backed `AuthStorage`
+ * under its lock. `list` reports types without resolving configured key values, so only an
+ * OAuth credential is read.
+ */
+async function readPiCredential(
+  piPackageDir: string,
+  agentDir: string,
+  provider: string,
+): Promise<StoredCredential & { type: "oauth" }> {
+  // A signal makes Pi report a failed locked read instead of answering from its cached copy.
+  const options = { signal: new AbortController().signal };
+  let stored: unknown;
   try {
-    await refresh();
-  } finally {
-    try {
-      await shutdownLoadedExtensions(extensions, cwd, signal);
-    } catch {
-      cleanupFailed = true;
-    } finally {
-      extensions.runtime.invalidate("Pi agent credential refresh finished");
-    }
+    const { AuthStorage } = await importPiAuthStorage(piPackageDir);
+    const store = AuthStorage.create(path.join(agentDir, "auth.json"));
+    const entry = (await store.list(options)).find((item) => item.providerId === provider);
+    stored = entry?.type === "oauth" ? await store.read(provider, options) : undefined;
+  } catch {
+    throw credentialStoreFailure(provider);
   }
-  if (cleanupFailed) {
-    throw new PiAgentGroupError("group", "could not settle extension preflight", "cleanup failed");
-  }
+  if (!isStoredCredential(stored) || stored.type !== "oauth") throw couldNotRefresh(provider);
+  return structuredClone(stored);
 }
 
 type IsolatedSettings = NonNullable<Parameters<typeof SettingsManager.inMemory>[0]>;
@@ -619,20 +682,6 @@ function isolatedSettings(defaults: IsolatedSettings): SettingsManager {
     { ...defaults, extensions: [], skills: [], prompts: [], themes: [] },
     { projectTrusted: false },
   );
-}
-
-/** Load only the given extension paths, and no other resources or context. */
-function isolatedResourceLoaderOptions(extensionPaths: readonly string[]) {
-  return {
-    additionalExtensionPaths: [...extensionPaths],
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-    systemPromptOverride: () => undefined,
-    appendSystemPromptOverride: () => [],
-  };
 }
 
 function resolveGroupDispatch(

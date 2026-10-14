@@ -45,6 +45,7 @@ export default defineConfig({
         // the integration and e2e suites) never registers in this report.
         "src/server/rpc-bridge.ts",
         "src/channels/adapter-entry.ts",
+        "src/builtins/pi-oauth-refresh.ts",
       ],
       thresholds: {
         lines: 85,

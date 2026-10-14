@@ -5,6 +5,7 @@ import { agentGroupErrorFields, runPiAgentGroup } from "../src/builtins/pi-agent
 import type { PiAgentLifecycleEvent, PiAgentRequest } from "../src/builtins/pi-agent-launch.js";
 import { agentGroupCauseText } from "../src/server/agent-group-diagnostics.js";
 import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
+import { TimeoutError } from "../src/workflows/errors.js";
 import { startMockOpenAiServer, type MockModelScript } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -67,6 +68,9 @@ async function legacyOAuthScenario(
     expiresInMs: number;
     refresh?: "rotate" | "short" | "fail";
     script?: MockModelScript;
+    /** The fixture refresh waits until this file exists. */
+    gate?: string;
+    afterRefresh?: "remove" | "api-key";
   },
 ): Promise<Scenario> {
   const mock = await startMockOpenAiServer(
@@ -102,7 +106,17 @@ async function legacyOAuthScenario(
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE", refreshLog);
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_NEW_ACCESS", MARKERS.newAccess);
   vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_NEW_REFRESH", MARKERS.newRefresh);
+  vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_REFRESH_GATE", options.gate);
+  vi.stubEnv("PI_AGENT_FIXTURE_OAUTH_AFTER_REFRESH", options.afterRefresh);
   return { agentDir, cwd, authPath, refreshLog, mock, events: [] };
+}
+
+async function waitFor(condition: () => Promise<boolean>): Promise<void> {
+  const deadline = Date.now() + SESSION_HANG_MS;
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error("the condition did not hold in time");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 async function refreshCount(scenario: Scenario): Promise<number> {
@@ -341,6 +355,124 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
       await close(scenario);
     }
   });
+
+  it.each([
+    ["a cancellation", () => new Error("test cancellation"), "cancelled: test cancellation"],
+    ["an action timeout", () => new TimeoutError(1_000), "cancelled: Timed out after 1000ms"],
+  ])(
+    "lets a refresh in flight finish and save before the group reports %s",
+    async (_name, reason, outcome) => {
+      let scenario: Scenario | undefined;
+      try {
+        const gateDir = await makeTempDir("pi-agent-oauth-gate");
+        const gate = path.join(gateDir, "release");
+        scenario = await legacyOAuthScenario("abort-in-flight", {
+          expiresInMs: NEAR_EXPIRY_MS,
+          refresh: "rotate",
+          gate,
+        });
+        const controller = new AbortController();
+        let settled = false;
+        let savedWhenRejected: unknown;
+        const authPath = scenario.authPath;
+        const run = runPiAgentGroup([request("abort-in-flight", scenario.cwd)], {
+          maxConcurrency: 1,
+          signal: controller.signal,
+        }).then(
+          () => {
+            settled = true;
+          },
+          async (error: unknown) => {
+            settled = true;
+            savedWhenRejected = (
+              JSON.parse(await fs.readFile(authPath, "utf8")) as Record<string, unknown>
+            )["fixture-legacy"];
+            throw error;
+          },
+        );
+        await waitFor(async () => (await refreshCount(scenario!)) === 1);
+        // The provider may already have rotated the refresh token, so the group keeps waiting.
+        controller.abort(reason());
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(settled).toBe(false);
+        await fs.writeFile(gate, "", "utf8");
+        const error = await groupError(run);
+        expect(error.message).toBe(`Pi agent group ${outcome}`);
+        expect(savedWhenRejected).toMatchObject({
+          type: "oauth",
+          access: MARKERS.newAccess,
+          refresh: MARKERS.newRefresh,
+        });
+        expect(await refreshCount(scenario)).toBe(1);
+        expect(scenario.mock.requests).toHaveLength(0);
+      } finally {
+        await close(scenario);
+      }
+    },
+  );
+
+  it.each([
+    ["removes the entry", "remove" as const],
+    ["replaces it with an API key", "api-key" as const],
+  ])("fails closed when another writer %s after the refresh", async (_name, afterRefresh) => {
+    let scenario: Scenario | undefined;
+    try {
+      scenario = await legacyOAuthScenario(`after-refresh-${afterRefresh}`, {
+        expiresInMs: NEAR_EXPIRY_MS,
+        refresh: "rotate",
+        afterRefresh,
+      });
+      // An environment key would otherwise authenticate the provider without the entry.
+      vi.stubEnv("PI_AGENT_FIXTURE_API_KEY", "fixture-environment-key");
+      const { cwd, events } = scenario;
+      const error = await groupError(
+        runPiAgentGroup([request("after-refresh", cwd)], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+          onLifecycle: (event) => {
+            events.push(event);
+          },
+        }),
+      );
+      expect(error.message).toBe(
+        "Pi agent group could not refresh OAuth credentials: fixture-legacy; sign in to the provider again in Pi, or configure an API key for it",
+      );
+      expect(await refreshCount(scenario)).toBe(1);
+      expect(events).toEqual([]);
+      expect(scenario.mock.requests).toHaveLength(0);
+    } finally {
+      await close(scenario);
+    }
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    "reports a credential store failure apart from a refresh failure",
+    async () => {
+      let scenario: Scenario | undefined;
+      try {
+        scenario = await legacyOAuthScenario("store-failure", {
+          expiresInMs: NEAR_EXPIRY_MS,
+          refresh: "rotate",
+        });
+        // Pi can lock auth.json but cannot write the refreshed credential to it.
+        await fs.chmod(scenario.authPath, 0o400);
+        const error = await groupError(
+          runPiAgentGroup([request("store-failure", scenario.cwd)], {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+          }),
+        );
+        expect(error.message).toBe(
+          "Pi agent group could not lock or update Pi credentials: fixture-legacy; another Pi process may be holding auth.json, or Pi could not write it; retry the agent group",
+        );
+        expectNoCredentialText(errorTexts(error));
+        expect(scenario.mock.requests).toHaveLength(0);
+      } finally {
+        if (scenario !== undefined) await fs.chmod(scenario.authPath, 0o600);
+        await close(scenario);
+      }
+    },
+  );
 
   it("uses a long-lived OAuth credential of a provider built into Pi without refreshing it", async () => {
     let scenario: Scenario | undefined;

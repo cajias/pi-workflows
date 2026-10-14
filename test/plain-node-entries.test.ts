@@ -29,6 +29,8 @@ const PLAIN_NODE_MODULES = [
   "viewer/cli",
   "builtins/catalog",
   "builtins/index",
+  // Started by the agent group bridge as a plain Node process that imports Pi by path.
+  "builtins/pi-oauth-refresh",
   "workflows/index",
   "resource-managers/index",
   "client/index",
@@ -159,13 +161,21 @@ function packageName(specifier: string): string {
 const STATIC_SPECIFIER = /^\s*(?:import|export)\s+(?:[^;"'`]*?\s+from\s*)?(["'])([^"'\n]+)\1/gmu;
 const LITERAL_DYNAMIC_SPECIFIER = /(?<![\w$.])import\s*\(\s*(["'])([^"'\n]+)\1\s*\)/gu;
 const ANY_DYNAMIC_IMPORT = /(?<![\w$.])import\s*\(/gu;
+/**
+ * Modules whose computed dynamic imports load Pi by absolute path from the Pi installation that
+ * runs them. Those imports never resolve through this package's dependencies.
+ */
+const PI_PATH_IMPORTERS = new Set([path.join("dist", "builtins", "pi-oauth-refresh.js")]);
 
 /** Runtime specifiers of one emitted module. Type-only imports are already erased by tsc. */
 function runtimeSpecifiers(file: string, source: string): string[] {
   const statics = [...source.matchAll(STATIC_SPECIFIER)].map((match) => match[2] ?? "");
   const dynamics = [...source.matchAll(LITERAL_DYNAMIC_SPECIFIER)].map((match) => match[2] ?? "");
   const dynamicCount = [...source.matchAll(ANY_DYNAMIC_IMPORT)].length;
-  if (dynamicCount !== dynamics.length) {
+  if (
+    dynamicCount !== dynamics.length &&
+    !PI_PATH_IMPORTERS.has(path.relative(builtPackage, file))
+  ) {
     throw new Error(`${file} has a dynamic import that the graph check cannot follow`);
   }
   return [...statics, ...dynamics];
