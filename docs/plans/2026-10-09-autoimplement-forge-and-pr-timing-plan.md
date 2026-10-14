@@ -1731,6 +1731,11 @@ These are out of scope for this plan.
     file lock, when the credential would not outlive the run bound plus a 10-minute margin. The
     group fails closed when the refresh fails or the token is still too short. Children never
     refresh, and legacy extension OAuth is covered.
+  - OAuth refresh hardening in `76b4658`, `7c00812`, `945f79f`, `27256c1`, and `fe662a6`: the
+    refresh runs in its own process, which no pi-workflows stop reaches, and that process exits at
+    the latest 5 minutes after the refresh starts. Private marker files list each refresh in
+    `server status` as `oauthRefreshes`. The group fails closed on a missing or changed entry, a
+    lock or store failure, an unsupported Pi installation, and a marker failure.
 - F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
@@ -1779,6 +1784,23 @@ These are out of scope for this plan.
     model request, and the step fails with an error that names the default and how to fix it.
   - Second-round review fix in `15ddf8e`: the error names the server restart that picks up a
     changed `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or changed extra Pi arguments.
+- F33: Require the origin session for interactive run.start and report undelivered terminal
+  messages. _(done)_
+  - Done in `a7bb8fd`, `0839408`, `483cc79`, `0979384`, `08b1fb8`, `c704399`, and `7cf2392`:
+    - an interactive `run.start` requires a live session command for its origin session, and a
+      start whose connection is lost retries with fresh authority and the same idempotency key;
+    - `state status` reports the count and oldest age of undelivered terminal messages, and
+      `state verify` lists them; both only report;
+    - verification scripts must use an isolated workflow server.
+- F34: Remove the two stale terminal workflow messages from the live state DB in a maintenance
+  window.
+  - Deferred by the human. It needs explicit approval before any run against the live state, and
+    it follows the procedure in `docs/SQLITE_STATE.md` ("Removing undeliverable terminal
+    messages").
+- F35: Refresh session authority on retry for `followUp.queue` and `run.changeSettings`.
+  - Found during F33: both commands build their session authority once, so a retry after a lost
+    connection carries the stale coordinator epoch and is rejected as replaced. A user retry can
+    then queue a second follow-up or apply a settings patch twice.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
