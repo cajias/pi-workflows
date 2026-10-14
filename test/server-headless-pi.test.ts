@@ -176,7 +176,7 @@ describe("workflow server headless pi pin", () => {
 
   it("reports no headless extensions unless the opt-in lists some", async () => {
     await withServer({}, async (databasePath, logs) => {
-      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ paths: [] });
+      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ entries: [] });
       expect(logs.some((line) => line.startsWith("headless extensions"))).toBe(false);
     });
   });
@@ -193,8 +193,13 @@ describe("workflow server headless pi pin", () => {
 
   it("hands listed headless extensions through the runner to each headless child", async () => {
     const root = await makeTempDir("server-headless-extensions");
+    const real = path.join(root, "extensions", "provider.ts");
+    await fs.mkdir(path.dirname(real));
+    await fs.writeFile(real, "export default function provider() {}\n");
+    const realpath = await fs.realpath(real);
+    // The configured path is a symlink; status shows both, and children load the real file.
     const extension = path.join(root, "provider.ts");
-    await fs.writeFile(extension, "export default function provider() {}\n");
+    await fs.symlink(real, extension);
     const argvFile = path.join(root, "argv.json");
     // A pi that records its arguments and submits the step it is given.
     const fakePi = path.join(root, "fake-pi.cjs");
@@ -218,15 +223,17 @@ setInterval(() => {}, 1000);
       claimPollMs: 10,
     };
     await withServer(options, async (databasePath, logs) => {
-      expect((await statusOf(databasePath)).headlessExtensions).toEqual({ paths: [extension] });
+      expect((await statusOf(databasePath)).headlessExtensions).toEqual({
+        entries: [{ path: extension, realpath }],
+      });
       expect(logs).toContain(
-        `headless extensions from PI_WORKFLOWS_HEADLESS_EXTENSIONS: ${extension}`,
+        `headless extensions from PI_WORKFLOWS_HEADLESS_EXTENSIONS: ${extension} (${realpath})`,
       );
       await runOnce(databasePath, root, "headless-extensions-run", AGENT_NODE);
       const argv = JSON.parse(await fs.readFile(argvFile, "utf8")) as string[];
       expect(argv.slice(0, 5)).toEqual(["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
       expect(path.basename(argv[5] ?? "")).toMatch(/^rpc-bridge\.(?:ts|js)$/);
-      expect(argv.slice(6)).toEqual(["-e", extension]);
+      expect(argv.slice(6)).toEqual(["-e", realpath]);
     });
   });
 

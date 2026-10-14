@@ -152,7 +152,7 @@ export function availableHeadlessLaunch(options: HeadlessPiOptions): {
 } {
   return {
     pi: availableHeadlessPi(options.pi),
-    extensions: availableHeadlessExtensions(options.extensions ?? { paths: [] }),
+    extensions: availableHeadlessExtensions(options.extensions ?? { entries: [] }),
   };
 }
 

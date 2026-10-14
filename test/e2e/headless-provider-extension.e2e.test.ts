@@ -341,7 +341,9 @@ describe("opt-in headless extensions of a server that a Pi session starts", () =
       }
     }
     expect(status, piOutput).toBeDefined();
-    expect(status?.headlessExtensions).toEqual({ paths: [providerExtension] });
+    expect(status?.headlessExtensions).toEqual({
+      entries: [{ path: providerExtension, realpath: await fs.realpath(providerExtension) }],
+    });
     expect(status?.headlessPi).toEqual({
       source: "session",
       kind: "node",

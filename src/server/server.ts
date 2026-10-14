@@ -299,7 +299,7 @@ export class WorkflowServer {
   /** The one retry of a pin that was unresolved at start. Runners wait for it. */
   private headlessPiRetry: Promise<void> | null = null;
   /** Opt-in extensions for every headless child, read once at start. */
-  private headlessExtensions: HeadlessExtensions = { paths: [] };
+  private headlessExtensions: HeadlessExtensions = { entries: [] };
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private viewTimer: ReturnType<typeof setInterval> | null = null;
@@ -2282,10 +2282,11 @@ export class WorkflowServer {
   private logHeadlessExtensions(): void {
     const extensions = this.headlessExtensions;
     if ("error" in extensions) this.log(`headless extensions unavailable: ${extensions.error}`);
-    else if (extensions.paths.length > 0) {
-      this.log(
-        `headless extensions from ${HEADLESS_EXTENSIONS_ENV}: ${extensions.paths.join(", ")}`,
+    else if (extensions.entries.length > 0) {
+      const listed = extensions.entries.map((entry) =>
+        entry.realpath === entry.path ? entry.path : `${entry.path} (${entry.realpath})`,
       );
+      this.log(`headless extensions from ${HEADLESS_EXTENSIONS_ENV}: ${listed.join(", ")}`);
     }
   }
 

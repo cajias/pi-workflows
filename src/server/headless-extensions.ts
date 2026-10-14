@@ -6,8 +6,11 @@ import { nearestPackageManifest } from "../client/headless-pi-command.js";
 /** Opt-in extension paths that every headless Pi child loads beside its bridge. */
 export const HEADLESS_EXTENSIONS_ENV = "PI_WORKFLOWS_HEADLESS_EXTENSIONS";
 
-/** The validated extension paths, or why the list is invalid. An invalid list fails closed. */
-export type HeadlessExtensions = { paths: string[] } | { error: string };
+/** One listed extension: the path as configured, and the real file that children load. */
+export type HeadlessExtension = { path: string; realpath: string };
+
+/** The validated extensions, or why the list is invalid. An invalid list fails closed. */
+export type HeadlessExtensions = { entries: HeadlessExtension[] } | { error: string };
 
 const RESTART_HINT = "then restart the workflow server with `pi-workflows server stop`";
 /** The pi-workflows package that holds this module, from `src/server` or `dist/server`. */
@@ -23,30 +26,47 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
  * the operator asked for.
  */
 export function readHeadlessExtensions(env: NodeJS.ProcessEnv): HeadlessExtensions {
-  const paths: string[] = [];
+  const entries: HeadlessExtension[] = [];
   for (const entry of (env[HEADLESS_EXTENSIONS_ENV] ?? "").split(path.delimiter)) {
     if (entry.length === 0) continue;
-    const problem = extensionProblem(entry);
-    if (problem !== undefined) {
+    const inspected = inspectExtension(entry);
+    if ("problem" in inspected) {
       return {
-        error: `${HEADLESS_EXTENSIONS_ENV} is invalid: ${problem}. Fix it, ${RESTART_HINT}`,
+        error: `${HEADLESS_EXTENSIONS_ENV} is invalid: ${inspected.problem}. Fix it, ${RESTART_HINT}`,
       };
     }
-    paths.push(path.normalize(entry));
+    entries.push({ path: path.normalize(entry), realpath: inspected.realpath });
   }
-  return { paths };
+  return { entries };
 }
 
-/** The listed paths, checked again before each start, because a listed file can be removed. */
+/**
+ * The real files that a child loads, checked again in full before each start. The file must
+ * still pass every rule and resolve to the real file pinned at server start, so a removed
+ * file or a symlink pointed elsewhere fails closed instead of loading something unchecked.
+ */
 export function availableHeadlessExtensions(extensions: HeadlessExtensions): string[] {
   if ("error" in extensions) throw new Error(extensions.error);
-  const missing = extensions.paths.find((entry) => !fs.existsSync(entry));
-  if (missing !== undefined) {
-    throw new Error(
-      `The headless extension ${missing} from ${HEADLESS_EXTENSIONS_ENV} no longer exists. Restore it, ${RESTART_HINT}.`,
-    );
-  }
-  return extensions.paths;
+  return extensions.entries.map((entry) => {
+    const inspected = inspectExtension(entry.path);
+    const problem =
+      "problem" in inspected
+        ? inspected.problem
+        : inspected.realpath === entry.realpath
+          ? undefined
+          : `${entry.path} now resolves to ${inspected.realpath} instead of ${entry.realpath}`;
+    if (problem !== undefined) {
+      throw new Error(
+        `The headless extension ${entry.path} from ${HEADLESS_EXTENSIONS_ENV} changed after the workflow server started: ${problem}. Restore it, ${RESTART_HINT}.`,
+      );
+    }
+    return entry.realpath;
+  });
+}
+
+function inspectExtension(entry: string): { realpath: string } | { problem: string } {
+  const problem = extensionProblem(entry);
+  return problem === undefined ? { realpath: fs.realpathSync(entry) } : { problem };
 }
 
 function extensionProblem(entry: string): string | undefined {

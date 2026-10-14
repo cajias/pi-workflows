@@ -737,7 +737,10 @@ describe("headless pi agent group launcher", () => {
     const extension = path.join(setup.dir, "provider.ts");
     await fs.writeFile(extension, "export default function provider() {}\n");
     await new HeadlessPiAgentGroupLauncher(
-      { ...setup.options, extensions: { paths: [extension] } },
+      {
+        ...setup.options,
+        extensions: { entries: [{ path: extension, realpath: await fs.realpath(extension) }] },
+      },
       setup.settings,
     ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
     const launched = JSON.parse(await fs.readFile(setup.argvFile, "utf8")) as { argv: string[] };

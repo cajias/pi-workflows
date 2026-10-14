@@ -5,11 +5,14 @@ import {
   HEADLESS_EXTENSIONS_ENV,
   availableHeadlessExtensions,
   readHeadlessExtensions,
+  type HeadlessExtensions,
 } from "../src/server/headless-extensions.js";
 import { HeadlessPiProcess, type HeadlessPiExit } from "../src/server/headless-pi.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
 const RESTART = "then restart the workflow server with `pi-workflows server stop`";
+const DIRECTORY =
+  "is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts";
 
 function listed(...entries: string[]): NodeJS.ProcessEnv {
   return { [HEADLESS_EXTENSIONS_ENV]: entries.join(path.delimiter) };
@@ -29,22 +32,28 @@ async function extensionPackage(name?: string): Promise<{ root: string; extensio
 
 describe("readHeadlessExtensions", () => {
   it("lists nothing unless the opt-in is set", () => {
-    expect(readHeadlessExtensions({})).toEqual({ paths: [] });
-    expect(readHeadlessExtensions(listed(""))).toEqual({ paths: [] });
+    expect(readHeadlessExtensions({})).toEqual({ entries: [] });
+    expect(readHeadlessExtensions(listed(""))).toEqual({ entries: [] });
   });
 
-  it("accepts absolute extension files", async () => {
+  it("accepts absolute extension files and pins the real file behind each", async () => {
     const file = await extensionPackage("@fixture/provider");
     const other = await extensionPackage("@fixture/other");
     const unnormalized = `${path.dirname(other.extension)}${path.sep}.${path.sep}provider.ts`;
-    expect(readHeadlessExtensions(listed(file.extension, "", unnormalized))).toEqual({
-      paths: [file.extension, other.extension],
+    const link = path.join(await makeTempDir("headless-extension-alias"), "provider.ts");
+    await fs.symlink(file.extension, link);
+    expect(readHeadlessExtensions(listed(file.extension, "", unnormalized, link))).toEqual({
+      entries: [
+        { path: file.extension, realpath: await fs.realpath(file.extension) },
+        { path: other.extension, realpath: await fs.realpath(other.extension) },
+        { path: link, realpath: await fs.realpath(file.extension) },
+      ],
     });
   });
 
   it("refuses a directory, which Pi would resolve like a package", async () => {
     const directory = (entry: string) =>
-      `${HEADLESS_EXTENSIONS_ENV} is invalid: ${entry} is a directory. Pi would load every extension, skill, prompt, and theme that it resolves there, so list the extension's entry file instead, such as <package>/dist/index.js or <package>/index.ts. Fix it, ${RESTART}`;
+      `${HEADLESS_EXTENSIONS_ENV} is invalid: ${entry} ${DIRECTORY}. Fix it, ${RESTART}`;
     // A plain provider package directory.
     const plain = await extensionPackage("@fixture/provider");
     expect(readHeadlessExtensions(listed(plain.root))).toEqual({ error: directory(plain.root) });
@@ -115,21 +124,61 @@ describe("readHeadlessExtensions", () => {
 });
 
 describe("availableHeadlessExtensions", () => {
-  it("returns the listed paths while they exist and fails closed otherwise", async () => {
+  const changed = (entry: string, problem: string) =>
+    `The headless extension ${entry} from ${HEADLESS_EXTENSIONS_ENV} changed after the workflow server started: ${problem}. Restore it, ${RESTART}.`;
+
+  it("returns the pinned real files while every check still passes", async () => {
     const file = await extensionPackage();
-    expect(availableHeadlessExtensions({ paths: [file.extension] })).toEqual([file.extension]);
+    const link = path.join(await makeTempDir("headless-extension-pinned"), "provider.ts");
+    await fs.symlink(file.extension, link);
+    const real = await fs.realpath(file.extension);
+    expect(availableHeadlessExtensions(readHeadlessExtensions(listed(link)))).toEqual([real]);
     expect(() => availableHeadlessExtensions({ error: "the list is invalid" })).toThrow(
       "the list is invalid",
     );
+  });
+
+  it("fails closed when a pinned file is removed or replaced", async () => {
+    const file = await extensionPackage();
+    const pinned = readHeadlessExtensions(listed(file.extension));
     await fs.rm(file.extension);
-    expect(() => availableHeadlessExtensions({ paths: [file.extension] })).toThrow(
-      `The headless extension ${file.extension} from ${HEADLESS_EXTENSIONS_ENV} no longer exists. Restore it, ${RESTART}.`,
+    expect(() => availableHeadlessExtensions(pinned)).toThrow(
+      changed(file.extension, `${file.extension} does not exist`),
+    );
+    await fs.mkdir(file.extension);
+    expect(() => availableHeadlessExtensions(pinned)).toThrow(
+      changed(file.extension, `${file.extension} ${DIRECTORY}`),
+    );
+  });
+
+  it("fails closed when a symlink points elsewhere after start", async () => {
+    const first = await extensionPackage();
+    const second = await extensionPackage();
+    const link = path.join(await makeTempDir("headless-extension-retarget"), "provider.ts");
+    await fs.symlink(first.extension, link);
+    const pinned = readHeadlessExtensions(listed(link));
+    await fs.rm(link);
+    await fs.symlink(second.extension, link);
+    expect(() => availableHeadlessExtensions(pinned)).toThrow(
+      changed(
+        link,
+        `${link} now resolves to ${await fs.realpath(second.extension)} instead of ${await fs.realpath(first.extension)}`,
+      ),
+    );
+    // Pointed into pi-workflows, the rule that refused it at start refuses it again.
+    await fs.rm(link);
+    await fs.symlink(path.resolve("src", "extension", "index.ts"), link);
+    expect(() => availableHeadlessExtensions(pinned)).toThrow(
+      changed(
+        link,
+        `${link} is part of pi-workflows, whose extension must not load beside the headless bridge`,
+      ),
     );
   });
 });
 
 describe("headless pi with listed extensions", () => {
-  async function launch(extensions: { paths: string[] } | { error: string }) {
+  async function launch(extensions: HeadlessExtensions) {
     const root = await makeTempDir("headless-extension-launch");
     const argsFile = path.join(root, "args.txt");
     const fakePi = path.join(root, "pi");
@@ -158,7 +207,10 @@ describe("headless pi with listed extensions", () => {
   it("loads each listed extension after the bridge and before the server's Pi arguments", async () => {
     const one = await extensionPackage();
     const two = await extensionPackage();
-    const run = await launch({ paths: [one.extension, two.extension] });
+    // Children load the pinned real file, not the configured symlink.
+    const alias = path.join(await makeTempDir("headless-extension-launch-alias"), "two.ts");
+    await fs.symlink(two.extension, alias);
+    const run = await launch(readHeadlessExtensions(listed(one.extension, alias)));
     await run.child.start();
     try {
       await waitUntil(() => run.exited() !== undefined, 10_000);
@@ -173,12 +225,27 @@ describe("headless pi with listed extensions", () => {
       "-e",
       "/bridge.ts",
       "-e",
-      one.extension,
+      await fs.realpath(one.extension),
       "-e",
-      two.extension,
+      await fs.realpath(two.extension),
       "--model",
       "fixture",
     ]);
+  });
+
+  it("starts no child when a listed symlink points elsewhere after start", async () => {
+    const first = await extensionPackage();
+    const second = await extensionPackage();
+    const link = path.join(await makeTempDir("headless-extension-launch-retarget"), "p.ts");
+    await fs.symlink(first.extension, link);
+    const run = await launch(readHeadlessExtensions(listed(link)));
+    await fs.rm(link);
+    await fs.symlink(second.extension, link);
+    await expect(run.child.start()).rejects.toThrow(
+      `The headless extension ${link} from ${HEADLESS_EXTENSIONS_ENV} changed after the workflow server started`,
+    );
+    expect(run.child.pid).toBeUndefined();
+    await expect(fs.access(run.argsFile)).rejects.toThrow();
   });
 
   it("starts no child when the list is invalid", async () => {
