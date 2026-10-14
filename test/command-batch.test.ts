@@ -153,9 +153,44 @@ describe("runCommandBatch", () => {
       "failed",
       "timedOut",
     ]);
-    expect(result.items[1]).toMatchObject({ exitCode: 3, stderr: "bad" });
-    expect(result.items[2]?.error).toBeTruthy();
-    expect(result.items[3]?.error).toMatch(/Timed out/);
+    expect(result.items[1]).toMatchObject({
+      exitCode: 3,
+      stderr: "bad",
+      error: "Command failed: exit 3; its output is in the item's stdout and stderr",
+    });
+    expect(result.items[2]?.error).toBe(`spawn ${path.join(cwd, "missing")} ENOENT`);
+    expect(result.items[3]?.error).toBe("Timed out after 50ms");
+  });
+
+  it("keeps complete command output in the item and states only the exit status in its error", async () => {
+    const cwd = await makeTempDir("command-batch-error-output");
+    const stderr = `OUTPUT_MARKER ${"e".repeat(6_000)} END OF STDERR`;
+    const result = await runCommandBatch({
+      items: [
+        item(
+          "loud",
+          cwd,
+          `process.stderr.write(${JSON.stringify(stderr)}); process.exit(2)`,
+          2_000,
+          20_000,
+        ),
+        item("killed", cwd, "process.kill(process.pid, 'SIGKILL')"),
+      ],
+      maxConcurrency: 2,
+    });
+    expect(result.items[0]).toMatchObject({
+      outcome: "failed",
+      exitCode: 2,
+      stderr,
+      stderrTruncated: false,
+      error: "Command failed: exit 2; its output is in the item's stdout and stderr",
+    });
+    expect(result.items[1]).toMatchObject({
+      outcome: "failed",
+      signal: "SIGKILL",
+      error: "Command failed: signal SIGKILL; its output is in the item's stdout and stderr",
+    });
+    expect(JSON.stringify(result.items.map((entry) => entry.error))).not.toContain("OUTPUT_MARKER");
   });
 
   it("reports output truncation", async () => {
