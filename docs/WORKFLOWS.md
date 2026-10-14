@@ -31,7 +31,9 @@ and keep its run from retention. The extension sends its session's authority
 with every start. When the session is still connecting or reporting its branch,
 the start waits up to 15 seconds for it and then fails with `Workflow session
 coordinator is not ready`. A headless start (`executionMode: "headless"`) needs
-no Pi session and carries no session authority.
+no Pi session and carries no session authority. Verification scripts and tests
+use headless runs or an isolated server, never the live server with a made-up
+session; see [Verification scripts](DEVELOPMENT.md#verification-scripts).
 
 Resume uses the run's original source and graph, including ordinary workflows
 without included workflows. Source and graph checks run before any durable

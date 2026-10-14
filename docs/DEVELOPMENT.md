@@ -158,6 +158,35 @@ real Pi process while one request is pending and proves that the same request is
 not inserted twice. Nothing outside the temp directories is touched, and no
 real model is called.
 
+## Verification scripts
+
+Tests and ad-hoc verification scripts that drive a workflow server through
+`WorkflowClient` must stay off the live server. `new WorkflowClient()` without a
+`databasePath` connects to the live server of
+`~/.pi/agent/workflows/state.sqlite`, which real Pi sessions use. Use one of
+these instead:
+
+- Start the run with `executionMode: "headless"`. A headless run needs no Pi
+  session and creates no terminal workflow message.
+- Use an isolated server. Pass a scratch database,
+  `new WorkflowClient({ databasePath: "/var/tmp/<scratch>/state.sqlite" })`, and
+  call `ensureAvailable()`. The client starts a server for that database with its
+  own socket under `<scratch>/server/`. Keep the scratch path short, because the
+  socket path must fit the operating system limit, 107 bytes on Linux. Send
+  `server.stop` and delete the scratch directory when the script is done.
+
+Never start an interactive run on the live socket with a made-up
+`originSessionId`. The run's terminal result is addressed to that session, so it
+would stay pending forever and keep the run from retention. The workflow server
+rejects such a start: an interactive `run.start` needs the live coordinator
+authority of its origin session, as described in
+[Starting and resuming runs](WORKFLOWS.md#starting-and-resuming-runs). A script
+that needs interactive behavior uses an isolated server and owns the session
+there. It subscribes with `view.session.watch` and `coordinator: true`, reports
+the branch with `workflowMessage.reportBranch`, and sends `targetSessionId` and
+`coordinatorEpoch` with the start from that same connection.
+`requestInteractiveStart` in `test/helpers.ts` does this for the unit tests.
+
 ## Publishing
 
 The npm package is `@osolmaz/pi-workflows`. The crates.io package is
