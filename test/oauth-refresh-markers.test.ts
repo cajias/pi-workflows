@@ -58,6 +58,42 @@ describe("OAuth refresh process markers", () => {
     expect(await fs.readdir(path.join(root, "real"))).toEqual([]);
   });
 
+  it("never lists or prunes through a symbolic link, and removes only marker names", async () => {
+    const root = await makeTempDir("oauth-refresh-markers");
+    const target = path.join(root, "target");
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, "7.json"), "someone else's file", "utf8");
+    writeOAuthRefreshMarker(target, { pid: 8, provider: "p8", startedAt: STARTED_AT });
+    const link = path.join(root, "oauth-refresh");
+    await fs.symlink(target, link);
+    const gone = { now: STARTED + 1_000, isRunning: () => false };
+    expect(listOAuthRefreshMarkers(link, gone)).toEqual([]);
+    pruneOAuthRefreshMarkers(link, gone);
+    expect((await fs.readdir(target)).toSorted()).toEqual(["7.json", "8.json"]);
+    // In the real directory only `<pid>.json` names are markers.
+    await fs.writeFile(path.join(target, "notes.json"), "kept", "utf8");
+    pruneOAuthRefreshMarkers(target, gone);
+    expect((await fs.readdir(target)).toSorted()).toEqual(["notes.json"]);
+  });
+
+  it("writes through a pending name, and prunes only pending markers left behind", async () => {
+    const directory = path.join(await makeTempDir("oauth-refresh-markers"), "oauth-refresh");
+    writeOAuthRefreshMarker(directory, { pid: 21, provider: "p21", startedAt: STARTED_AT });
+    expect(await fs.readdir(directory)).toEqual(["21.json"]);
+    // A marker another process is still writing, and one that a dead process left.
+    const writing = path.join(directory, "22.json.tmp");
+    const left = path.join(directory, "23.json.tmp");
+    await fs.writeFile(writing, "", "utf8");
+    await fs.writeFile(left, "", "utf8");
+    const old = new Date(Date.now() - 60_000);
+    await fs.utimes(left, old, old);
+    pruneOAuthRefreshMarkers(directory, { now: Date.now(), isRunning: () => true });
+    expect((await fs.readdir(directory)).toSorted()).toEqual(["21.json", "22.json.tmp"]);
+    expect(listOAuthRefreshMarkers(directory, { isRunning: () => true }).map((m) => m.pid)).toEqual(
+      [21],
+    );
+  });
+
   it("lists markers with whether their process still runs, and prunes the rest", async () => {
     const directory = path.join(await makeTempDir("oauth-refresh-markers"), "oauth-refresh");
     expect(listOAuthRefreshMarkers(directory)).toEqual([]);

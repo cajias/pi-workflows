@@ -12,7 +12,12 @@ import { workflowsConfigDir } from "./config-dir.js";
  * never credential data.
  */
 const MARKER_SCHEMA = "pi-workflows.oauth-refresh-marker.v1";
-const MARKER_SUFFIX = ".json";
+/** A marker's file name. Nothing else in the directory is ever read or removed. */
+const MARKER_NAME = /^\d+\.json$/u;
+/** A marker that is still being written, before it is renamed into place. */
+const PENDING_MARKER_NAME = /^\d+\.json\.tmp$/u;
+/** A pending marker this old was left by a process that died while writing it. */
+const PENDING_MARKER_MAX_AGE_MS = 10_000;
 
 /**
  * How long a refresh process may load Pi and the admitted extensions before its refresh starts.
@@ -49,24 +54,37 @@ export function oauthRefreshMarkerDirectory(env: NodeJS.ProcessEnv = process.env
 
 /**
  * Write the marker of the calling process: `<pid>.json`, mode `0600`, in a `0700` directory.
- * Returns its path. A file left for the same PID belongs to an earlier, finished process.
+ * Returns its path. A file left for the same PID belongs to an earlier, finished process. The
+ * marker is written under a pending name and renamed into place, so a concurrent prune never
+ * sees it half-written.
  */
 export function writeOAuthRefreshMarker(directory: string, marker: OAuthRefreshMarker): string {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  // The directory must be the user's own, not a symbolic link, and private.
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || (process.getuid !== undefined && stat.uid !== process.getuid())) {
+  if (!isPrivateDirectory(directory)) {
     throw new Error(`${directory} is not a private directory of this user`);
   }
   fs.chmodSync(directory, 0o700);
-  const file = path.join(directory, `${marker.pid}${MARKER_SUFFIX}`);
-  fs.rmSync(file, { force: true });
-  fs.writeFileSync(file, JSON.stringify({ schema: MARKER_SCHEMA, ...marker }), {
+  const file = path.join(directory, `${marker.pid}.json`);
+  const pending = `${file}.tmp`;
+  fs.rmSync(pending, { force: true });
+  fs.writeFileSync(pending, JSON.stringify({ schema: MARKER_SCHEMA, ...marker }), {
     encoding: "utf8",
     mode: 0o600,
     flag: "wx",
   });
+  fs.renameSync(pending, file);
   return file;
+}
+
+/** A real directory, not a symbolic link, that belongs to this user. */
+function isPrivateDirectory(directory: string): boolean {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(directory);
+  } catch {
+    return false;
+  }
+  return stat.isDirectory() && (process.getuid === undefined || stat.uid === process.getuid());
 }
 
 export function removeOAuthRefreshMarker(file: string): void {
@@ -83,10 +101,25 @@ export function listOAuthRefreshMarkers(
   );
 }
 
-/** Remove the markers whose process no longer runs, and unreadable markers. */
+/**
+ * Remove the markers whose process no longer runs, unreadable markers, and pending markers that
+ * a process left while writing them. A directory that is not this user's own real directory is
+ * left alone, and only marker file names are ever removed.
+ */
 export function pruneOAuthRefreshMarkers(directory: string, options: LivenessOptions = {}): void {
   for (const { file, marker } of markerFiles(directory)) {
     if (marker === undefined || !isLive(marker, options)) fs.rmSync(file, { force: true });
+  }
+  const now = options.now ?? Date.now();
+  for (const name of directoryEntries(directory)) {
+    if (!PENDING_MARKER_NAME.test(name)) continue;
+    const file = path.join(directory, name);
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && now - stat.mtimeMs > PENDING_MARKER_MAX_AGE_MS) fs.rmSync(file);
+    } catch {
+      // Renamed or removed meanwhile.
+    }
   }
 }
 
@@ -97,16 +130,20 @@ function isLive(marker: OAuthRefreshMarker, options: LivenessOptions): boolean {
   return (options.isRunning ?? processRunning)(marker.pid) && age <= MARKER_MAX_AGE_MS;
 }
 
-/** Regular marker files, never followed through a symbolic link. */
-function markerFiles(directory: string): Array<{ file: string; marker?: OAuthRefreshMarker }> {
-  let names: string[];
+/** The entries of a private marker directory; none for any other path. */
+function directoryEntries(directory: string): string[] {
+  if (!isPrivateDirectory(directory)) return [];
   try {
-    names = fs.readdirSync(directory);
+    return fs.readdirSync(directory);
   } catch {
     return [];
   }
-  return names
-    .filter((name) => name.endsWith(MARKER_SUFFIX))
+}
+
+/** Regular marker files, never followed through a symbolic link. */
+function markerFiles(directory: string): Array<{ file: string; marker?: OAuthRefreshMarker }> {
+  return directoryEntries(directory)
+    .filter((name) => MARKER_NAME.test(name))
     .flatMap((name) => {
       const file = path.join(directory, name);
       try {
