@@ -1715,23 +1715,32 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         sessionFactory: successfulFactory(),
       }),
     ).rejects.toThrow(/must not invoke an extension command/);
-    await expect(
-      runPiAgentGroup(
-        [
-          {
-            ...request("first-dispatch"),
-            model: { provider: "fixture-native", id: "fixture-model" },
-            thinkingLevel: "high",
-          },
-          {
-            ...request("second-dispatch"),
-            model: { provider: "fixture-native", id: "other-model" },
-            thinkingLevel: "high",
-          },
-        ],
-        { maxConcurrency: 2, signal },
-      ),
-    ).rejects.toThrow(/one exact model dispatch/);
+    // The real SDK path reads settings before it compares dispatches, so it gets a temporary
+    // agent directory instead of the user's.
+    const agentDir = await makeTempDir("pi-agent-group-mixed-dispatch");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("first-dispatch"),
+              model: { provider: "fixture-native", id: "fixture-model" },
+              thinkingLevel: "high",
+            },
+            {
+              ...request("second-dispatch"),
+              model: { provider: "fixture-native", id: "other-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 2, signal },
+        ),
+      ).rejects.toThrow(/one exact model dispatch/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("excludes Pi Workflows wrapper packages before their factories run", async () => {
