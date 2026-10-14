@@ -125,11 +125,13 @@ export type WorkflowStateNoticeSummary = {
 
 /**
  * Pending terminal workflow messages that have waited at least
- * `UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS` for a target session that left no
- * retained evidence of ever reporting to the workflow server: no sent workflow
- * message, no workflow turn, and no recorded session segment. Only that session's
- * own coordinator can deliver such a message, so it can stay pending forever and
- * keep its run from retention. Bind the creation cutoff as the only parameter.
+ * `UNDELIVERED_TERMINAL_MESSAGE_MIN_AGE_MS` for a target session with no retained
+ * delivery evidence: no sent workflow message, no workflow turn, and no recorded
+ * session segment. Only that session's own coordinator can deliver such a message,
+ * so it can stay pending forever and keep its run from retention. A real session
+ * that closed before its first delivery matches too, because the live coordinator
+ * an interactive start requires leaves no durable row; it receives the message
+ * when it resumes. Bind the creation cutoff as the only parameter.
  */
 const UNDELIVERED_TERMINAL_MESSAGES = `FROM workflow_messages m
   WHERE m.kind = 'terminal' AND m.status = 'pending' AND m.created_at <= ?
@@ -206,6 +208,6 @@ export function workflowStateNoticeSummary(
 export function workflowStateNoticeLines(notices: WorkflowStateNotices): string[] {
   return notices.undeliveredTerminalMessages.entries.map(
     (message) =>
-      `notice undeliveredTerminalMessage ${message.workflowMessageId}: run ${message.runId}, target session ${message.targetSessionId} never reported; pending since ${message.createdAt} (${(message.ageMs / 3_600_000).toFixed(1)} h)`,
+      `notice undeliveredTerminalMessage ${message.workflowMessageId}: run ${message.runId}, target session ${message.targetSessionId} has no retained delivery evidence; pending since ${message.createdAt} (${(message.ageMs / 3_600_000).toFixed(1)} h)`,
   );
 }

@@ -136,7 +136,7 @@ describe("undelivered terminal workflow messages", () => {
     );
   }
 
-  it("lists every old pending terminal message of a session that never reported", async () => {
+  it("lists every old pending terminal message of a session with no delivery evidence", async () => {
     const f = await fixture();
     try {
       f.terminal("made-up-one", "made-up-session-one");
@@ -221,7 +221,7 @@ describe("undelivered terminal workflow messages", () => {
     }
   });
 
-  it("treats a workflow turn as evidence that the session reported", async () => {
+  it("treats a workflow turn as delivery evidence of the session", async () => {
     const f = await fixture();
     try {
       f.terminal("turned", "turn-session");

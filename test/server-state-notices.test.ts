@@ -19,7 +19,7 @@ const HOUR_MS = 60 * 60 * 1_000;
 
 /**
  * Seed two failed interactive runs with pending terminal messages: one for a session
- * that never reported, one for a session that received an earlier message.
+ * with no delivery evidence, one for a session that received an earlier message.
  */
 function seed(databasePath: string, projectPath: string, createdAt: number): void {
   const queue = new WorkflowRunQueueStore(databasePath, { projectPath });
@@ -175,7 +175,7 @@ describe("undelivered terminal message notices", () => {
     expect(written.join("").split("\n")).toEqual([
       `Inactive SQLite backup is valid: ${backupPath}`,
       expect.stringMatching(
-        /^notice undeliveredTerminalMessage terminal-orphan: run orphan, target session made-up-session never reported; pending since \S+Z \(2\.\d h\)$/u,
+        /^notice undeliveredTerminalMessage terminal-orphan: run orphan, target session made-up-session has no retained delivery evidence; pending since \S+Z \(2\.\d h\)$/u,
       ),
       "",
     ]);

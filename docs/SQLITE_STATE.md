@@ -200,14 +200,18 @@ conditions:
 - it was created at least one hour (`minimumAgeMs`, 3,600,000) before the report.
   A connected session receives its terminal message within seconds of becoming
   idle, so the hour leaves out every normal delivery delay;
-- its target session has no retained evidence of ever reporting to the server:
-  no `sent` workflow message, no workflow turn, and no session segment.
+- its target session has no retained delivery evidence: no `sent` workflow
+  message, no workflow turn, and no session segment.
 
 This is the narrowest rule that still finds a message no session will claim. A
-session that did report once keeps its pending result for when it comes back, so
-that result is not listed. Retention can remove an older run that held a
-session's only evidence, so check a listed session before you act on it. The
-report only reads state. It never cancels, expires, or deletes a message.
+session with delivery evidence keeps its pending result for when it comes back,
+so that result is not listed. A listed session is not proof of a session that
+never existed. An interactive start needs the session's live coordinator, but
+that proof leaves no durable row. A real session that closed before its first
+delivery therefore matches too, for example after a run with no agent step. So
+does a session whose only evidence was in an older run that retention removed.
+Such a session receives the message when it resumes. The report only reads
+state. It never cancels, expires, or deletes a message.
 
 Both commands return the report in `notices`, a `pi-workflows.state-notices.v1`
 value, in one of two forms. `state status` keeps its rule of naming no session,
@@ -251,16 +255,20 @@ of a rejected `state verify`, and after the valid line of inactive-backup
 verification:
 
 ```text
-notice undeliveredTerminalMessage workflow-message-example: run example-run, target session example-session never reported; pending since 2026-01-10T12:00:00.000Z (30.0 h)
+notice undeliveredTerminalMessage workflow-message-example: run example-run, target session example-session has no retained delivery evidence; pending since 2026-01-10T12:00:00.000Z (30.0 h)
 ```
 
 ### Removing undeliverable terminal messages
 
 No command removes a listed message, because the server cannot prove that a
-session will never connect. Deleting only the message does not work either: at
-startup, the server creates the missing terminal message of a terminal
-interactive run again. When an operator has confirmed that the target session
-does not exist, remove the whole run tree in a maintenance window:
+session will never connect. A listed message can belong to a real Pi session that
+closed before delivery; that session receives the message when it resumes, and
+deleting the run would remove its post-workflow handoff. Before you delete
+anything, confirm that no Pi session with the target session ID exists, for
+example that Pi keeps no session file with that ID. Deleting only the message
+does not work either: at startup, the server creates the missing terminal message
+of a terminal interactive run again. Once you have confirmed that the target
+session does not exist, remove the whole run tree in a maintenance window:
 
 1. Check that no work is active with `pi-workflows server status` and
    `pi-workflows state status`.
@@ -275,7 +283,7 @@ does not exist, remove the whole run tree in a maintenance window:
    the first error and rolls back. The transaction first checks its guards. The
    server holds no claim (`workflow_server_state.server_id IS NULL`). The message
    is still a pending terminal message of that run and session, and the session
-   still has no sent message, turn, or session segment. The run is a terminal
+   still has no retained delivery evidence. The run is a terminal
    root run with a settled queue row. No other run names it as parent, root, or
    recovery root, or names one of its messages as a recovery source. None of its
    effects is pending, applying, or ambiguous. The transaction then deletes the
