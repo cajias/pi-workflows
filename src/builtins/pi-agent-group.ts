@@ -19,7 +19,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { PROMPT_CEILING_CHARS } from "../workflows/prompt-evidence.js";
 import {
-  boundedErrorText,
   PiAgentGroupError,
   type PiAgentGroupLaunchOptions,
   type PiAgentLifecycleEvent,
@@ -858,18 +857,7 @@ async function runOneAgent(
     if (abortKind !== undefined || options.signal.aborted) {
       abortSession(abortKind ?? "cancelled");
       await abortWork;
-      if (abortKind === "timeout") {
-        throw new PiAgentGroupError(
-          request.id,
-          "timed out",
-          `after ${timeoutMs}ms${abortSuffix(abortFailure)}`,
-        );
-      }
-      throw new PiAgentGroupError(
-        request.id,
-        "cancelled",
-        `${cancellationReason(options.signal.reason)}${abortSuffix(abortFailure)}`,
-      );
+      throw stoppedError(request.id, abortKind, timeoutMs, options.signal, abortFailure);
     }
 
     await session.prompt(request.prompt, {
@@ -878,19 +866,8 @@ async function runOneAgent(
       },
     });
     await abortWork;
-    if (abortKind === "timeout") {
-      throw new PiAgentGroupError(
-        request.id,
-        "timed out",
-        `after ${timeoutMs}ms${abortSuffix(abortFailure)}`,
-      );
-    }
-    if (abortKind === "cancelled" || options.signal.aborted) {
-      throw new PiAgentGroupError(
-        request.id,
-        "cancelled",
-        `${cancellationReason(options.signal.reason)}${abortSuffix(abortFailure)}`,
-      );
+    if (abortKind !== undefined || options.signal.aborted) {
+      throw stoppedError(request.id, abortKind, timeoutMs, options.signal, abortFailure);
     }
     if (preflightDisposition !== "started") {
       throw new PiAgentGroupError(
@@ -911,7 +888,7 @@ async function runOneAgent(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    failure = normalizeAgentError(request.id, error, abortKind, options.signal);
+    failure = normalizeAgentError(request.id, error, abortKind, timeoutMs, options.signal);
   } finally {
     clearTimeout(timeout);
     options.signal.removeEventListener("abort", onAbort);
@@ -920,7 +897,17 @@ async function runOneAgent(
     try {
       await session?.dispose();
     } catch (error) {
-      failure ??= new PiAgentGroupError(request.id, "cleanup failed", errorMessage(error));
+      failure ??=
+        error instanceof PiAgentGroupError
+          ? error
+          : new PiAgentGroupError(
+              request.id,
+              "cleanup failed",
+              "the session could not be disposed",
+              {
+                detail: errorMessage(error),
+              },
+            );
     }
     const state = terminalState(failure);
     lifecycle.emit(state, state, true);
@@ -1306,10 +1293,13 @@ function finalAssistantText(
   if (message === undefined)
     throw new PiAgentGroupError(id, "returned no final output", "missing assistant message");
   if (message.stopReason === "error" || message.stopReason === "aborted") {
+    // The provider's error text can quote the prompt, the response, or credentials.
+    const detail = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
     throw new PiAgentGroupError(
       id,
       `stopped with ${String(message.stopReason)}`,
-      typeof message.errorMessage === "string" ? message.errorMessage : "provider stopped",
+      detail === undefined ? "provider stopped" : "the provider reported an error",
+      detail === undefined ? {} : { detail },
     );
   }
   const text = messageText(message.content).trim();
@@ -1351,16 +1341,26 @@ async function publishQueuedCancellations(
   ).catch(() => undefined);
 }
 
+/** A thrown SDK or provider error keeps its text as private detail. */
 function normalizeAgentError(
   id: string,
   error: unknown,
   abortKind: "timeout" | "cancelled" | undefined,
+  timeoutMs: number,
   signal: AbortSignal,
-): unknown {
+): PiAgentGroupError {
   if (error instanceof PiAgentGroupError) return error;
-  if (abortKind === "timeout") return new PiAgentGroupError(id, "timed out", errorMessage(error));
+  const detail = { detail: errorMessage(error) };
+  if (abortKind === "timeout") {
+    return new PiAgentGroupError(
+      id,
+      "timed out",
+      `after ${timeoutMs}ms; the session raised an error`,
+      detail,
+    );
+  }
   if (abortKind === "cancelled" || signal.aborted) return cancellationError(id, signal.reason);
-  return new PiAgentGroupError(id, "failed", errorMessage(error));
+  return new PiAgentGroupError(id, "failed", "the session raised an error", detail);
 }
 
 function terminalState(error: unknown): PiAgentLifecycleState {
@@ -1376,8 +1376,24 @@ function cancellationReason(reason: unknown): string {
   return reason === undefined ? "operation cancelled" : errorMessage(reason);
 }
 
-function abortSuffix(error: unknown): string {
-  return error === undefined ? "" : `; abort failed: ${boundedErrorText(errorMessage(error))}`;
+/**
+ * A session stopped by its timeout or by cancellation. A failed session abort is a fact; the
+ * abort's own error text is private detail.
+ */
+function stoppedError(
+  id: string,
+  abortKind: "timeout" | "cancelled" | undefined,
+  timeoutMs: number,
+  signal: AbortSignal,
+  abortFailure: unknown,
+): PiAgentGroupError {
+  const timedOut = abortKind === "timeout";
+  const code = timedOut ? "timed out" : "cancelled";
+  const facts = timedOut ? `after ${timeoutMs}ms` : cancellationReason(signal.reason);
+  if (abortFailure === undefined) return new PiAgentGroupError(id, code, facts);
+  return new PiAgentGroupError(id, code, `${facts}; the session abort failed`, {
+    detail: errorMessage(abortFailure),
+  });
 }
 
 function modelName(model: { provider: string; id: string } | undefined): string {

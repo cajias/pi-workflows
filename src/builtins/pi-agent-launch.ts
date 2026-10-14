@@ -56,35 +56,42 @@ export type PiAgentGroupLauncher = (
   options: PiAgentGroupLaunchOptions,
 ) => Promise<PiAgentResult[]>;
 
-const MAX_ERROR_CHARS = 2_000;
+export type PiAgentGroupErrorOptions = {
+  /**
+   * The complete cause when it holds text that Pi Workflows did not write, such as a provider
+   * error, a thrown SDK error, or Pi's own output. The message never contains it.
+   */
+  detail?: string;
+  /** Text from Pi Workflows that follows the facts, such as where the complete cause is saved. */
+  notice?: string;
+};
 
+/**
+ * A failed agent or agent group. Its message holds only the error code, the agent ID, and
+ * safe operational facts that Pi Workflows writes itself: fixed text, provider and model IDs,
+ * counts, and paths. The message reaches workflow state, traces, `piw`, and the post-workflow
+ * model turn, and Sanity Check lets only safe operational facts leave a child session. Text
+ * that a provider, an SDK, or Pi produced stays in `detail`; the workflow runner saves it
+ * to a private cause file and names that file in `notice`.
+ */
 export class PiAgentGroupError extends Error {
+  readonly detail: string | undefined;
+  readonly notice: string | undefined;
+
   constructor(
     readonly agentId: string,
     readonly code: string,
-    /** Unbounded cause text; the message bounds it. Launchers send it to rebuild the same error. */
-    readonly detail: string,
-    /**
-     * Text from Pi Workflows itself that follows the bounded cause in full, such as the path
-     * of a diagnostic log. It never quotes provider or Pi output.
-     */
-    readonly notice?: string,
+    /** Safe operational facts from Pi Workflows. Never provider, SDK, or Pi output. */
+    readonly facts: string,
+    options: PiAgentGroupErrorOptions = {},
   ) {
     super(
-      `Pi agent ${agentId} ${code}: ${boundedErrorText(detail)}${notice === undefined ? "" : `. ${notice}`}`,
+      `Pi agent ${agentId} ${code}: ${facts}${options.notice === undefined ? "" : `. ${options.notice}`}`,
     );
     this.name = "PiAgentGroupError";
+    this.detail = options.detail;
+    this.notice = options.notice;
   }
-}
-
-/**
- * Cause text in an agent error. Sanity Check lets only bounded safe operational facts leave
- * a child session, and agent errors can quote provider responses, so the message keeps at
- * most 2,000 characters. `PiAgentGroupError.detail` keeps the complete cause in memory.
- */
-export function boundedErrorText(value: string): string {
-  const text = value.trim() || "unknown failure";
-  return text.length <= MAX_ERROR_CHARS ? text : `${text.slice(0, MAX_ERROR_CHARS)}…`;
 }
 
 let installedLauncher: PiAgentGroupLauncher | undefined;

@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  boundedErrorText,
   PiAgentGroupError,
   launchPiAgentGroup,
   setPiAgentGroupLauncher,
@@ -48,14 +47,25 @@ describe("Pi agent group launcher", () => {
     );
   });
 
-  it("keeps the full cause on the error and bounds its message", () => {
-    const detail = `  ${"x".repeat(2_500)}  `;
-    const error = new PiAgentGroupError("review", "failed", detail);
+  it("keeps private detail out of the message and never shortens it", () => {
+    const detail = `PRIVATE_PROVIDER_TEXT ${"x".repeat(10_000)}`;
+    const error = new PiAgentGroupError("review", "failed", "the session raised an error", {
+      detail,
+    });
     expect(error.detail).toBe(detail);
-    expect(error.message).toBe(`Pi agent review failed: ${"x".repeat(2_000)}…`);
-    expect(new PiAgentGroupError("review", "failed", " ").message).toBe(
-      "Pi agent review failed: unknown failure",
+    expect(error.facts).toBe("the session raised an error");
+    expect(error.message).toBe("Pi agent review failed: the session raised an error");
+    expect(error.message).not.toContain("PRIVATE_PROVIDER_TEXT");
+
+    const facts = `after 5ms; ${"y".repeat(3_000)}`;
+    const located = new PiAgentGroupError("review", "timed out", facts, {
+      detail,
+      notice: "complete cause: /tmp/cause.txt",
+    });
+    expect(located.message).toBe(
+      `Pi agent review timed out: ${facts}. complete cause: /tmp/cause.txt`,
     );
-    expect(boundedErrorText(" short ")).toBe("short");
+    expect(located.notice).toBe("complete cause: /tmp/cause.txt");
+    expect(new PiAgentGroupError("review", "failed", "fixed").detail).toBeUndefined();
   });
 });

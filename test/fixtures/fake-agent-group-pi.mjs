@@ -65,15 +65,26 @@ const runScenarios = {
     emit({
       type: "failed",
       groupId: command.groupId,
-      error: { message: "ignored", agentId: "review", code: "timed out", detail: "after 5ms" },
+      error: { message: "ignored", agentId: "review", code: "timed out", facts: "after 5ms" },
     });
     respond(id, { success: true, data: { disposition: "handled" } });
+  },
+  // A provider error whose complete text only the bridge's private detail carries.
+  "provider-error"(command, id) {
+    agentFailure(command, id, "stopped with error", "the provider reported an error");
+  },
+  // A thrown SDK error, which the bridge reports the same way.
+  "sdk-error"(command, id) {
+    agentFailure(command, id, "failed", "the session raised an error");
+  },
+  "rejected-private"(_command, id) {
+    respond(id, { success: false, error: privateText() });
   },
   "plain-error"(command, id) {
     emit({
       type: "failed",
       groupId: command.groupId,
-      error: { message: "Invalid Pi agent id: !" },
+      error: { message: process.env.FAKE_AGENT_GROUP_PRIVATE_TEXT ?? "Invalid Pi agent id: !" },
     });
     respond(id, { success: true, data: { disposition: "handled" } });
   },
@@ -142,6 +153,31 @@ const runScenarios = {
   },
 };
 
+/** A started agent fails; its private text is on stderr and in the failure's detail. */
+function agentFailure(command, id, code, facts) {
+  const agentId = command.requests[0].id;
+  lifecycle(command.groupId, command.requests[0], "running");
+  lifecycle(command.groupId, command.requests[0], "failed");
+  process.stderr.write(`provider extension output ${privateText()}\n`);
+  emit({
+    type: "failed",
+    groupId: command.groupId,
+    error: {
+      message: `Pi agent ${agentId} ${code}: ${facts}`,
+      agentId,
+      code,
+      facts,
+      detail: privateText(),
+    },
+  });
+  respond(id, { success: true, data: { disposition: "handled" } });
+}
+
+/** Text that stands for provider or Pi output, which must reach only private files. */
+function privateText() {
+  return process.env.FAKE_AGENT_GROUP_PRIVATE_TEXT ?? "PRIVATE_FAKE_PI_TEXT";
+}
+
 function resultText(request) {
   const unit = process.env.FAKE_AGENT_GROUP_TEXT ?? `result ${request.id}`;
   return unit.repeat(Number(process.env.FAKE_AGENT_GROUP_TEXT_REPEAT ?? "1"));
@@ -175,7 +211,7 @@ function cancel(command) {
       emit({
         type: "failed",
         groupId: command.groupId,
-        error: { message: "late", agentId: "group", code: "cancelled", detail: command.reason },
+        error: { message: "late", agentId: "group", code: "cancelled", facts: command.reason },
       });
       markLate();
     }, lateMs);
@@ -188,7 +224,7 @@ function cancel(command) {
   emit({
     type: "failed",
     groupId: command.groupId,
-    error: { message: "ignored", agentId: "group", code: "cancelled", detail: command.reason },
+    error: { message: "ignored", agentId: "group", code: "cancelled", facts: command.reason },
   });
 }
 

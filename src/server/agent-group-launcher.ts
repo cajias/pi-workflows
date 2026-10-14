@@ -7,7 +7,12 @@ import {
   type PiAgentResult,
 } from "../builtins/pi-agent-launch.js";
 import { errorMessage } from "../workflows/errors.js";
-import { AgentLifecycleLedger, PiStderrLog, pruneStderrLogs } from "./agent-group-diagnostics.js";
+import {
+  AgentGroupDiagnostics,
+  agentGroupCauseText,
+  AgentLifecycleLedger,
+  pruneAgentGroupDiagnostics,
+} from "./agent-group-diagnostics.js";
 import {
   decodeAgentGroupEvent,
   encodeAgentGroupPrompt,
@@ -48,9 +53,9 @@ const LAUNCH_HINT =
 export type HeadlessPiAgentGroupSettings = {
   /** The bridge extension; `null` reports a broken installation. */
   bridgePath?: string | null;
-  /** Parent of each group's private stderr log directory; defaults to the OS temp directory. */
+  /** Parent of each group's private diagnostics directory; defaults to the OS temp directory. */
   diagnosticsDirectory?: string;
-  /** Name prefix of each stderr log directory, for example one that names the run. */
+  /** Name prefix of each diagnostics directory, for example one that names the run. */
   diagnosticsPrefix?: string;
   cancelSettleMs?: number;
   resultIdleMs?: number;
@@ -63,7 +68,7 @@ type ResolvedSettings = {
   resultIdleMs: number;
 };
 
-type Outcome = { results: PiAgentResult[] } | { error: Error };
+type Outcome = { results: PiAgentResult[] } | { error: PiAgentGroupError };
 
 /**
  * Runs Pi agent groups for the workflow runner. The runner is plain Node and cannot load the
@@ -94,8 +99,9 @@ export class HeadlessPiAgentGroupLauncher {
     requests: PiAgentRequest[],
     options: PiAgentGroupLaunchOptions,
   ): Promise<PiAgentResult[]> => {
-    // Before its first group, the launcher deletes expired logs that earlier runs kept or left.
-    this.pruned ??= this.pruneStderrLogs();
+    // Before its first group, the launcher deletes expired diagnostics that earlier runs kept
+    // or left.
+    this.pruned ??= this.pruneDiagnostics();
     await this.pruned;
     if (options.signal.aborted) throw cancellationError(options.signal.reason);
     if (this.closed) {
@@ -111,13 +117,10 @@ export class HeadlessPiAgentGroupLauncher {
     try {
       availableHeadlessLaunch(this.options);
     } catch (error) {
-      // The reason is Pi Workflows' own text with paths, so it follows the cause in full.
-      throw new PiAgentGroupError(
-        "group",
-        "could not run",
-        "headless pi is unavailable",
-        errorMessage(error),
-      );
+      // The reason is Pi Workflows' own text with paths, so it follows the facts in full.
+      throw new PiAgentGroupError("group", "could not run", "headless pi is unavailable", {
+        notice: errorMessage(error),
+      });
     }
     const call = new AgentGroupCall(
       this.bridgePath,
@@ -132,16 +135,16 @@ export class HeadlessPiAgentGroupLauncher {
     } finally {
       await call.child.close();
       this.active.delete(call.child);
-      await call.finishStderrLog();
+      await call.finishDiagnostics();
     }
   };
 
   /** Pruning is housekeeping: a failure is reported on the runner's stderr, never to the group. */
-  private async pruneStderrLogs(): Promise<void> {
-    await pruneStderrLogs(this.settings.diagnosticsDirectory, {
+  private async pruneDiagnostics(): Promise<void> {
+    await pruneAgentGroupDiagnostics(this.settings.diagnosticsDirectory, {
       onError: (target, error) => {
         process.stderr.write(
-          `Could not prune agent group stderr logs at ${target}: ${errorMessage(error)}\n`,
+          `Could not prune agent group diagnostics at ${target}: ${errorMessage(error)}\n`,
         );
       },
     });
@@ -158,7 +161,7 @@ class AgentGroupCall {
   readonly child: HeadlessPiProcess;
   private readonly groupId = randomUUID();
   private readonly outcome = deferred<PiAgentResult[]>();
-  private readonly stderrLog: PiStderrLog;
+  private readonly diagnostics: AgentGroupDiagnostics;
   private readonly ledger: AgentLifecycleLedger;
   private lifecycleWork: Promise<void> = Promise.resolve();
   private ready = false;
@@ -176,7 +179,10 @@ class AgentGroupCall {
     private readonly requests: PiAgentRequest[],
     private readonly options: PiAgentGroupLaunchOptions,
   ) {
-    this.stderrLog = new PiStderrLog(settings.diagnosticsDirectory, settings.diagnosticsPrefix);
+    this.diagnostics = new AgentGroupDiagnostics(
+      settings.diagnosticsDirectory,
+      settings.diagnosticsPrefix,
+    );
     this.ledger = new AgentLifecycleLedger(requests);
     this.child = new HeadlessPiProcess(bridgePath, launch, {
       onStderrChunk: (chunk) => this.onStderrChunk(chunk),
@@ -190,7 +196,7 @@ class AgentGroupCall {
     const onAbort = () => this.cancel();
     this.options.signal.addEventListener("abort", onAbort, { once: true });
     try {
-      await this.stderrLog.open();
+      await this.diagnostics.open();
       try {
         await this.child.start();
       } catch (error) {
@@ -206,14 +212,13 @@ class AgentGroupCall {
     }
   }
 
-  /** Call after the child exits, so the kept log holds its complete stderr. */
-  async finishStderrLog(): Promise<void> {
-    if (this.keepStderrLog) await this.stderrLog.keep();
-    else await this.stderrLog.discard();
+  /** Call after the child exits, so a kept stderr log holds the complete stream. */
+  async finishDiagnostics(): Promise<void> {
+    await this.diagnostics.finish(this.keepStderrLog);
   }
 
   private onStderrChunk(chunk: Buffer): void {
-    this.stderrLog.write(chunk);
+    this.diagnostics.write(chunk);
     if (this.resultTimer !== undefined) this.startResultTimer();
   }
 
@@ -238,11 +243,12 @@ class AgentGroupCall {
     if (response === undefined || this.settled) return;
     if (response.error !== undefined) {
       this.recordRpcResponse(line);
-      this.failToRun(`pi rejected the agent group command: ${response.error}`);
+      this.failToRun("pi rejected the agent group command", response.error);
     } else if (response.disposition !== "handled") {
       this.recordRpcResponse(line);
       this.failToRun(
-        `pi did not route the agent group command to its bridge (disposition ${String(response.disposition)})`,
+        "pi did not route the agent group command to its bridge",
+        `disposition ${String(response.disposition)}`,
       );
     } else {
       this.startResultTimer();
@@ -254,7 +260,9 @@ class AgentGroupCall {
     const stage = this.ready
       ? "headless pi exited before the agent group finished"
       : "headless pi exited before the agent group bridge loaded";
-    this.failToRun(`${stage} (${describeHeadlessPiExit(exit)})`);
+    // A spawn error is the operating system's text about pi; the exit status is a fact.
+    if (exit.error === undefined) this.failToRun(`${stage} (${describeHeadlessPiExit(exit)})`);
+    else this.failToRun(`${stage} (pi could not be started)`, exit.error);
   }
 
   private sendRun(): void {
@@ -293,24 +301,25 @@ class AgentGroupCall {
     this.cancelTimer = setTimeout(cancelled, this.settings.cancelSettleMs);
   }
 
-  /** Keep Pi's complete answer in the log, because the error message bounds the cause. */
+  /** Keep Pi's complete answer in the log, because the error message never quotes Pi. */
   private recordRpcResponse(line: string): void {
-    this.stderrLog.write(Buffer.from(`\n[pi-workflows] pi RPC response on stdout: ${line}\n`));
+    this.diagnostics.write(Buffer.from(`\n[pi-workflows] pi RPC response on stdout: ${line}\n`));
   }
 
   /**
-   * The bounded cause can quote Pi. The log location and launch hint follow it in full, so
-   * the message always names the complete diagnostics.
+   * Pi could not run the group. `facts` is Pi Workflows' own text; `detail` is text that Pi
+   * or the operating system supplied, which only the cause file holds. The stderr log is kept
+   * too, and the message names both files and the launch hint.
    */
-  private failToRun(cause: string): void {
+  private failToRun(facts: string, detail?: string): void {
     // A cancelled group reports cancellation, so nothing would name the log.
     this.keepStderrLog = !this.options.signal.aborted;
     this.finishUnconfirmed(
       new PiAgentGroupError(
         "group",
         "could not run",
-        cause,
-        `${this.stderrLog.describe()}. ${LAUNCH_HINT}`,
+        facts,
+        detail === undefined ? {} : { detail },
       ),
     );
   }
@@ -340,17 +349,36 @@ class AgentGroupCall {
       .catch(() => undefined);
   }
 
-  /** Settle once, after forwarded lifecycle facts. A cancelled group always reports cancellation. */
+  /**
+   * Settle once, after forwarded lifecycle facts. A cancelled group always reports
+   * cancellation; any other failure first saves its complete cause.
+   */
   private finish(outcome: Outcome): void {
     if (this.settled) return;
     this.settled = true;
     this.clearTimers();
-    const final: Outcome = this.options.signal.aborted
+    const cancelled = this.options.signal.aborted;
+    const final: Outcome = cancelled
       ? { error: cancellationError(this.options.signal.reason) }
       : outcome;
-    void this.lifecycleWork.then(() => {
+    void this.lifecycleWork.then(async () => {
       if ("results" in final) this.outcome.resolve(final.results);
-      else this.outcome.reject(final.error);
+      else this.outcome.reject(cancelled ? final.error : await this.withSavedCause(final.error));
+    });
+  }
+
+  /**
+   * The same error, naming the file that holds its complete cause. When pi could not run the
+   * group, the message also names the kept stderr log and the launch hint. The message never
+   * quotes the private detail, even when the cause file cannot be written.
+   */
+  private async withSavedCause(error: PiAgentGroupError): Promise<PiAgentGroupError> {
+    const notices = [await this.diagnostics.saveCause(agentGroupCauseText(error))];
+    if (this.keepStderrLog) notices.push(this.diagnostics.describeStderr());
+    const located = notices.join("; ");
+    return new PiAgentGroupError(error.agentId, error.code, error.facts, {
+      ...(error.detail === undefined ? {} : { detail: error.detail }),
+      notice: this.keepStderrLog ? `${located}. ${LAUNCH_HINT}` : located,
     });
   }
 
@@ -396,11 +424,20 @@ function promptResponse(
   return { disposition: isRecord(value.data) ? value.data.disposition : undefined };
 }
 
-function failureError(failure: AgentGroupFailure): Error {
-  if (failure.agentId !== undefined && failure.code !== undefined && failure.detail !== undefined) {
-    return new PiAgentGroupError(failure.agentId, failure.code, failure.detail);
+function failureError(failure: AgentGroupFailure): PiAgentGroupError {
+  if (failure.agentId !== undefined && failure.code !== undefined && failure.facts !== undefined) {
+    return new PiAgentGroupError(
+      failure.agentId,
+      failure.code,
+      failure.facts,
+      failure.detail === undefined ? {} : { detail: failure.detail },
+    );
   }
-  return new Error(failure.message);
+  // Any other error, such as a Pi SDK, settings, or package manager failure while the group is
+  // prepared, can quote text that Pi Workflows did not write, so all of it is private detail.
+  return new PiAgentGroupError("group", "failed", "the agent group raised an error", {
+    detail: failure.message,
+  });
 }
 
 function cancellationError(reason: unknown): PiAgentGroupError {

@@ -40,13 +40,19 @@ export default function reviewProvider(pi) {
     models: [{ id: "fixture-model", name: "Fixture model", reasoning: true }],
   });
   const answer = ${JSON.stringify(JSON.stringify(REVIEW))};
+  const mode = process.env.PI_WORKFLOWS_E2E_REVIEW_MODE;
   faux.setResponses([
-    process.env.PI_WORKFLOWS_E2E_REVIEW_MODE === "hang"
+    mode === "hang"
       ? async (_context, options) => {
           await new Promise((resolve) => options?.signal?.addEventListener("abort", resolve));
           return fauxAssistantMessage("aborted");
         }
-      : fauxAssistantMessage(answer),
+      : mode === "provider-error"
+        ? fauxAssistantMessage("", {
+            stopReason: "error",
+            errorMessage: process.env.PI_WORKFLOWS_E2E_PROVIDER_ERROR,
+          })
+        : fauxAssistantMessage(answer),
   ]);
   pi.registerProvider({
     ...faux.provider,
@@ -300,5 +306,27 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
     await waitUntil(() => output.pids.every(processGone), 10_000);
     // Neither group failed to run, so no stderr log remains.
     expect(await fs.readdir(path.join(root, "logs"))).toEqual([]);
+  }, 120_000);
+
+  it("saves a real provider error only in the cause file that the action error names", async () => {
+    const privateText = `invalid request PRIVATE_E2E_PROVIDER_MARKER ${"x".repeat(6_000)} END`;
+    const output = await runReview({
+      PI_WORKFLOWS_E2E_REVIEW_MODE: "provider-error",
+      PI_WORKFLOWS_E2E_PROVIDER_ERROR: privateText,
+    });
+
+    const facts = "Pi agent review stopped with error: the provider reported an error";
+    const cause = /complete cause: (\S+cause\.txt)$/u.exec(output.error ?? "")?.[1];
+    expect(output.error).toBe(`${facts}. complete cause: ${cause}`);
+    expect(cause?.startsWith(path.join(root, "logs") + path.sep)).toBe(true);
+    expect(await fs.readFile(cause ?? "", "utf8")).toBe(`${facts}\n\n${privateText}\n`);
+    expect(JSON.stringify(output.updates)).not.toContain("PRIVATE_E2E_PROVIDER_MARKER");
+    expect(
+      output.updates.filter((update) => update.key === "agents/review/review").at(-1),
+    ).toMatchObject({ status: "failed" });
+    // The bridge reported the error, so only the cause file stays.
+    expect(await fs.readdir(path.dirname(cause ?? ""))).toEqual(["cause.txt"]);
+    await waitUntil(() => output.pids.every(processGone), 10_000);
+    await fs.rm(path.dirname(cause ?? ""), { recursive: true, force: true });
   }, 120_000);
 });

@@ -267,7 +267,8 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
     expect(maximum).toBe(2);
   });
 
-  it("fails on a provider error and disposes the session", async () => {
+  it("fails on a provider error, keeps its text private, and disposes the session", async () => {
+    const providerText = `PRIVATE_PROVIDER_ERROR ${"p".repeat(6_000)} END`;
     let disposed = false;
     const factory: PiAgentSessionFactory = async () => {
       const listeners = new Set<(event: Record<string, unknown>) => void>();
@@ -280,7 +281,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         },
         async prompt(_prompt, options) {
           options?.preflightResult?.("started");
-          for (const listener of listeners) listener(message("", "error", "provider failed"));
+          for (const listener of listeners) listener(message("", "error", providerText));
         },
         async abort() {},
         dispose() {
@@ -288,13 +289,17 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         },
       };
     };
-    await expect(
-      runPiAgentGroup([request("provider")], {
-        maxConcurrency: 1,
-        signal: new AbortController().signal,
-        sessionFactory: factory,
-      }),
-    ).rejects.toThrow(/provider failed/);
+    const error = await runPiAgentGroup([request("provider")], {
+      maxConcurrency: 1,
+      signal: new AbortController().signal,
+      sessionFactory: factory,
+    }).catch((caught: unknown) => caught);
+    // The provider's text can quote the prompt or credentials, so only the detail holds it.
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect(error).toMatchObject({
+      message: "Pi agent provider stopped with error: the provider reported an error",
+      detail: providerText,
+    });
     expect(disposed).toBe(true);
   });
 
@@ -379,7 +384,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
           events.push(event);
         },
       }),
-    ).rejects.toThrow(/first failed/);
+    ).rejects.toMatchObject({ agentId: "first", detail: "first failed" });
     expect(created).toEqual(["first"]);
     expect(events).toContainEqual(
       expect.objectContaining({ id: "queued", state: "cancelled", phase: "cancelled" }),
@@ -390,7 +395,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/first failed/);
+    ).rejects.toMatchObject({ agentId: "first-no-progress", detail: "first failed" });
   });
 
   it("rejects duplicate tools and invalid limits", async () => {
@@ -655,7 +660,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
     ).rejects.toThrow(/assistant text is empty/);
   });
 
-  it("includes bounded abort diagnostics", async () => {
+  it("reports a failed abort as a fact and keeps the abort's text private", async () => {
     let release: (() => void) | undefined;
     const factory: PiAgentSessionFactory = async () => ({
       model: { provider: "mock", id: "model" },
@@ -668,7 +673,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       },
       async abort() {
         release?.();
-        throw new Error("abort failed");
+        throw new Error("PRIVATE_ABORT_FAILURE");
       },
       dispose() {},
     });
@@ -678,10 +683,13 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/abort failed/);
+    ).rejects.toMatchObject({
+      message: "Pi agent abort-diagnostic timed out: after 5ms; the session abort failed",
+      detail: "PRIVATE_ABORT_FAILURE",
+    });
   });
 
-  it("bounds unexpected error messages", async () => {
+  it("keeps the complete text of unexpected errors out of the message", async () => {
     const blank: PiAgentSessionFactory = async () => {
       throw "";
     };
@@ -691,10 +699,15 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: blank,
       }),
-    ).rejects.toThrow(/unknown failure/);
+    ).rejects.toMatchObject({
+      message: "Pi agent blank failed: the session raised an error",
+      detail: "",
+    });
 
+    // A thrown SDK error keeps every character, but only in the private detail.
+    const sdkText = `PRIVATE_SDK_ERROR ${"x".repeat(5_000)} END`;
     const verbose: PiAgentSessionFactory = async () => {
-      throw new Error("x".repeat(3_000));
+      throw new Error(sdkText);
     };
     await expect(
       runPiAgentGroup([request("verbose")], {
@@ -702,7 +715,10 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: verbose,
       }),
-    ).rejects.toSatisfy((error: Error) => error.message.length < 2_100);
+    ).rejects.toMatchObject({
+      message: "Pi agent verbose failed: the session raised an error",
+      detail: sdkText,
+    });
   });
 
   it("reports missing models and cleanup failures", async () => {
@@ -720,7 +736,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: noModel,
       }),
-    ).rejects.toThrow(/No usable Pi model/);
+    ).rejects.toMatchObject({ code: "failed", detail: "No usable Pi model is configured" });
 
     const cleanup: PiAgentSessionFactory = async () => {
       const listeners = new Set<(event: Record<string, unknown>) => void>();
@@ -737,7 +753,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         },
         async abort() {},
         dispose() {
-          throw new Error("dispose failed");
+          throw new Error("PRIVATE_DISPOSE_FAILURE");
         },
       };
     };
@@ -747,7 +763,10 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: cleanup,
       }),
-    ).rejects.toThrow(/cleanup failed/);
+    ).rejects.toMatchObject({
+      message: "Pi agent cleanup cleanup failed: the session could not be disposed",
+      detail: "PRIVATE_DISPOSE_FAILURE",
+    });
 
     const primary: PiAgentSessionFactory = async () => ({
       model: { provider: "mock", id: "model" },
@@ -767,7 +786,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: primary,
       }),
-    ).rejects.toThrow(/prompt failed first/);
+    ).rejects.toMatchObject({ code: "failed", detail: "prompt failed first" });
   });
 
   it("cancels a session while its prompt is running", async () => {
@@ -1799,7 +1818,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/bad agent/);
+    ).rejects.toMatchObject({ agentId: "bad", detail: "bad agent" });
     expect(created).toEqual(["bad", "good"]);
   });
 });

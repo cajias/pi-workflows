@@ -156,6 +156,12 @@ describe("agent group bridge", () => {
       new PiAgentGroupError("review", "timed out", "after 5ms"),
     );
     await bridge.command(runArgument("agent"));
+    groupRunner.run.mockRejectedValueOnce(
+      new PiAgentGroupError("review", "stopped with error", "the provider reported an error", {
+        detail: "provider said no",
+      }),
+    );
+    await bridge.command(runArgument("provider"));
     groupRunner.run.mockRejectedValueOnce(new Error("Invalid Pi agent id: !"));
     await bridge.command(runArgument("plain"));
 
@@ -167,7 +173,18 @@ describe("agent group bridge", () => {
           message: "Pi agent review timed out: after 5ms",
           agentId: "review",
           code: "timed out",
-          detail: "after 5ms",
+          facts: "after 5ms",
+        },
+      },
+      {
+        type: "failed",
+        groupId: "provider",
+        error: {
+          message: "Pi agent review stopped with error: the provider reported an error",
+          agentId: "review",
+          code: "stopped with error",
+          facts: "the provider reported an error",
+          detail: "provider said no",
         },
       },
       { type: "failed", groupId: "plain", error: { message: "Invalid Pi agent id: !" } },
@@ -190,7 +207,7 @@ describe("agent group bridge", () => {
         message: "Pi agent group cancelled: stop now",
         agentId: "group",
         code: "cancelled",
-        detail: "stop now",
+        facts: "stop now",
       },
     });
   });
@@ -204,7 +221,7 @@ describe("agent group bridge", () => {
     expect(bridge.events.at(-1)).toMatchObject({
       type: "failed",
       groupId: "group-1",
-      error: { code: "cancelled", detail: "Headless pi is shutting down" },
+      error: { code: "cancelled", facts: "Headless pi is shutting down" },
     });
     await running;
   });

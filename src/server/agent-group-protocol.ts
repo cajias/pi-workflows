@@ -33,11 +33,16 @@ export type AgentGroupCommand =
     }
   | { type: "cancel"; groupId: string; reason: string };
 
-/** A failed group. Agent errors keep their fields so the runner rebuilds the same error. */
+/**
+ * A failed group. Agent errors keep their fields so the runner rebuilds the same error. The
+ * `message` of any other error, and an agent error's `detail`, can quote provider, SDK, or Pi
+ * text, so the runner keeps them out of its error message.
+ */
 export type AgentGroupFailure = {
   message: string;
   agentId?: string;
   code?: string;
+  facts?: string;
   detail?: string;
 };
 
@@ -118,12 +123,13 @@ export function describeAgentGroupFailure(error: unknown): AgentGroupFailure {
 
 function agentErrorFields(
   error: Error,
-): Required<Pick<AgentGroupFailure, "agentId" | "code" | "detail">> | undefined {
+): Pick<AgentGroupFailure, "agentId" | "code" | "facts" | "detail"> | undefined {
   const fields: Record<string, unknown> = { ...error };
-  const { agentId, code, detail } = fields;
-  return typeof agentId === "string" && typeof code === "string" && typeof detail === "string"
-    ? { agentId, code, detail }
-    : undefined;
+  const { agentId, code, facts, detail } = fields;
+  if (typeof agentId !== "string" || typeof code !== "string" || typeof facts !== "string") {
+    return undefined;
+  }
+  return typeof detail === "string" ? { agentId, code, facts, detail } : { agentId, code, facts };
 }
 
 function groupEvent(groupId: string, value: Record<string, unknown>): AgentGroupEvent | undefined {

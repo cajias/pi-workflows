@@ -1,38 +1,50 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PiAgentGroupError } from "../src/builtins/pi-agent-launch.js";
 import {
-  PiStderrLog,
-  pruneStderrLogs,
-  STDERR_LOG_RETENTION_MS,
+  AgentGroupDiagnostics,
+  agentGroupCauseText,
+  DIAGNOSTICS_RETENTION_MS,
+  pruneAgentGroupDiagnostics,
 } from "../src/server/agent-group-diagnostics.js";
 import { makeTempDir } from "./helpers.js";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
-const EXPIRED = new Date(NOW - STDERR_LOG_RETENTION_MS - DAY_MS);
-const FRESH = new Date(NOW - STDERR_LOG_RETENTION_MS + DAY_MS);
+const EXPIRED = new Date(NOW - DIAGNOSTICS_RETENTION_MS - DAY_MS);
+const FRESH = new Date(NOW - DIAGNOSTICS_RETENTION_MS + DAY_MS);
 
-type LogDirectory = { directory: string; log: string };
+type LogDirectory = { directory: string; log: string; cause: string };
 
-/** A log directory with the exact layout that PiStderrLog creates, last modified at `mtime`. */
+/**
+ * A diagnostics directory with the exact layout that AgentGroupDiagnostics creates, last
+ * modified at `mtime`: a stderr log unless `contents` is null, and a cause file when `cause`
+ * is given.
+ */
 async function logDirectory(
   parent: string,
   name: string,
   mtime: Date,
   contents: string | null = "pi stderr\n",
+  cause: string | null = null,
 ): Promise<LogDirectory> {
   const directory = path.join(parent, name);
   await fs.mkdir(directory, { mode: 0o700 });
   await fs.chmod(directory, 0o700);
   const log = path.join(directory, "pi-stderr.log");
-  if (contents !== null) {
-    await fs.writeFile(log, contents, { mode: 0o600 });
-    await fs.chmod(log, 0o600);
-    await fs.utimes(log, mtime, mtime);
+  const causeFile = path.join(directory, "cause.txt");
+  for (const [file, text] of [
+    [log, contents],
+    [causeFile, cause],
+  ] as const) {
+    if (text === null) continue;
+    await fs.writeFile(file, text, { mode: 0o600 });
+    await fs.chmod(file, 0o600);
+    await fs.utimes(file, mtime, mtime);
   }
   await fs.utimes(directory, mtime, mtime);
-  return { directory, log };
+  return { directory, log, cause: causeFile };
 }
 
 async function exists(target: string): Promise<boolean> {
@@ -43,7 +55,7 @@ async function exists(target: string): Promise<boolean> {
 }
 
 async function prune(parent: string, errors: Array<[string, unknown]> = []): Promise<string[]> {
-  return await pruneStderrLogs(parent, {
+  return await pruneAgentGroupDiagnostics(parent, {
     now: NOW,
     onError: (target, error) => errors.push([target, error]),
   });
@@ -53,9 +65,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("agent group stderr log pruning", () => {
+describe("agent group diagnostics pruning", () => {
   it("keeps logs for seven days", () => {
-    expect(STDERR_LOG_RETENTION_MS).toBe(7 * DAY_MS);
+    expect(DIAGNOSTICS_RETENTION_MS).toBe(7 * DAY_MS);
   });
 
   it("removes expired log directories, with or without a run ID, and empty ones", async () => {
@@ -77,6 +89,71 @@ describe("agent group stderr log pruning", () => {
     expect(errors).toEqual([]);
   });
 
+  it("removes expired directories that hold a cause file, alone or beside the log", async () => {
+    const parent = await makeTempDir("stderr-log-prune");
+    const causeOnly = await logDirectory(
+      parent,
+      "pi-workflows-r1-agent-group-cause1",
+      EXPIRED,
+      null,
+      "Pi agent review failed: the session raised an error\n",
+    );
+    const both = await logDirectory(
+      parent,
+      "pi-workflows-r1-agent-group-both01",
+      EXPIRED,
+      "pi stderr\n",
+      "Pi agent group could not run: pi rejected the agent group command\n",
+    );
+    const errors: Array<[string, unknown]> = [];
+
+    expect(await prune(parent, errors)).toEqual([both.directory, causeOnly.directory].sort());
+    expect(await fs.readdir(parent)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  it("keeps a directory while its cause file is recent, private, and regular", async () => {
+    const parent = await makeTempDir("stderr-log-prune");
+    // A recent cause file keeps the directory even when the log and the directory expired.
+    const fresh = await logDirectory(
+      parent,
+      "pi-workflows-r1-agent-group-fresh2",
+      EXPIRED,
+      "pi stderr\n",
+      "cause\n",
+    );
+    await fs.utimes(fresh.cause, FRESH, FRESH);
+    const readable = await logDirectory(
+      parent,
+      "pi-workflows-r1-agent-group-mode03",
+      EXPIRED,
+      null,
+      "cause\n",
+    );
+    await fs.chmod(readable.cause, 0o644);
+    const elsewhere = await makeTempDir("stderr-log-target");
+    const outsideCause = path.join(elsewhere, "cause.txt");
+    await fs.writeFile(outsideCause, "outside\n", { mode: 0o600 });
+    await fs.utimes(outsideCause, EXPIRED, EXPIRED);
+    const linked = await logDirectory(parent, "pi-workflows-r1-agent-group-link02", EXPIRED, null);
+    await fs.symlink(outsideCause, linked.cause);
+    await fs.utimes(linked.directory, EXPIRED, EXPIRED);
+    const nested = await logDirectory(parent, "pi-workflows-r1-agent-group-nest02", EXPIRED, null);
+    await fs.mkdir(nested.cause, { mode: 0o700 });
+    await fs.utimes(nested.cause, EXPIRED, EXPIRED);
+    await fs.utimes(nested.directory, EXPIRED, EXPIRED);
+    const errors: Array<[string, unknown]> = [];
+
+    expect(await prune(parent, errors)).toEqual([]);
+    expect(await fs.readFile(fresh.cause, "utf8")).toBe("cause\n");
+    expect(await fs.readFile(fresh.log, "utf8")).toBe("pi stderr\n");
+    expect(await fs.readFile(readable.cause, "utf8")).toBe("cause\n");
+    expect((await fs.lstat(linked.cause)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(outsideCause, "utf8")).toBe("outside\n");
+    expect((await fs.lstat(nested.cause)).isDirectory()).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
   it("keeps directories that pi used within the retention period", async () => {
     const parent = await makeTempDir("stderr-log-prune");
     const fresh = await logDirectory(parent, "pi-workflows-r1-agent-group-fresh1", FRESH);
@@ -94,9 +171,9 @@ describe("agent group stderr log pruning", () => {
       expect(await fs.readFile(kept.log, "utf8")).toBe("pi stderr\n");
     }
     expect(
-      await pruneStderrLogs(parent, {
+      await pruneAgentGroupDiagnostics(parent, {
         now: NOW + 30 * DAY_MS,
-        retentionMs: STDERR_LOG_RETENTION_MS,
+        retentionMs: DIAGNOSTICS_RETENTION_MS,
       }),
     ).toHaveLength(4);
   });
@@ -213,7 +290,7 @@ describe("agent group stderr log pruning", () => {
     await fs.writeFile(notDirectory, "");
     const reports: string[] = [];
     await expect(
-      pruneStderrLogs(notDirectory, {
+      pruneAgentGroupDiagnostics(notDirectory, {
         now: NOW,
         onError: (target) => {
           reports.push(target);
@@ -243,20 +320,88 @@ describe("agent group stderr log pruning", () => {
     expect(errors).toEqual([]);
   });
 
-  it("prunes the directories that PiStderrLog creates and keeps", async () => {
+  it("prunes the directories that AgentGroupDiagnostics creates and keeps", async () => {
     const parent = await makeTempDir("stderr-log-prune");
-    const kept = new PiStderrLog(parent, "pi-workflows-r1-agent-group-");
-    await kept.open();
-    kept.write(Buffer.from("could not run\n"));
-    await kept.keep();
-    const logPath = kept.path;
-    if (logPath === undefined) throw new Error("the log did not open");
-    const directory = path.dirname(logPath);
+    // Pi could not run this group, so both files stay.
+    const couldNotRun = new AgentGroupDiagnostics(parent, "pi-workflows-r1-agent-group-");
+    await couldNotRun.open();
+    couldNotRun.write(Buffer.from("could not run\n"));
+    await couldNotRun.saveCause("Pi agent group could not run: pi rejected the command\n");
+    await couldNotRun.finish(true);
+    // The bridge reported this failure, so only the cause file stays.
+    const reported = new AgentGroupDiagnostics(parent, "pi-workflows-r2-agent-group-");
+    await reported.open();
+    reported.write(Buffer.from("provider output\n"));
+    await reported.saveCause("Pi agent review failed: the session raised an error\n");
+    await reported.finish(false);
+    const kept = [couldNotRun, reported].map((diagnostics) => {
+      if (diagnostics.causePath === undefined) throw new Error("the directory did not open");
+      return diagnostics.causePath;
+    });
+    const directories = kept.map((cause) => path.dirname(cause));
+    expect(await fs.readdir(directories[0]!)).toEqual(["cause.txt", "pi-stderr.log"]);
+    expect(await fs.readdir(directories[1]!)).toEqual(["cause.txt"]);
 
     expect(await prune(parent)).toEqual([]);
-    await fs.utimes(logPath, EXPIRED, EXPIRED);
-    await fs.utimes(directory, EXPIRED, EXPIRED);
-    expect(await prune(parent)).toEqual([directory]);
-    expect(await exists(directory)).toBe(false);
+    for (const directory of directories) {
+      for (const name of await fs.readdir(directory)) {
+        await fs.utimes(path.join(directory, name), EXPIRED, EXPIRED);
+      }
+      await fs.utimes(directory, EXPIRED, EXPIRED);
+    }
+    expect(await prune(parent)).toEqual(directories.toSorted());
+    expect(await fs.readdir(parent)).toEqual([]);
+  });
+});
+
+describe("agent group diagnostics", () => {
+  it("writes the complete cause to a private file beside the stderr log", async () => {
+    const parent = await makeTempDir("agent-group-diagnostics");
+    const diagnostics = new AgentGroupDiagnostics(parent, "pi-workflows-r1-agent-group-");
+    await diagnostics.open();
+    const detail = `PRIVATE_CAUSE ${"é漢".repeat(4_000)} END`;
+    const error = new PiAgentGroupError("review", "failed", "the session raised an error", {
+      detail,
+    });
+
+    const notice = await diagnostics.saveCause(agentGroupCauseText(error));
+    const causePath = diagnostics.causePath!;
+    expect(notice).toBe(`complete cause: ${causePath}`);
+    expect(path.dirname(causePath)).toBe(path.dirname(diagnostics.stderrPath!));
+    expect(await fs.readFile(causePath, "utf8")).toBe(
+      `Pi agent review failed: the session raised an error\n\n${detail}\n`,
+    );
+    expect((await fs.stat(path.dirname(causePath))).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(causePath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(diagnostics.stderrPath!)).mode & 0o777).toBe(0o600);
+    // A second cause never replaces the first.
+    expect(await diagnostics.saveCause("other")).toMatch(/^complete cause was not saved: EEXIST/u);
+    await diagnostics.finish(false);
+    expect(await fs.readdir(path.dirname(causePath))).toEqual(["cause.txt"]);
+  });
+
+  it("states facts alone when an error has no private detail", () => {
+    expect(agentGroupCauseText(new PiAgentGroupError("group", "has unknown provider", "x"))).toBe(
+      "Pi agent group has unknown provider: x\n",
+    );
+  });
+
+  it("removes a directory that keeps nothing and reports one it could not create", async () => {
+    const parent = await makeTempDir("agent-group-diagnostics");
+    const unused = new AgentGroupDiagnostics(parent);
+    await unused.open();
+    unused.write(Buffer.from("output\n"));
+    await unused.finish(false);
+    expect(await fs.readdir(parent)).toEqual([]);
+
+    const missing = new AgentGroupDiagnostics(path.join(parent, "missing"));
+    await missing.open();
+    expect(missing.causePath).toBeUndefined();
+    expect(await missing.saveCause("PRIVATE_CAUSE")).toMatch(
+      /^complete cause was not saved: ENOENT/u,
+    );
+    expect(await missing.saveCause("PRIVATE_CAUSE")).not.toContain("PRIVATE_CAUSE");
+    expect(missing.describeStderr()).toMatch(/^pi stderr was not saved: ENOENT/u);
+    await missing.finish(false);
   });
 });
