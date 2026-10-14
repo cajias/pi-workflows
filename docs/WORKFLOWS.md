@@ -36,13 +36,14 @@ not ready because ...`, which names the last reason, such as a stale session vie
 or an unreported branch. When the connection drops during a start, or the server
 refuses the start's epoch as replaced, the start may already be committed. The
 extension then waits, within the same 15 seconds, for the session's next epoch
-and sends the start again with the same idempotency key and run ID, at most three
-sends in all. The server adopts a start it already committed instead of creating
-a second run. When the extension cannot confirm the start, its error names the
-run ID; check `/workflow status` before you start the workflow again. A headless
-start (`executionMode: "headless"`) needs no Pi session and carries no session
-authority. Verification scripts and tests use an isolated server with a scratch
-database, never the live server; see
+and sends the start again with the same idempotency key and run ID, in at most
+three start attempts. After a lost connection, each attempt's client may resend
+once, and the server refuses that resend as replaced. The server adopts a start
+it already committed instead of creating a second run. When the extension cannot
+confirm the start, its error names the run ID; check `/workflow status` before
+you start the workflow again. A headless start (`executionMode: "headless"`)
+needs no Pi session and carries no session authority. Verification scripts and
+tests use an isolated server with a scratch database, never the live server; see
 [Verification scripts](DEVELOPMENT.md#verification-scripts).
 
 Resume uses the run's original source and graph, including ordinary workflows
