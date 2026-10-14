@@ -67,6 +67,13 @@ function fixtureOAuth() {
 }
 
 export default function legacyProvider(pi: ExtensionAPI): void {
+  // Only an OAuth refresh process carries a refresh request. There,
+  // PI_AGENT_FIXTURE_REFRESH_LOAD_EXIT makes the extension fail to load by ending the process
+  // with that exit status.
+  const loadExit = process.env.PI_AGENT_FIXTURE_REFRESH_LOAD_EXIT;
+  if (loadExit && process.env.PI_WORKFLOWS_OAUTH_REFRESH_REQUEST !== undefined) {
+    process.exit(Number(loadExit));
+  }
   pi.registerProvider("fixture-legacy", {
     baseUrl: process.env.PI_AGENT_FIXTURE_BASE_URL ?? "http://127.0.0.1:1/v1",
     apiKey: "$PI_AGENT_FIXTURE_API_KEY",

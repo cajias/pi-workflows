@@ -43,6 +43,7 @@ import {
   OAUTH_REFRESH_REQUEST_ENV,
   oauthRefreshEntryArgs,
   oauthRefreshProcessEnv,
+  oauthRefreshProcessFailed,
   piModulePaths,
   UnsupportedPiInstallationError,
 } from "./pi-oauth-refresh-contract.js";
@@ -599,7 +600,11 @@ async function prepareDispatchCredential(
     refreshed.access === credential.access &&
     refreshed.refresh === credential.refresh &&
     refreshed.expires === credential.expires;
-  if (unchanged) throw couldNotRefresh(provider);
+  if (unchanged) {
+    throw oauthRefreshProcessFailed(exit)
+      ? refreshProcessFailure(provider)
+      : couldNotRefresh(provider);
+  }
   throw new PiAgentGroupError(
     "group",
     "has OAuth credentials that expire too soon",
@@ -612,6 +617,15 @@ function couldNotRefresh(provider: string): PiAgentGroupError {
     "group",
     "could not refresh OAuth credentials",
     `${provider}; sign in to the provider again in Pi, or configure an API key for it`,
+  );
+}
+
+/** The refresh process failed before Pi could refresh, so signing in again would not help. */
+function refreshProcessFailure(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not run the OAuth refresh process",
+    `${provider}; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group`,
   );
 }
 
@@ -1391,6 +1405,8 @@ async function createSdkSession(
           source: "interactive",
         }),
       subscribe: (listener) =>
+        // Pi session events are plain objects, and PiAgentEvent is only their record view.
+        // SAFETY: the listener checks each field it reads before using it.
         session.subscribe((event) => listener(event as unknown as PiAgentEvent)),
       abort: async () => await session.abort(),
       credentialFailure: () => refreshFailure,

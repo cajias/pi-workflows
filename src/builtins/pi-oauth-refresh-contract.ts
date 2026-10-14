@@ -54,6 +54,26 @@ export const OAUTH_REFRESH_EXIT = {
 
 export type OAuthRefreshExit = (typeof OAUTH_REFRESH_EXIT)[keyof typeof OAUTH_REFRESH_EXIT];
 
+/** Exit statuses from a refresh process that reached Pi's authentication, or named its failure. */
+const REPORTED_EXITS: ReadonlySet<number> = new Set([
+  OAUTH_REFRESH_EXIT.done,
+  OAUTH_REFRESH_EXIT.refreshFailed,
+  OAUTH_REFRESH_EXIT.storeFailed,
+  OAUTH_REFRESH_EXIT.unsupported,
+  OAUTH_REFRESH_EXIT.markerFailed,
+]);
+
+/**
+ * Whether the refresh process itself failed rather than Pi's refresh: it could not start (the
+ * group passes `undefined` for a spawn error), could not load Pi or the admitted extensions
+ * (`failed`, or any status that Pi Workflows does not define, such as a crash), did not start
+ * the refresh in time (`notStarted`), ran into the ceiling (`ceiling`), or did not exit while
+ * the group waited (`undefined`). Signing in again does not help with any of these.
+ */
+export function oauthRefreshProcessFailed(exit: number | undefined): boolean {
+  return exit === undefined || !REPORTED_EXITS.has(exit);
+}
+
 export type OAuthRefreshRequest = {
   /** The root of the Pi package that runs the group, from Pi's `getPackageDir()`. */
   piPackageDir: string;

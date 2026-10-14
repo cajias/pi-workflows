@@ -14,6 +14,7 @@ import {
   oauthRefreshEntryArgs,
   oauthRefreshExitFor,
   oauthRefreshProcessEnv,
+  oauthRefreshProcessFailed,
   piModulePaths,
   UnsupportedPiInstallationError,
 } from "../src/builtins/pi-oauth-refresh-contract.js";
@@ -56,6 +57,30 @@ describe("OAuth refresh process contract", () => {
     // Every status is distinct, so the group can tell the outcomes apart.
     const statuses = Object.values(OAUTH_REFRESH_EXIT);
     expect(new Set(statuses).size).toBe(statuses.length);
+  });
+
+  it("tells a failed refresh process apart from a refresh that reached Pi", () => {
+    // Pi refreshed, reported its own failure, or the process named a failure of its own.
+    for (const exit of [
+      OAUTH_REFRESH_EXIT.done,
+      OAUTH_REFRESH_EXIT.refreshFailed,
+      OAUTH_REFRESH_EXIT.storeFailed,
+      OAUTH_REFRESH_EXIT.unsupported,
+      OAUTH_REFRESH_EXIT.markerFailed,
+    ]) {
+      expect(oauthRefreshProcessFailed(exit), `exit ${exit}`).toBe(false);
+    }
+    // The process could not load Pi or the extensions, did not start the refresh in time, ran
+    // into the ceiling, crashed, could not be spawned, or did not exit while the group waited.
+    for (const exit of [
+      OAUTH_REFRESH_EXIT.failed,
+      OAUTH_REFRESH_EXIT.notStarted,
+      OAUTH_REFRESH_EXIT.ceiling,
+      1,
+      undefined,
+    ]) {
+      expect(oauthRefreshProcessFailed(exit), `exit ${String(exit)}`).toBe(true);
+    }
   });
 
   it("passes a test ceiling only with the explicit test switch, and floors it otherwise", () => {

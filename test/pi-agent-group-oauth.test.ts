@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { agentGroupErrorFields, runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
 import type { PiAgentLifecycleEvent, PiAgentRequest } from "../src/builtins/pi-agent-launch.js";
 import {
+  OAUTH_REFRESH_EXIT,
   OAUTH_REFRESH_TEST_CEILING_ENV,
   OAUTH_REFRESH_TEST_SWITCH_ENV,
 } from "../src/builtins/pi-oauth-refresh-contract.js";
@@ -296,6 +297,48 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
     }
   });
 
+  it.each([
+    ["could not load Pi or the admitted extensions", OAUTH_REFRESH_EXIT.failed],
+    ["did not start the refresh in time", OAUTH_REFRESH_EXIT.notStarted],
+    ["crashed", 1],
+  ])(
+    "names a refresh process that %s instead of asking to sign in again",
+    async (_name, loadExit) => {
+      let scenario: Scenario | undefined;
+      try {
+        scenario = await legacyOAuthScenario(`refresh-process-${loadExit}`, {
+          expiresInMs: NEAR_EXPIRY_MS,
+          refresh: "rotate",
+        });
+        // The fixture extension ends the refresh process while it loads there, before any refresh.
+        vi.stubEnv("PI_AGENT_FIXTURE_REFRESH_LOAD_EXIT", String(loadExit));
+        const before = await fs.readFile(scenario.authPath, "utf8");
+        const { cwd, events } = scenario;
+        const error = await groupError(
+          runPiAgentGroup([request("refresh-process", cwd)], {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+            onLifecycle: (event) => {
+              events.push(event);
+            },
+          }),
+        );
+        expect(error.message).toBe(
+          "Pi agent group could not run the OAuth refresh process: fixture-legacy; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group",
+        );
+        expect(agentGroupErrorFields(error)?.detail).toBeUndefined();
+        expectNoCredentialText(errorTexts(error));
+        expect(await refreshCount(scenario)).toBe(0);
+        expect(events).toEqual([]);
+        expect(scenario.mock.requests).toHaveLength(0);
+        expect(await fs.readFile(scenario.authPath, "utf8")).toBe(before);
+        expect(listOAuthRefreshMarkers(scenario.markerDir)).toEqual([]);
+      } finally {
+        await close(scenario);
+      }
+    },
+  );
+
   it("fails before any session starts when the refreshed credential still expires too soon", async () => {
     let scenario: Scenario | undefined;
     try {
@@ -474,7 +517,7 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
       expectNoCredentialText(markerText);
       const error = await run;
       expect(error.message).toBe(
-        "Pi agent group could not refresh OAuth credentials: fixture-legacy; sign in to the provider again in Pi, or configure an API key for it",
+        "Pi agent group could not run the OAuth refresh process: fixture-legacy; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group",
       );
       await expectRefreshProcessGone(scenario, pid);
       expect(await refreshCount(scenario)).toBe(1);
