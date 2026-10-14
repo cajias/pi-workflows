@@ -158,6 +158,86 @@ async function installedPackages(directory: string): Promise<string[]> {
   return names.toSorted();
 }
 
+// Unique OAuth credential values for the legacy fixture provider. None may appear in the
+// review output, its error, or any diagnostics file.
+const OAUTH_MARKERS = {
+  oldAccess: "pw-e2e-oauth-old-access-93a1",
+  oldRefresh: "pw-e2e-oauth-old-refresh-93a1",
+  newAccess: "pw-e2e-oauth-new-access-93a1",
+  newRefresh: "pw-e2e-oauth-new-refresh-93a1",
+};
+
+/**
+ * An agent directory whose default provider is the legacy fixture extension, with a stored
+ * OAuth credential that expires in five minutes. The fixture's refresh mock logs each call.
+ */
+async function oauthScenario(
+  name: string,
+  baseUrl: string,
+  refresh: "rotate" | "fail",
+): Promise<{
+  env: Record<string, string>;
+  authPath: string;
+  refreshLog: string;
+  diagnosticsDir: string;
+}> {
+  const agentDir = path.join(root, `${name}-agent`);
+  const diagnosticsDir = path.join(root, `${name}-logs`);
+  await fs.mkdir(agentDir, { recursive: true });
+  await fs.mkdir(diagnosticsDir, { recursive: true });
+  await writeJson(path.join(agentDir, "settings.json"), {
+    defaultProvider: "fixture-legacy",
+    defaultModel: "fixture-legacy-model",
+    defaultThinkingLevel: "high",
+    extensions: [
+      path.join(REPO_ROOT, "test", "fixtures", "pi-agent-extensions", "legacy-provider.ts"),
+    ],
+  });
+  const authPath = path.join(agentDir, "auth.json");
+  await writeJson(authPath, {
+    "fixture-legacy": {
+      type: "oauth",
+      access: OAUTH_MARKERS.oldAccess,
+      refresh: OAUTH_MARKERS.oldRefresh,
+      expires: Date.now() + 5 * 60_000,
+    },
+  });
+  const refreshLog = path.join(root, `${name}-refresh.log`);
+  return {
+    env: {
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR: diagnosticsDir,
+      PI_AGENT_FIXTURE_BASE_URL: baseUrl,
+      PI_AGENT_FIXTURE_OAUTH: "1",
+      PI_AGENT_FIXTURE_OAUTH_REFRESH: refresh,
+      PI_AGENT_FIXTURE_OAUTH_REFRESH_FILE: refreshLog,
+      PI_AGENT_FIXTURE_OAUTH_NEW_ACCESS: OAUTH_MARKERS.newAccess,
+      PI_AGENT_FIXTURE_OAUTH_NEW_REFRESH: OAUTH_MARKERS.newRefresh,
+    },
+    authPath,
+    refreshLog,
+    diagnosticsDir,
+  };
+}
+
+async function refreshCount(file: string): Promise<number> {
+  const text = await fs.readFile(file, "utf8").catch(() => "");
+  return text.trim() === "" ? 0 : text.trim().split("\n").length;
+}
+
+/** Fails when the text or any file under the directory holds an OAuth marker. */
+async function expectNoOAuthText(text: string, directory: string): Promise<void> {
+  const texts = [text];
+  for (const entry of await fs.readdir(directory, { recursive: true, withFileTypes: true })) {
+    if (entry.isFile()) {
+      texts.push(await fs.readFile(path.join(entry.parentPath, entry.name), "utf8"));
+    }
+  }
+  for (const marker of Object.values(OAUTH_MARKERS)) {
+    for (const value of texts) expect(value).not.toContain(marker);
+  }
+}
+
 beforeAll(async () => {
   root = await makeTempDir("agent-group-bridge-e2e");
   // A copy of the package like a `pi install` tree: regular dependencies are installed,
@@ -281,6 +361,56 @@ describe("Sanity Check agent groups under the real Pi runtime", () => {
         .catch(() => "{}");
       expect(JSON.parse(store)).not.toHaveProperty("cerebras");
       expect(output.pids).toHaveLength(1);
+      await waitUntil(() => output.pids.every(processGone), 10_000);
+    } finally {
+      await mock.close();
+    }
+  }, 120_000);
+
+  it("refreshes a near-expiry OAuth credential once in the headless pi host", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: JSON.stringify(REVIEW),
+    }));
+    const scenario = await oauthScenario("oauth-refresh", mock.baseUrl, "rotate");
+    try {
+      const output = await runReview(scenario.env);
+
+      expect(output.error).toBeUndefined();
+      expect(output.reviews).toEqual([REVIEW]);
+      // One refresh in the bridge host, saved by Pi, and the child used the new credential.
+      expect(await refreshCount(scenario.refreshLog)).toBe(1);
+      expect(mock.authorizations).toEqual([`Bearer ${OAUTH_MARKERS.newAccess}`]);
+      const stored = JSON.parse(await fs.readFile(scenario.authPath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      expect(stored["fixture-legacy"]).toMatchObject({
+        type: "oauth",
+        access: OAUTH_MARKERS.newAccess,
+        refresh: OAUTH_MARKERS.newRefresh,
+      });
+      await expectNoOAuthText(JSON.stringify(output), scenario.diagnosticsDir);
+      await waitUntil(() => output.pids.every(processGone), 10_000);
+    } finally {
+      await mock.close();
+    }
+  }, 120_000);
+
+  it("fails before any session starts when the headless pi host cannot refresh", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const scenario = await oauthScenario("oauth-failure", mock.baseUrl, "fail");
+    try {
+      const output = await runReview(scenario.env);
+
+      expect(output.error).toMatch(
+        /^Pi agent group could not refresh OAuth credentials: fixture-legacy; sign in to the provider again in Pi, or configure an API key for it\. complete cause: /,
+      );
+      expect(await refreshCount(scenario.refreshLog)).toBe(1);
+      expect(mock.requests).toHaveLength(0);
+      // The kept cause file names the failure; the refresh error, which quoted the refresh
+      // token, is saved nowhere.
+      await expectNoOAuthText(JSON.stringify(output), scenario.diagnosticsDir);
       await waitUntil(() => output.pids.every(processGone), 10_000);
     } finally {
       await mock.close();
