@@ -14,8 +14,9 @@ type FixtureOAuthCredentials = { access: string; refresh: string; expires: numbe
  * failure. The gate wait gives up after 60 seconds.
  *
  * PI_AGENT_FIXTURE_OAUTH_AFTER_REFRESH changes `auth.json` after Pi saved the refreshed
- * credential, as another Pi process could: `remove` deletes the entry, and `api-key` replaces
- * it with an API key.
+ * credential, as another Pi process could: `remove` deletes the entry, `api-key` replaces it
+ * with an API key, `malformed` leaves an OAuth entry without its refresh token and expiry, and
+ * `torn` leaves the file cut off, as a read in the middle of a write would see it.
  */
 function fixtureOAuth() {
   return {
@@ -58,8 +59,11 @@ function fixtureOAuth() {
         const authPath = path.join(process.env.PI_CODING_AGENT_DIR ?? "", "auth.json");
         const stored = JSON.parse(fs.readFileSync(authPath, "utf8")) as Record<string, unknown>;
         if (change === "remove") delete stored["fixture-legacy"];
-        else stored["fixture-legacy"] = { type: "api_key", key: "fixture-replacement-key" };
-        fs.writeFileSync(authPath, JSON.stringify(stored), "utf8");
+        else if (change === "malformed") {
+          stored["fixture-legacy"] = { type: "oauth", access: credentials.access };
+        } else stored["fixture-legacy"] = { type: "api_key", key: "fixture-replacement-key" };
+        const text = JSON.stringify(stored);
+        fs.writeFileSync(authPath, change === "torn" ? text.slice(0, 12) : text, "utf8");
       }
       return credentials.access;
     },

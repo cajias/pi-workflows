@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +14,7 @@ import {
   getPackageDir,
   ModelRegistry,
   ModelRuntime,
+  readStoredCredential,
   SessionManager,
   SettingsManager,
   type LoadExtensionsResult,
@@ -36,7 +36,6 @@ import {
   type PiAgentTool,
 } from "./pi-agent-launch.js";
 import {
-  createPiCredentialStore,
   encodeOAuthRefreshRequest,
   isolatedResourceLoaderOptions,
   OAUTH_REFRESH_EXIT,
@@ -44,8 +43,7 @@ import {
   oauthRefreshEntryArgs,
   oauthRefreshProcessEnv,
   oauthRefreshProcessFailed,
-  piModulePaths,
-  UnsupportedPiInstallationError,
+  piSdkEntry,
 } from "./pi-oauth-refresh-contract.js";
 
 // This module imports packages that only Pi supplies. Only processes that Pi starts may load
@@ -552,9 +550,9 @@ type DispatchCredentialInput = {
  * The dispatch credential that children receive. Children never refresh OAuth credentials, so
  * an OAuth credential that could expire while a child still needs it is refreshed here, once,
  * before any session starts, through Pi's own locked credential store. Afterwards the group
- * reads the stored credential again through that store. It fails closed when the credential is
- * gone, is no longer an OAuth credential, or still expires too soon: the group never switches
- * to another kind of authentication on its own.
+ * reads the stored credential again with Pi's public `readStoredCredential`. It fails closed
+ * when the credential is gone or unreadable, is no longer an OAuth credential, or still expires
+ * too soon: the group never switches to another kind of authentication on its own.
  */
 async function prepareDispatchCredential(
   input: DispatchCredentialInput,
@@ -563,12 +561,7 @@ async function prepareDispatchCredential(
   if (credential?.type !== "oauth") return credential;
   if (credential.expires - now() > requiredValidityMs) return credential;
   const piPackageDir = getPackageDir();
-  const modules = piModulePaths(piPackageDir);
-  if (
-    process.versions.bun !== undefined ||
-    !existsSync(modules.sdk) ||
-    !existsSync(modules.authStorage)
-  ) {
+  if (process.versions.bun !== undefined || piSdkEntry(piPackageDir) === undefined) {
     throw unsupportedPiInstallation(provider);
   }
   const entryArgs = oauthRefreshEntryArgs(path.dirname(fileURLToPath(import.meta.url)));
@@ -594,7 +587,7 @@ async function prepareDispatchCredential(
       `${provider}; make ${oauthRefreshMarkerDirectory()} a private directory of this user`,
     );
   }
-  const refreshed = await readPiCredential(piPackageDir, input.agentDir, provider);
+  const refreshed = readRefreshedCredential(input.agentDir, provider);
   if (refreshed.expires - now() > requiredValidityMs) return refreshed;
   const unchanged =
     refreshed.access === credential.access &&
@@ -689,28 +682,17 @@ async function refreshInOwnProcess(
 }
 
 /**
- * The dispatch provider's stored OAuth credential, read through Pi's file-backed `AuthStorage`
- * under its lock. `list` reports types without resolving configured key values, so only an
- * OAuth credential is read. A Pi installation whose credential store cannot be loaded, or has a
- * different shape, is reported apart from a lock or IO failure.
+ * The dispatch provider's stored OAuth credential after the refresh, read with Pi's public
+ * `readStoredCredential`. Pi 1.1.0 exports no locked read, so this read takes no lock. It reads
+ * the whole file at once, and Pi writes `auth.json` only under its lock, so a read that meets a
+ * write in progress cannot parse and returns nothing. Every such read, and any lock or IO error,
+ * fails closed as `could not refresh OAuth credentials`.
  */
-async function readPiCredential(
-  piPackageDir: string,
+function readRefreshedCredential(
   agentDir: string,
   provider: string,
-): Promise<StoredCredential & { type: "oauth" }> {
-  // A signal makes Pi report a failed locked read instead of answering from its cached copy.
-  const options = { signal: new AbortController().signal };
-  let stored: unknown;
-  try {
-    const store = await createPiCredentialStore(piPackageDir, path.join(agentDir, "auth.json"));
-    const entry = (await store.list(options)).find((item) => item.providerId === provider);
-    stored = entry?.type === "oauth" ? await store.read(provider, options) : undefined;
-  } catch (error) {
-    throw error instanceof UnsupportedPiInstallationError
-      ? unsupportedPiInstallation(provider)
-      : credentialStoreFailure(provider);
-  }
+): StoredCredential & { type: "oauth" } {
+  const stored: unknown = readStoredCredential(provider, path.join(agentDir, "auth.json"));
   if (!isStoredCredential(stored) || stored.type !== "oauth") throw couldNotRefresh(provider);
   return structuredClone(stored);
 }

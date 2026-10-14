@@ -81,7 +81,7 @@ async function legacyOAuthScenario(
     script?: MockModelScript;
     /** The fixture refresh waits until this file exists. */
     gate?: string;
-    afterRefresh?: "remove" | "api-key";
+    afterRefresh?: "remove" | "api-key" | "malformed" | "torn";
   },
 ): Promise<Scenario> {
   const mock = await startMockOpenAiServer(
@@ -515,6 +515,8 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
       ]);
       const markerText = await fs.readFile(path.join(scenario.markerDir, `${pid}.json`), "utf8");
       expectNoCredentialText(markerText);
+      // `server status` reports exactly this list as `oauthRefreshes`.
+      expectNoCredentialText(JSON.stringify(listOAuthRefreshMarkers(scenario.markerDir)));
       const error = await run;
       expect(error.message).toBe(
         "Pi agent group could not run the OAuth refresh process: fixture-legacy; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group",
@@ -526,6 +528,38 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
       expect(await fs.readFile(scenario.authPath, "utf8")).toBe(before);
       await expect(fs.stat(`${scenario.authPath}.lock`)).rejects.toThrow();
     } finally {
+      await close(scenario);
+    }
+  });
+
+  it("counts Pi's wait for the auth.json lock against the ceiling", async () => {
+    let scenario: Scenario | undefined;
+    let lock: string | undefined;
+    try {
+      scenario = await legacyOAuthScenario("lock-wait", { expiresInMs: LONG_LIVED_MS });
+      // A provider built into Pi, so the refresh process loads no extension and meets the lock
+      // first in Pi's authentication.
+      await writeOpenRouterConfig(scenario, NEAR_EXPIRY_MS, { modelsJson: true });
+      // Another Pi process holds the lock that Pi's credential store takes for auth.json.
+      lock = `${scenario.authPath}.lock`;
+      await fs.mkdir(lock);
+      vi.stubEnv(OAUTH_REFRESH_TEST_CEILING_ENV, "1500");
+      vi.stubEnv(OAUTH_REFRESH_TEST_SWITCH_ENV, "1");
+      const started = Date.now();
+      const error = await groupError(
+        runPiAgentGroup([request("lock-wait", scenario.cwd)], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      );
+      // The ceiling ended the wait long before Pi's own 30-second lock wait would have.
+      expect(Date.now() - started).toBeLessThan(20_000);
+      expect(error.message).toBe(
+        "Pi agent group could not run the OAuth refresh process: openrouter; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group",
+      );
+      expect(listOAuthRefreshMarkers(scenario.markerDir)).toEqual([]);
+    } finally {
+      if (lock !== undefined) await fs.rm(lock, { recursive: true, force: true });
       await close(scenario);
     }
   });
@@ -592,14 +626,14 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
   });
 
   it.each([
-    ["without Pi's credential store", { sdk: "export {};\n" }],
+    ["whose manifest names no public entry", { exports: { "./client": "./index.js" } }],
     [
-      "with a Pi SDK that lacks the model runtime",
-      { sdk: "export {};\n", authStorage: "export const AuthStorage = {};\n" },
+      "whose Pi SDK lacks the model runtime",
+      { exports: { ".": { import: "./index.js" } }, sdk: "export {};\n" },
     ],
   ])(
-    "fails closed before any session starts %s",
-    async (_name, modules: { sdk: string; authStorage?: string }) => {
+    "fails closed before any session starts with a Pi package %s",
+    async (_name, stub: { exports: unknown; sdk?: string }) => {
       let scenario: Scenario | undefined;
       try {
         scenario = await legacyOAuthScenario("unsupported-pi", {
@@ -607,15 +641,12 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
           refresh: "rotate",
         });
         const piPackageDir = await makeTempDir("pi-agent-oauth-stub-pi");
-        await fs.mkdir(path.join(piPackageDir, "dist", "core"), { recursive: true });
-        await fs.writeFile(path.join(piPackageDir, "dist", "index.js"), modules.sdk, "utf8");
-        if (modules.authStorage !== undefined) {
-          await fs.writeFile(
-            path.join(piPackageDir, "dist", "core", "auth-storage.js"),
-            modules.authStorage,
-            "utf8",
-          );
-        }
+        await fs.writeFile(
+          path.join(piPackageDir, "package.json"),
+          JSON.stringify({ name: "@earendil-works/pi-coding-agent", exports: stub.exports }),
+          "utf8",
+        );
+        await fs.writeFile(path.join(piPackageDir, "index.js"), stub.sdk ?? "export {};\n", "utf8");
         // Pi's getPackageDir() honours PI_PACKAGE_DIR, so the refresh loads the stub.
         vi.stubEnv("PI_PACKAGE_DIR", piPackageDir);
         const { cwd, events } = scenario;
@@ -644,6 +675,9 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
   it.each([
     ["removes the entry", "remove" as const],
     ["replaces it with an API key", "api-key" as const],
+    // Pi's readStoredCredential returns nothing for a file that does not parse.
+    ["leaves the file cut off", "torn" as const],
+    ["leaves an OAuth entry of the wrong shape", "malformed" as const],
   ])("fails closed when another writer %s after the refresh", async (_name, afterRefresh) => {
     let scenario: Scenario | undefined;
     try {

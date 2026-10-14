@@ -20,16 +20,18 @@ const PENDING_MARKER_NAME = /^\d+\.json\.tmp$/u;
 const PENDING_MARKER_MAX_AGE_MS = 10_000;
 
 /**
- * How long a refresh process may load Pi and the admitted extensions before its refresh starts.
- * It exits when the refresh has not started by then, which is safe: no refresh is in flight.
+ * How long a refresh process may load Pi and the admitted extensions before it calls Pi's
+ * authentication. It exits when it has not called it by then, which is safe: no refresh is in
+ * flight.
  */
 export const OAUTH_REFRESH_START_DEADLINE_MS = 60_000;
 /**
- * How long a refresh process may run once its refresh has started. Pi waits at most 30 seconds
- * for the `auth.json` lock and gives the provider's refresh a 15-second abort signal, and the
- * agent group waits two minutes for the process. A refresh still running five minutes after it
- * started is stuck, for example in a provider refresh that ignores its abort signal, so the
- * process then exits even though the refresh is in flight. Exiting releases Pi's lock.
+ * How long a refresh process may run once it has called Pi's authentication, which includes
+ * Pi's wait for the `auth.json` lock. Pi waits at most 30 seconds for that lock and gives the
+ * provider's refresh a 15-second abort signal, and the agent group waits two minutes for the
+ * process. A refresh still running five minutes after the call is stuck, for example in a
+ * provider refresh that ignores its abort signal, so the process then exits even though the
+ * refresh is in flight. Exiting releases Pi's lock.
  */
 export const OAUTH_REFRESH_CEILING_MS = 5 * 60_000;
 /**

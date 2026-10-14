@@ -3,7 +3,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  createPiCredentialStore,
   decodeOAuthRefreshRequest,
   encodeOAuthRefreshRequest,
   loadPiSdk,
@@ -15,7 +14,7 @@ import {
   oauthRefreshExitFor,
   oauthRefreshProcessEnv,
   oauthRefreshProcessFailed,
-  piModulePaths,
+  piSdkEntry,
   UnsupportedPiInstallationError,
 } from "../src/builtins/pi-oauth-refresh-contract.js";
 import {
@@ -32,13 +31,23 @@ function modelsError(code: unknown): Error {
   return error;
 }
 
-async function stubPi(modules: { sdk?: string; authStorage?: string }): Promise<string> {
+const COMPLETE_SDK =
+  "export const ModelRuntime = { create() {} };\nexport function createAgentSessionServices() {}\nexport const SettingsManager = { inMemory() {} };\n";
+
+/** A stub Pi package: an optional manifest and an optional module at `sdk/entry.js`. */
+async function stubPi(stub: {
+  exports?: unknown;
+  manifest?: string;
+  sdk?: string;
+}): Promise<string> {
   const root = await makeTempDir("pi-oauth-refresh-stub");
-  const paths = piModulePaths(root);
-  await fs.mkdir(path.dirname(paths.authStorage), { recursive: true });
-  if (modules.sdk !== undefined) await fs.writeFile(paths.sdk, modules.sdk, "utf8");
-  if (modules.authStorage !== undefined) {
-    await fs.writeFile(paths.authStorage, modules.authStorage, "utf8");
+  const manifest =
+    stub.manifest ??
+    JSON.stringify({ name: "@earendil-works/pi-coding-agent", exports: stub.exports });
+  await fs.writeFile(path.join(root, "package.json"), manifest, "utf8");
+  if (stub.sdk !== undefined) {
+    await fs.mkdir(path.join(root, "sdk"));
+    await fs.writeFile(path.join(root, "sdk", "entry.js"), stub.sdk, "utf8");
   }
   return root;
 }
@@ -148,40 +157,61 @@ describe("OAuth refresh process contract", () => {
     expect(oauthRefreshEntryArgs(directory, () => undefined)).toEqual([compiled]);
   });
 
-  it("reports a Pi installation without the modules or APIs that the refresh uses", async () => {
-    const missing = await stubPi({});
-    await expect(loadPiSdk(missing)).rejects.toThrow(
+  it("finds Pi's public entry in the package manifest, and nothing else", async () => {
+    const entry = (root: string) => path.join(root, "sdk", "entry.js");
+    const importCondition = await stubPi({
+      exports: { ".": { types: "./sdk/entry.d.ts", import: "./sdk/entry.js" } },
+      sdk: COMPLETE_SDK,
+    });
+    expect(piSdkEntry(importCondition)).toBe(entry(importCondition));
+    const defaultCondition = await stubPi({
+      exports: { ".": { default: "./sdk/entry.js" } },
+      sdk: COMPLETE_SDK,
+    });
+    expect(piSdkEntry(defaultCondition)).toBe(entry(defaultCondition));
+    const plain = await stubPi({ exports: { ".": "./sdk/entry.js" }, sdk: COMPLETE_SDK });
+    expect(piSdkEntry(plain)).toBe(entry(plain));
+    // No manifest, no exports, no root entry, a require-only root, an entry outside the
+    // package, or a missing entry file.
+    const none = await makeTempDir("pi-oauth-refresh-stub");
+    expect(piSdkEntry(none)).toBeUndefined();
+    for (const exports of [
+      undefined,
+      "./sdk/entry.js",
+      { "./client": "./sdk/entry.js" },
+      { ".": { require: "./sdk/entry.js" } },
+      { ".": "../outside.js" },
+      { ".": "/sdk/entry.js" },
+      { ".": "./sdk/missing.js" },
+    ]) {
+      expect(
+        piSdkEntry(await stubPi({ exports, sdk: COMPLETE_SDK })),
+        JSON.stringify(exports),
+      ).toBe(undefined);
+    }
+    expect(piSdkEntry(await stubPi({ manifest: "not json", sdk: COMPLETE_SDK }))).toBeUndefined();
+  });
+
+  it("reports a Pi installation without the public entry or API that the refresh uses", async () => {
+    await expect(loadPiSdk(await stubPi({}))).rejects.toThrow(
+      "unsupported Pi installation: the Pi package has no public entry",
+    );
+    const broken = await stubPi({
+      exports: { ".": { import: "./sdk/entry.js" } },
+      sdk: "throw new Error('cannot load');\n",
+    });
+    await expect(loadPiSdk(broken)).rejects.toThrow(
       "unsupported Pi installation: the Pi SDK could not be loaded",
     );
-    await expect(createPiCredentialStore(missing, "/auth.json")).rejects.toThrow(
-      "unsupported Pi installation: Pi's credential store could not be loaded",
-    );
-
     const misshapen = await stubPi({
+      exports: { ".": { import: "./sdk/entry.js" } },
       sdk: "export const ModelRuntime = {};\n",
-      authStorage: "export const AuthStorage = {};\n",
     });
     await expect(loadPiSdk(misshapen)).rejects.toThrow(UnsupportedPiInstallationError);
-    await expect(createPiCredentialStore(misshapen, "/auth.json")).rejects.toThrow(
-      "unsupported Pi installation: Pi's credential store has no AuthStorage.create",
-    );
-
-    const partialStore = await stubPi({
-      authStorage:
-        "export const AuthStorage = { create: () => ({ read() {}, list() {}, modify() {} }) };\n",
-    });
-    await expect(createPiCredentialStore(partialStore, "/auth.json")).rejects.toThrow(
-      "unsupported Pi installation: Pi's credential store has no delete",
-    );
-
     const complete = await stubPi({
-      sdk: "export const ModelRuntime = { create() {} };\nexport function createAgentSessionServices() {}\nexport const SettingsManager = { inMemory() {} };\n",
-      authStorage:
-        "export const AuthStorage = { create: (authPath) => ({ authPath, read() {}, list() {}, modify() {}, delete() {} }) };\n",
+      exports: { ".": { import: "./sdk/entry.js" } },
+      sdk: COMPLETE_SDK,
     });
-    await expect(loadPiSdk(complete)).resolves.toBeDefined();
-    await expect(createPiCredentialStore(complete, "/agent/auth.json")).resolves.toMatchObject({
-      authPath: "/agent/auth.json",
-    });
+    await expect(loadPiSdk(complete)).resolves.toHaveProperty("createAgentSessionServices");
   });
 });

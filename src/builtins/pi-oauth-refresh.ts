@@ -1,6 +1,5 @@
 /**
- * Refreshes one stored OAuth credential through Pi's own locked credential store, in a process
- * of its own.
+ * Refreshes one stored OAuth credential through Pi's public SDK, in a process of its own.
  *
  * The headless pi process that runs an agent group starts this process detached, in its own
  * session and process group, and registers it with no supervisor. The workflow server, the
@@ -8,15 +7,17 @@
  * registered process IDs, so no stop of theirs reaches this process, and none can end a refresh
  * after the provider has rotated the refresh token and before Pi has saved it.
  *
- * The process is plain Node: it imports Pi by path from the installation that runs the group.
- * Pi's `AuthStorage` takes the `auth.json` lock, refreshes, and writes the result; this process
- * never writes credentials. It reports only an exit status (see `pi-oauth-refresh-contract.ts`),
- * so no credential and no error text leaves it. While it runs it keeps a marker with its process
- * ID, the provider ID, and its start time (see `state/oauth-refresh-markers.ts`).
+ * The process is plain Node: it imports Pi's public entry, as the Pi package's manifest names
+ * it, from the installation that runs the group. A `ModelRuntime` created with `authPath` uses
+ * Pi's own file-backed credential store, so Pi takes the `auth.json` lock, refreshes, and writes
+ * the result; this process never writes credentials. It reports only an exit status (see
+ * `pi-oauth-refresh-contract.ts`), so no credential and no error text leaves it. While it runs it
+ * keeps a marker with its process ID, the provider ID, and its start time (see
+ * `state/oauth-refresh-markers.ts`).
  *
- * Its lifetime is bounded twice: it exits when the refresh has not started within
- * `OAUTH_REFRESH_START_DEADLINE_MS`, and once the refresh has started, it exits at
- * `OAUTH_REFRESH_CEILING_MS` even when the refresh is still in flight.
+ * Its lifetime is bounded twice: it exits when it has not reached Pi's authentication within
+ * `OAUTH_REFRESH_START_DEADLINE_MS`, and from there, it exits at `OAUTH_REFRESH_CEILING_MS` even
+ * when Pi is still waiting for the lock or the refresh is still in flight.
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +28,6 @@ import {
   writeOAuthRefreshMarker,
 } from "../state/oauth-refresh-markers.js";
 import {
-  createPiCredentialStore,
   decodeOAuthRefreshRequest,
   isolatedResourceLoaderOptions,
   loadPiSdk,
@@ -40,23 +40,11 @@ import {
 
 async function refresh(request: OAuthRefreshRequest, started: () => void): Promise<void> {
   const sdk = await loadPiSdk(request.piPackageDir);
-  const store = await createPiCredentialStore(
-    request.piPackageDir,
-    path.join(request.agentDir, "auth.json"),
-  );
+  // `authPath` without `credentials` gives the runtime Pi's own file-backed, locked store.
   const modelRuntime = await sdk.ModelRuntime.create({
+    authPath: path.join(request.agentDir, "auth.json"),
     allowModelNetwork: false,
     refreshOnCreate: false,
-    credentials: {
-      read: async (providerId, options) => await store.read(providerId, options),
-      list: async (options) => await store.list(options),
-      // Pi refreshes an OAuth credential only through this write, under the file lock.
-      modify: async (providerId, update, options) => {
-        started();
-        return await store.modify(providerId, update, options);
-      },
-      delete: async (providerId, options) => await store.delete(providerId, options),
-    },
     modelsStore: {
       read: async () => undefined,
       write: async () => undefined,
@@ -75,6 +63,8 @@ async function refresh(request: OAuthRefreshRequest, started: () => void): Promi
       resourceLoaderOptions: isolatedResourceLoaderOptions(request.extensionPaths),
     });
   }
+  // From here Pi may wait for the lock and refresh, so the ceiling replaces the start deadline.
+  started();
   // No abort signal: once Pi has sent the refresh token, the refresh and its save must finish.
   await modelRuntime.getAuth(request.provider, { minOAuthValidityMs: request.minValidityMs });
 }
@@ -99,8 +89,8 @@ async function main(): Promise<number> {
   }
   process.on("exit", () => removeOAuthRefreshMarker(marker));
   let refreshing = false;
-  // Nothing in Pi Workflows signals this process. A signal from elsewhere still waits for a
-  // refresh in flight, up to the ceiling.
+  // Nothing in Pi Workflows signals this process. Once Pi's authentication has started, a
+  // signal from elsewhere still waits for it, up to the ceiling.
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(signal, () => {
       if (!refreshing) process.exit(OAUTH_REFRESH_EXIT.failed);

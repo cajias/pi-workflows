@@ -1,16 +1,15 @@
 /**
  * The contract between an agent group and its OAuth refresh process (`pi-oauth-refresh.ts`):
  * the request, the exit statuses, how a refresh error maps to one, how the entry starts, and how
- * both sides load Pi's modules by path from the Pi installation that runs the group.
+ * the refresh process loads Pi's public SDK from the Pi installation that runs the group.
  *
  * Only Node built-ins and Pi Workflows' own state module are imported statically, so a plain
  * Node process can load this module.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { CredentialStore } from "@earendil-works/pi-ai";
 import {
   OAUTH_REFRESH_CEILING_MS,
   OAUTH_REFRESH_MIN_CEILING_MS,
@@ -194,21 +193,50 @@ export function isolatedResourceLoaderOptions(extensionPaths: readonly string[])
   };
 }
 
-/** The Pi modules that the refresh uses: the public SDK and Pi's file-backed credential store. */
-export function piModulePaths(piPackageDir: string): { sdk: string; authStorage: string } {
-  return {
-    sdk: path.join(piPackageDir, "dist", "index.js"),
-    authStorage: path.join(piPackageDir, "dist", "core", "auth-storage.js"),
-  };
+/**
+ * The public entry of the Pi package: its manifest's `exports["."]`, as the `import` condition,
+ * else the `default` condition, else a plain string. Pi Workflows imports only this entry, the
+ * module that `import "@earendil-works/pi-coding-agent"` resolves to, and no file inside the
+ * package. `undefined` when the manifest has no such entry or the entry file is missing.
+ */
+export function piSdkEntry(piPackageDir: string): string | undefined {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(readFileSync(path.join(piPackageDir, "package.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  const exports = isRecord(manifest) ? manifest.exports : undefined;
+  const root = isRecord(exports) && "." in exports ? exports["."] : undefined;
+  const target =
+    typeof root === "string"
+      ? root
+      : isRecord(root)
+        ? [root.import, root.default].find((value) => typeof value === "string")
+        : undefined;
+  if (typeof target !== "string" || !target.startsWith("./")) return undefined;
+  const entry = path.resolve(piPackageDir, target);
+  const relative = path.relative(piPackageDir, entry);
+  if (relative.startsWith("..") || path.isAbsolute(relative) || !existsSync(entry)) {
+    return undefined;
+  }
+  return entry;
 }
 
 type PiSdk = typeof import("@earendil-works/pi-coding-agent");
 
 /** Pi's public SDK, with the functions that the refresh calls. */
 export async function loadPiSdk(piPackageDir: string): Promise<PiSdk> {
-  const sdk = (await importPiModule(piModulePaths(piPackageDir).sdk, "the Pi SDK")) as Partial<
-    Record<keyof PiSdk, unknown>
-  >;
+  const entry = piSdkEntry(piPackageDir);
+  if (entry === undefined) {
+    throw new UnsupportedPiInstallationError("the Pi package has no public entry");
+  }
+  let sdk: Partial<Record<keyof PiSdk, unknown>>;
+  try {
+    sdk = (await import(pathToFileURL(entry).href)) as Partial<Record<keyof PiSdk, unknown>>;
+  } catch {
+    throw new UnsupportedPiInstallationError("the Pi SDK could not be loaded");
+  }
   const settings = sdk.SettingsManager as { inMemory?: unknown } | undefined;
   const runtime = sdk.ModelRuntime as { create?: unknown } | undefined;
   if (
@@ -221,35 +249,6 @@ export async function loadPiSdk(piPackageDir: string): Promise<PiSdk> {
   return sdk as PiSdk;
 }
 
-/**
- * Pi's file-backed credential store for `auth.json` (`dist/core/auth-storage.js`), which Pi's
- * SDK uses itself. Pi's public SDK does not export it, so it is loaded by path.
- */
-export async function createPiCredentialStore(
-  piPackageDir: string,
-  authPath: string,
-): Promise<CredentialStore> {
-  const module = (await importPiModule(
-    piModulePaths(piPackageDir).authStorage,
-    "Pi's credential store",
-  )) as { AuthStorage?: { create?: unknown } };
-  const create = module.AuthStorage?.create;
-  if (typeof create !== "function") {
-    throw new UnsupportedPiInstallationError("Pi's credential store has no AuthStorage.create");
-  }
-  const store = create.call(module.AuthStorage, authPath) as Partial<CredentialStore> | undefined;
-  for (const method of ["read", "list", "modify", "delete"] as const) {
-    if (typeof store?.[method] !== "function") {
-      throw new UnsupportedPiInstallationError(`Pi's credential store has no ${method}`);
-    }
-  }
-  return store as CredentialStore;
-}
-
-async function importPiModule(file: string, what: string): Promise<unknown> {
-  try {
-    return await import(pathToFileURL(file).href);
-  } catch {
-    throw new UnsupportedPiInstallationError(`${what} could not be loaded`);
-  }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
