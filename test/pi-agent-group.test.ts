@@ -12,6 +12,7 @@ import {
   type PiAgentLifecycleEvent,
   type PiAgentRequest,
 } from "../src/builtins/pi-agent-launch.js";
+import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import { startMockOpenAiServer } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -179,6 +180,62 @@ function successfulFactory(
 }
 
 describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
+  it("keeps its own validation text in the message and foreign error text private", async () => {
+    const signal = new AbortController().signal;
+    const invalid = await runPiAgentGroup([request("same"), request("same")], {
+      maxConcurrency: 1,
+      signal,
+    }).catch((error: unknown) => error);
+    expect(invalid).toBeInstanceOf(PiAgentGroupError);
+    expect(invalid).toMatchObject({
+      agentId: "group",
+      code: "has an invalid request",
+      facts: "Duplicate Pi agent id: same",
+      detail: undefined,
+      message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
+    });
+    // The bridge sends the facts as the safe part of the error.
+    expect(describeAgentGroupFailure(invalid)).toEqual({
+      message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
+      agentId: "group",
+      code: "has an invalid request",
+      facts: "Duplicate Pi agent id: same",
+    });
+
+    const thrown = await runPiAgentGroup([request("sdk")], {
+      maxConcurrency: 1,
+      signal,
+      sessionFactory: async () => {
+        throw new Error("PRIVATE_SDK_ERROR settings could not be read");
+      },
+    }).catch((error: unknown) => error);
+    expect(describeAgentGroupFailure(thrown)).toEqual({
+      message: "Pi agent sdk failed: the session raised an error",
+      agentId: "sdk",
+      code: "failed",
+      facts: "the session raised an error",
+      detail: "PRIVATE_SDK_ERROR settings could not be read",
+    });
+
+    // A Pi without a default model is told what to configure.
+    const agentDir = await makeTempDir("pi-agent-group-no-default");
+    await fs.writeFile(path.join(agentDir, "settings.json"), "{}\n", "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("unconfigured"), cwd: agentDir }], {
+          maxConcurrency: 1,
+          signal,
+        }),
+      ).rejects.toThrow(
+        "Pi agent group has no default model: configure a default provider, model, and thinking level in Pi",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("validates requests and options before creating sessions", async () => {
     const signal = new AbortController().signal;
     await expect(runPiAgentGroup([], { maxConcurrency: 1, signal })).resolves.toEqual([]);
@@ -1709,6 +1766,55 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
           ],
         }),
       ).rejects.toThrow(/exposes workflow control/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("names a long extension source in full when it rejects the extension", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-long-source");
+    const cwd = await makeTempDir("pi-agent-group-long-source-project");
+    // A local package whose source, its path in the settings, is longer than 200 characters.
+    const packageDir = path.join(agentDir, "a".repeat(120), "b".repeat(120));
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "fixture-long-source", pi: { extensions: ["./extension.ts"] } }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(packageDir, "extension.ts"),
+      `import nativeProvider from ${JSON.stringify(fixtureExtension("native-provider"))};
+import readOverride from ${JSON.stringify(fixtureExtension("read-override"))};
+export default function extension(pi) {
+  nativeProvider(pi);
+  readOverride(pi);
+}
+`,
+      "utf8",
+    );
+    await writeNativeFixtureConfig(agentDir, []);
+    const settingsPath = path.join(agentDir, "settings.json");
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8")) as Record<string, unknown>;
+    await fs.writeFile(
+      settingsPath,
+      JSON.stringify({ ...settings, packages: [packageDir] }),
+      "utf8",
+    );
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      expect(packageDir.length).toBeGreaterThan(200);
+      await expect(
+        runPiAgentGroup([{ ...request("long-source"), cwd }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toMatchObject({
+        code: "provider extension replaces a built-in tool",
+        facts: packageDir,
+        message: `Pi agent group provider extension replaces a built-in tool: ${packageDir}`,
+      });
     } finally {
       vi.unstubAllEnvs();
     }

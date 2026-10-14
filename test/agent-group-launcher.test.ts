@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
 import {
   PiAgentGroupError,
   type PiAgentLifecycleEvent,
@@ -13,6 +14,7 @@ import {
   RESULT_IDLE_MS,
   type HeadlessPiAgentGroupSettings,
 } from "../src/server/agent-group-launcher.js";
+import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import type { HeadlessPiOptions } from "../src/server/headless-pi.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
@@ -322,6 +324,44 @@ describe("headless pi agent group launcher", () => {
     expect(await namedCause(error)).toBe(`Pi agent review ${facts}\n\n${privateText}\n`);
     // Pi's stderr carried the same text from a provider extension; that log is not kept.
     expect(await fs.readdir(path.dirname(namedCausePath(error)))).toEqual(["cause.txt"]);
+  });
+
+  it("shows its own validation text and hides a thrown SDK error, as the bridge reports them", async () => {
+    const signal = new AbortController().signal;
+    // The bridge's own description of each error, from the real group runner.
+    const reported = async (run: Promise<unknown>) =>
+      JSON.stringify(describeAgentGroupFailure(await run.catch((error: unknown) => error)));
+    const invalid = await reported(
+      runPiAgentGroup([request("same"), request("same")], { maxConcurrency: 1, signal }),
+    );
+    const thrown = await reported(
+      runPiAgentGroup([request("sdk")], {
+        maxConcurrency: 1,
+        signal,
+        sessionFactory: async () => {
+          throw new Error("PRIVATE_SDK_MARKER could not read settings");
+        },
+      }),
+    );
+
+    const run = async (failure: string) => {
+      const setup = await harness("relay-failure", {}, { FAKE_AGENT_GROUP_FAILURE: failure });
+      return await setup
+        .launcher()
+        .run([request("same")], { maxConcurrency: 1, signal })
+        .catch((error: unknown) => error);
+    };
+    const invalidError = await run(invalid);
+    expect((invalidError as Error).message).toBe(
+      `Pi agent group has an invalid request: Duplicate Pi agent id: same. complete cause: ${namedCausePath(invalidError)}`,
+    );
+    const thrownError = await run(thrown);
+    expect((thrownError as Error).message).toBe(
+      `Pi agent sdk failed: the session raised an error. complete cause: ${namedCausePath(thrownError)}`,
+    );
+    expect(await namedCause(thrownError)).toBe(
+      "Pi agent sdk failed: the session raised an error\n\nPRIVATE_SDK_MARKER could not read settings\n",
+    );
   });
 
   it("keeps every character of a group-level error only in the cause file", async () => {

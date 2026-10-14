@@ -88,7 +88,7 @@ export async function runPiAgentGroup(
   input: PiAgentRequest[],
   options: PiAgentGroupOptions,
 ): Promise<PiAgentResult[]> {
-  const { requests, maxFinalChars } = validateGroup(input, options);
+  const { requests, maxFinalChars } = validatedGroup(input, options);
   if (requests.length === 0) return [];
   if (options.signal.aborted) throw cancellationError("group", options.signal.reason);
 
@@ -344,7 +344,7 @@ async function createSdkGroupPlan(
   signal.throwIfAborted();
   const cwd = requests[0]!.cwd;
   if (requests.some((request) => request.cwd !== cwd)) {
-    throw new Error("Pi agent group requests must use one working directory");
+    throw invalidRequest("the requests must use one working directory");
   }
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -405,7 +405,7 @@ function resolveGroupDispatch(
   if (hasAnyOverride) {
     for (const [index, override] of overrides.entries()) {
       if (override.model === undefined || override.thinkingLevel === undefined) {
-        throw new Error(
+        throw invalidRequest(
           `Pi agent ${requests[index]!.id} must override model and thinkingLevel together`,
         );
       }
@@ -419,7 +419,7 @@ function resolveGroupDispatch(
           override.thinkingLevel !== first.thinkingLevel,
       )
     ) {
-      throw new Error("Pi agent group requests must use one exact model dispatch");
+      throw invalidRequest("the requests must use one exact model dispatch");
     }
     return {
       provider: first.model!.provider,
@@ -431,7 +431,11 @@ function resolveGroupDispatch(
   const modelId = settingsManager.getDefaultModel();
   const thinkingLevel = settingsManager.getDefaultThinkingLevel();
   if (provider === undefined || modelId === undefined || thinkingLevel === undefined) {
-    throw new Error("Pi agent group requires configured provider, model, and thinking level");
+    throw new PiAgentGroupError(
+      "group",
+      "has no default model",
+      "configure a default provider, model, and thinking level in Pi",
+    );
   }
   return { provider, modelId, thinkingLevel };
 }
@@ -605,7 +609,7 @@ async function extensionCandidate(
 ): Promise<ExtensionCandidate | undefined> {
   const resolvedPath = await canonicalPath(resource.path, signal);
   if (await isPiWorkflowsExtension(resolvedPath, resource, signal)) return undefined;
-  return { path: resolvedPath, source: boundedSource(resource.metadata.source) };
+  return { path: resolvedPath, source: resource.metadata.source };
 }
 
 async function canonicalizeBehaviorPaths(
@@ -617,7 +621,7 @@ async function canonicalizeBehaviorPaths(
     operationalText(value, "Pi agent behavior extension path", 4_000);
     const resolvedPath = await canonicalPath(value, signal);
     if (await isPiWorkflowsExtension(resolvedPath, undefined, signal)) {
-      throw new Error("Pi Workflows cannot be admitted as a child extension");
+      throw invalidRequest("Pi Workflows cannot be admitted as a child extension");
     }
     result.set(resolvedPath, { path: resolvedPath, source: "explicit behavior extension" });
   }
@@ -719,11 +723,6 @@ function isReservedExtensionName(value: string): boolean {
     name.startsWith("workflow-") ||
     name.startsWith("workflow:")
   );
-}
-
-function boundedSource(value: string): string {
-  const source = value.trim();
-  return source.length <= 200 ? source : `${source.slice(0, 200)}…`;
 }
 
 function credentialStoreFromSnapshot(
@@ -1196,6 +1195,25 @@ function assertExactSession(
         ? "no model selected"
         : `${session.model.provider}/${session.model.id} ${session.thinkingLevel}`,
     );
+  }
+}
+
+/**
+ * A request that Pi Workflows rejects. The text is Pi Workflows' own and names only request
+ * fields, so the message keeps it, unlike the text of a foreign SDK or settings error.
+ */
+function invalidRequest(text: string): PiAgentGroupError {
+  return new PiAgentGroupError("group", "has an invalid request", text);
+}
+
+function validatedGroup(
+  input: PiAgentRequest[],
+  options: PiAgentGroupOptions,
+): { requests: PiAgentRequest[]; maxFinalChars: number } {
+  try {
+    return validateGroup(input, options);
+  } catch (error) {
+    throw invalidRequest(errorMessage(error));
   }
 }
 

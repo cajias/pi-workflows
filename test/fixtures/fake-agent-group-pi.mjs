@@ -77,6 +77,15 @@ const runScenarios = {
   "sdk-error"(command, id) {
     agentFailure(command, id, "failed", "the session raised an error");
   },
+  // Relays a failure exactly as the bridge described it, from FAKE_AGENT_GROUP_FAILURE.
+  "relay-failure"(command, id) {
+    emit({
+      type: "failed",
+      groupId: command.groupId,
+      error: JSON.parse(process.env.FAKE_AGENT_GROUP_FAILURE ?? "{}"),
+    });
+    respond(id, { success: true, data: { disposition: "handled" } });
+  },
   "rejected-private"(_command, id) {
     respond(id, { success: false, error: privateText() });
   },
