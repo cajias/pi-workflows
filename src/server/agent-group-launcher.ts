@@ -6,7 +6,7 @@ import {
   type PiAgentRequest,
   type PiAgentResult,
 } from "../builtins/pi-agent-launch.js";
-import { errorMessage } from "../workflows/errors.js";
+import { errorMessage, isClaimLostError, isRunParkedError } from "../workflows/errors.js";
 import {
   AgentGroupDiagnostics,
   agentGroupCauseText,
@@ -133,19 +133,33 @@ export class HeadlessPiAgentGroupLauncher {
     try {
       return await call.run();
     } finally {
-      await call.child.close();
-      this.active.delete(call.child);
-      await call.finishDiagnostics();
+      await this.cleanUp(call);
     }
   };
+
+  /**
+   * Stop the group's pi child and finish its diagnostics. Cleanup is housekeeping like pruning:
+   * a failure is reported on the runner's stderr and never replaces the group's outcome.
+   */
+  private async cleanUp(call: AgentGroupCall): Promise<void> {
+    try {
+      await call.child.close();
+    } catch (error) {
+      reportHousekeeping("Could not stop an agent group's headless pi", error);
+    }
+    this.active.delete(call.child);
+    try {
+      await call.finishDiagnostics();
+    } catch (error) {
+      reportHousekeeping("Could not finish agent group diagnostics", error);
+    }
+  }
 
   /** Pruning is housekeeping: a failure is reported on the runner's stderr, never to the group. */
   private async pruneDiagnostics(): Promise<void> {
     await pruneAgentGroupDiagnostics(this.settings.diagnosticsDirectory, {
       onError: (target, error) => {
-        process.stderr.write(
-          `Could not prune agent group diagnostics at ${target}: ${errorMessage(error)}\n`,
-        );
+        reportHousekeeping(`Could not prune agent group diagnostics at ${target}`, error);
       },
     });
   }
@@ -200,9 +214,14 @@ class AgentGroupCall {
       try {
         await this.child.start();
       } catch (error) {
-        // The start failure is the outcome; the killed child must not settle again.
-        this.settled = true;
-        throw error;
+        // A lost claim or a parked run is the engine's own stop signal and keeps its type.
+        if (isClaimLostError(error) || isRunParkedError(error)) {
+          this.settled = true;
+          throw error;
+        }
+        // Any other start failure can quote the operating system or the server, so its text
+        // is private detail. The killed child cannot settle the group again.
+        this.failToRun("headless pi could not be started", errorMessage(error));
       }
       if (this.options.signal.aborted) this.cancel();
       return await this.outcome.promise;
@@ -438,6 +457,10 @@ function failureError(failure: AgentGroupFailure): PiAgentGroupError {
   return new PiAgentGroupError("group", "failed", "the agent group raised an error", {
     detail: failure.message,
   });
+}
+
+function reportHousekeeping(what: string, error: unknown): void {
+  process.stderr.write(`${what}: ${errorMessage(error)}\n`);
 }
 
 function cancellationError(reason: unknown): PiAgentGroupError {

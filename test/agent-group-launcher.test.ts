@@ -16,6 +16,7 @@ import {
 } from "../src/server/agent-group-launcher.js";
 import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import type { HeadlessPiOptions } from "../src/server/headless-pi.js";
+import { ClaimLostError } from "../src/workflows/errors.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
 const FAKE_PI = path.resolve("test/fixtures/fake-agent-group-pi.mjs");
@@ -142,6 +143,20 @@ async function diagnosticModes(file: string): Promise<{ directory: number; files
       names.map(async (name) => (await fs.stat(path.join(directory, name))).mode & 0o777),
     ),
   };
+}
+
+/** Collect the runner's housekeeping reports, which start with "Could not", from stderr. */
+function captureHousekeepingReports(): string[] {
+  const written: string[] = [];
+  const write = process.stderr.write.bind(process.stderr);
+  vi.spyOn(process.stderr, "write").mockImplementation((chunk, ...rest) => {
+    if (String(chunk).startsWith("Could not")) {
+      written.push(String(chunk));
+      return true;
+    }
+    return write(chunk, ...(rest as []));
+  });
+  return written;
 }
 
 function states(events: PiAgentLifecycleEvent[]): string[] {
@@ -909,25 +924,115 @@ describe("headless pi agent group launcher", () => {
     ]);
   });
 
-  it("kills the child when the server refuses to supervise it", async () => {
+  it("kills the child when the server refuses to supervise it and saves the refusal", async () => {
     const setup = await harness("hang");
     let pid: number | undefined;
-    await expect(
-      new HeadlessPiAgentGroupLauncher(
-        {
-          ...setup.options,
-          registry: {
-            register: (value) => {
-              pid = value;
-              throw new Error("Runner process is not a direct child of the active runner");
-            },
-            unregister: () => undefined,
+    const seen: PiAgentLifecycleEvent[] = [];
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        registry: {
+          register: (value) => {
+            pid = value;
+            throw new Error("PRIVATE_REGISTRY_MARKER: not a direct child of the active runner");
           },
+          unregister: () => undefined,
         },
-        setup.settings,
-      ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal }),
-    ).rejects.toThrow("Runner process is not a direct child of the active runner");
+      },
+      setup.settings,
+    )
+      .run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          seen.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    // The raw start failure goes through the same cause file as any group pi could not run.
+    expect((error as Error).message).toBe(
+      `Pi agent group could not run: headless pi could not be started. complete cause: ${namedCausePath(error)}; complete pi stderr: ${namedStderrLogPath(error)}. ${LAUNCH_HINT}`,
+    );
+    expect(await namedCause(error)).toBe(
+      "Pi agent group could not run: headless pi could not be started\n\nPRIVATE_REGISTRY_MARKER: not a direct child of the active runner\n",
+    );
+    // The queued request's track ends instead of staying pending.
+    expect(states(seen)).toEqual([`a:cancelled:${NEVER_STARTED}`]);
+    await waitUntil(() => groupGone(pid), 5_000);
+  });
+
+  it("keeps a lost claim as the engine's own error when pi starts", async () => {
+    const setup = await harness("hang");
+    let pid: number | undefined;
+    const lost = new ClaimLostError("run-1", "ownerChanged");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        registry: {
+          register: (value) => {
+            pid = value;
+            throw lost;
+          },
+          unregister: () => undefined,
+        },
+      },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBe(lost);
     await waitUntil(() => groupGone(pid), 5_000);
     expect(await fs.readdir(setup.logs)).toEqual([]);
+  });
+
+  it("keeps the group's outcome when cleanup fails and reports the failure on stderr", async () => {
+    const written = captureHousekeepingReports();
+    // Unregistering the child fails after a successful group.
+    const unregistering = await harness("success");
+    const results = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...unregistering.options,
+        registry: {
+          register: () => undefined,
+          unregister: () => {
+            throw new Error("unregister refused");
+          },
+        },
+      },
+      unregistering.settings,
+    ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    expect(results.map((result) => result.text)).toEqual(["result a"]);
+
+    // Removing the diagnostics fails after a successful group and after a failed one.
+    const removing = await harness("success");
+    vi.spyOn(fs, "rm").mockRejectedValueOnce(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    await expect(
+      removing.launcher().run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toHaveLength(1);
+    const failing = await harness("provider-error");
+    vi.spyOn(fs, "rm").mockRejectedValueOnce(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    const error = await failing
+      .launcher()
+      .run([request("review")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      `Pi agent review stopped with error: the provider reported an error. complete cause: ${namedCausePath(error)}`,
+    );
+
+    expect(written).toEqual([
+      "Could not stop an agent group's headless pi: unregister refused\n",
+      "Could not finish agent group diagnostics: device busy\n",
+      "Could not finish agent group diagnostics: device busy\n",
+    ]);
   });
 });
