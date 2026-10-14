@@ -83,7 +83,7 @@ function unusableReason<Model extends HeadlessModelRef>(
   if (configured === undefined) {
     return selection.hasProvider(provider)
       ? `provider "${provider}" has no model "${model}" in headless pi`
-      : `provider "${provider}" is not available in headless pi, which loads only the pi-workflows bridge and any extension in the server's extra Pi arguments`;
+      : `provider "${provider}" is not available in headless pi, which loads only the pi-workflows bridge, any extension in PI_WORKFLOWS_HEADLESS_EXTENSIONS, and any extension in the server's extra Pi arguments`;
   }
   if (!selection.hasConfiguredAuth(configured)) {
     return `provider "${provider}" has no configured authentication in headless pi`;
@@ -115,7 +115,7 @@ export function describeUnusableDefaultModel(
   return [
     `Headless pi cannot run workflow steps on the default model "${unusable.provider}/${unusable.model}" from Pi settings${describeSources(sources)}: ${unusable.reason}.`,
     `${instead}, so headless pi stopped before any model request.`,
-    "Load the provider's extension with `pi-workflows server run -- -e /absolute/path/to/extension`, choose a model with `pi-workflows server run -- --provider <provider> --model <model>`, or change the default.",
+    "Load the provider's extension with `PI_WORKFLOWS_HEADLESS_EXTENSIONS=/absolute/path/to/extension` or `pi-workflows server run -- -e /absolute/path/to/extension`, choose a model with `pi-workflows server run -- --provider <provider> --model <model>`, or change the default.",
   ].join(" ");
 }
 

@@ -42,7 +42,7 @@ describe("findUnusableDefaultModel", () => {
       provider: "custom",
       model: "custom-model",
       reason:
-        'provider "custom" is not available in headless pi, which loads only the pi-workflows bridge and any extension in the server\'s extra Pi arguments',
+        'provider "custom" is not available in headless pi, which loads only the pi-workflows bridge, any extension in PI_WORKFLOWS_HEADLESS_EXTENSIONS, and any extension in the server\'s extra Pi arguments',
       selected: FALLBACK,
     });
   });
@@ -122,7 +122,7 @@ describe("describeUnusableDefaultModel", () => {
         defaultModel: "/home/u/.pi/agent/settings.json",
       }),
     ).toBe(
-      'Headless pi cannot run workflow steps on the default model "custom/custom-model" from Pi settings (set in /home/u/.pi/agent/settings.json): provider "custom" is not available in headless pi. Pi would have used "fallback/fallback-model" instead, so headless pi stopped before any model request. Load the provider\'s extension with `pi-workflows server run -- -e /absolute/path/to/extension`, choose a model with `pi-workflows server run -- --provider <provider> --model <model>`, or change the default.',
+      'Headless pi cannot run workflow steps on the default model "custom/custom-model" from Pi settings (set in /home/u/.pi/agent/settings.json): provider "custom" is not available in headless pi. Pi would have used "fallback/fallback-model" instead, so headless pi stopped before any model request. Load the provider\'s extension with `PI_WORKFLOWS_HEADLESS_EXTENSIONS=/absolute/path/to/extension` or `pi-workflows server run -- -e /absolute/path/to/extension`, choose a model with `pi-workflows server run -- --provider <provider> --model <model>`, or change the default.',
     );
   });
 
