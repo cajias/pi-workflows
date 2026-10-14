@@ -249,7 +249,29 @@ This changes nothing about what a headless child may do without those arguments.
 - **An `npm:` or `git:` source installs a temporary copy in each child**, at every start, rather than using the copy that `pi install` manages. Pass the absolute path of the installed extension file or package directory instead.
 - **Sanity Check agent groups do not use these arguments to choose a model.** The group's child sessions choose the provider and model from the user's settings. They use a provider that Pi defines, or admit the user-scope extension that registers it, as [Built-in sanity check](WORKFLOWS.md#built-in-sanity-check) describes. In the group's host process, the arguments only need to let Pi start, so a `--provider` there also needs its `-e` extension.
 
-Only `server run` accepts extra Pi arguments. A server that a Pi session, `server start`, or `piw` starts gets none, so its headless steps cannot use a provider that only an extension registers. Giving that server extension sources would need a separate opt-in server option, which is waiting for a decision.
+Only `server run` accepts extra Pi arguments. A server that a Pi session, `server start`, or `piw` starts gets none. To load a provider extension into the headless children of any server, list it in [headless extensions](#headless-extensions) instead.
+
+### Headless extensions
+
+`PI_WORKFLOWS_HEADLESS_EXTENSIONS` lists extensions that every headless Pi child loads beside its bridge. It is off by default, and without it a headless child loads only its bridge. Set it in the environment of whatever starts the server. The extension starts the server with the Pi session's own environment, so this covers the server that a session starts:
+
+```bash
+PI_WORKFLOWS_HEADLESS_EXTENSIONS=/abs/path/provider-ext.ts pi
+```
+
+`pi-workflows server start`, `server run`, and `piw` read it the same way. Separate entries with the platform path delimiter, `:` on Linux and macOS and `;` on Windows. Empty entries are skipped.
+
+The server reads the list once at start and keeps it for its whole life, like the [pinned pi](#headless-pi-command). Whoever starts the server fixes the list. A later Pi session with another value connects to the running server and does not change it; restart the server with `pi-workflows server stop` to apply a change. Each child gets `-e <path>` for every entry, after the bridge's `-e` and before the server's [extra Pi arguments](#extra-pi-arguments). `--no-extensions` stays, so the child still discovers no other extension. To use a provider that only a listed extension registers, select it with `defaultProvider` and `defaultModel` in the user's settings, or with `server run -- --provider <provider> --model <model>`.
+
+Each entry must:
+
+- be an absolute path; `~` is not expanded;
+- exist, as an extension file or a package directory;
+- not be part of pi-workflows: not inside this package's root, and not inside any package named `@osolmaz/pi-workflows`. The pi-workflows extension would register a second `workflow` tool beside the bridge and start its own server client in every child.
+
+A list with one bad entry is invalid as a whole and fails closed. The server still starts, `server status` reports `headlessExtensions` as `{"error": "..."}`, the server logs the reason, and every headless agent step and agent group fails at start with it, instead of running without an extension that the operator asked for. A valid list appears as `{"paths": [...]}`, and an unset one as `{"paths": []}`. Before each start, the runner also checks that every listed path still exists.
+
+The whole extension loads, not only its provider. Its tools, hooks, commands, and flags run in every headless agent step and every agent group host process, for every run and project that the server handles. Headless steps enforce no tool allowlist, so the model can call the extension's tools there. List only an extension that you trust with that reach. The child sessions of a Sanity Check agent group do not load the listed extensions; they choose their own provider as described in [Built-in sanity check](WORKFLOWS.md#built-in-sanity-check).
 
 ## Live client protocol
 

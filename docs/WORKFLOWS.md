@@ -165,7 +165,8 @@ absolute path: `pi-workflows server run -- -e /abs/path/provider-ext.ts
 every headless agent step and agent group host process, for every run and
 project. It must not be the pi-workflows extension, and `server run` rejects a
 relative extension path. A server started any other way gets no extra Pi
-arguments. See
+arguments; list the extension in [headless extensions](#headless-extensions)
+instead. See
 [Extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments) for every caveat.
 
 The extension, CLI, and `piw` use the same version-1 client protocol over a Unix socket or Windows named pipe. The server sends byte-bounded run-list and run-view pages. Clients collect a complete run list for one revision and reject stale run pages whose cursor or revision no longer matches. A run view's `revision` is the presentation cursor; `runRevision` is the execution resource revision used by restart and other exact execution commands. The server reads only the selected history ranges and reuses an unchanged subscribed view after a lightweight revision check. It waits for a slow socket to drain and removes every subscription when its client unsubscribes. Large values stay available through verified content chunks. Server-generated aggregate values are saved and linked to the run before the server advertises them.
@@ -1358,6 +1359,38 @@ if (run.state !== "succeeded") {
 Child workflow completion queues the parent resource again. The global server runs the child through the same queue and supervised runner model as any other run. A server or runner crash resumes the existing durable run when its committed effect state makes that safe. Consequential external mutations belong in the workflow or resource manager effect API; an uncertain result stops for explicit recovery.
 
 See [RESOURCE_MANAGERS.md](RESOURCE_MANAGERS.md) for resource manager definitions and the full recovery contract.
+
+## Headless extensions
+
+Headless Pi children start with `--no-extensions` and load only their bridge, so
+a provider that only a user extension registers is unknown there. Set
+`PI_WORKFLOWS_HEADLESS_EXTENSIONS` in the environment of whatever starts the
+workflow server to list absolute extension paths, separated by the platform
+path delimiter. A server that a Pi session starts inherits that session's
+environment:
+
+```bash
+PI_WORKFLOWS_HEADLESS_EXTENSIONS=/abs/path/provider-ext.ts pi
+```
+
+Every headless agent step and Sanity Check agent group host then loads each
+listed extension after its bridge. Select the extension's provider with
+`defaultProvider` and `defaultModel` in the user's settings, or with
+`pi-workflows server run -- --provider <provider> --model <model>`.
+
+- The opt-in is off by default, so headless children keep their default
+  authority.
+- The server reads the list once at start and keeps it until it restarts.
+  `pi-workflows server status` reports it as `headlessExtensions`.
+- Each entry must be an absolute path that exists and is not part of
+  pi-workflows. One bad entry makes the whole list invalid. The server still
+  starts and reports the reason, and every headless child fails with it instead
+  of running without the extension.
+- The whole extension loads, with its tools, hooks, and commands, into every
+  headless child for every run and project that the server handles.
+
+See [Headless extensions](WORKFLOW_SERVER.md#headless-extensions) for the
+complete rules.
 
 ## Host-provided Pi packages
 
