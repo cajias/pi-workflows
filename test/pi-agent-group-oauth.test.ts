@@ -321,26 +321,22 @@ describe("Pi agent group OAuth credentials", { timeout: 3 * SESSION_HANG_MS }, (
     let scenario: Scenario | undefined;
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
-      // The first model request calls the read tool. While the tool runs, the clock moves
-      // past the credential's expiry, so the next request would need a refresh.
+      // The mock answers the first model request with a read tool call and, as it answers,
+      // moves the clock past the credential's expiry. The next request would need a refresh.
       scenario = await legacyOAuthScenario("mid-prompt", {
         expiresInMs: LONG_LIVED_MS,
         refresh: "rotate",
-        script: ({ lastRole }) =>
-          lastRole === "toolResult" || lastRole === "tool"
-            ? { kind: "text", text: '{"answer":"late"}' }
-            : { kind: "tool", toolName: "read", args: { path: "README.md" } },
+        script: ({ lastRole }) => {
+          if (lastRole === "tool") return { kind: "text", text: '{"answer":"late"}' };
+          vi.setSystemTime(Date.now() + 2 * LONG_LIVED_MS);
+          return { kind: "tool", toolName: "read", args: { path: "README.md" } };
+        },
       });
       const before = await fs.readFile(scenario.authPath, "utf8");
-      let clock = 0;
       const error = await groupError(
         runPiAgentGroup([request("mid-prompt", scenario.cwd)], {
           maxConcurrency: 1,
           signal: new AbortController().signal,
-          now: () => (clock += 300),
-          onLifecycle: (event) => {
-            if (event.phase === "tool: read") vi.setSystemTime(Date.now() + 2 * LONG_LIVED_MS);
-          },
         }),
       );
       expect(error.message).toBe(
