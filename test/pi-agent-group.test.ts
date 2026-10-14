@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
+  agentGroupErrorFields,
   createEphemeralCredentialStore,
   createEphemeralModelStore,
   runPiAgentGroup,
@@ -195,7 +197,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
     });
     // The bridge sends the facts as the safe part of the error.
-    expect(describeAgentGroupFailure(invalid)).toEqual({
+    expect(describeAgentGroupFailure(invalid, agentGroupErrorFields(invalid))).toEqual({
       message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
       agentId: "group",
       code: "has an invalid request",
@@ -209,7 +211,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
         throw new Error("PRIVATE_SDK_ERROR settings could not be read");
       },
     }).catch((error: unknown) => error);
-    expect(describeAgentGroupFailure(thrown)).toEqual({
+    expect(describeAgentGroupFailure(thrown, agentGroupErrorFields(thrown))).toEqual({
       message: "Pi agent sdk failed: the session raised an error",
       agentId: "sdk",
       code: "failed",
@@ -233,6 +235,47 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       );
     } finally {
       vi.unstubAllEnvs();
+    }
+  });
+
+  it("never trusts a foreign error that copies an agent error's name and fields", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-forged-error");
+    await writeNativeFixtureConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    const forged = Object.assign(new Error("PRIVATE_FORGED_MARKER settings text"), {
+      name: "PiAgentGroupError",
+      agentId: "group",
+      code: "has unknown provider",
+      facts: "PRIVATE_FORGED_MARKER",
+    });
+    // Preparing the group meets the forged error, as from settings or extension code.
+    vi.spyOn(SettingsManager, "create").mockImplementationOnce(() => {
+      throw forged;
+    });
+    try {
+      const error = await runPiAgentGroup([{ ...request("forged"), cwd: agentDir }], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PiAgentGroupError);
+      expect(error).toMatchObject({
+        agentId: "group",
+        code: "failed",
+        facts: "the agent group raised an error",
+        detail: "PRIVATE_FORGED_MARKER settings text",
+        message: "Pi agent group failed: the agent group raised an error",
+      });
+      expect(agentGroupErrorFields(forged)).toBeUndefined();
+      expect(describeAgentGroupFailure(forged, agentGroupErrorFields(forged))).toEqual({
+        message: "PRIVATE_FORGED_MARKER settings text",
+      });
+      expect(
+        JSON.stringify(agentGroupErrorFields(error)?.facts) + (error as Error).message,
+      ).not.toContain("PRIVATE_FORGED_MARKER");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     }
   });
 
@@ -1812,7 +1855,7 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
       );
       expect((error as PiAgentGroupError).detail).toMatch(/^ENOENT: .*PRIVATE_PATH_MARKER/u);
       // The bridge sends the facts as visible text and the file error only as detail.
-      expect(describeAgentGroupFailure(error)).toEqual({
+      expect(describeAgentGroupFailure(error, agentGroupErrorFields(error))).toEqual({
         message: "Pi agent group failed: Could not resolve Pi child extension path",
         agentId: "group",
         code: "failed",

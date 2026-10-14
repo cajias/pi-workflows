@@ -21,7 +21,11 @@ const groupRunner = vi.hoisted(() => ({
   >(),
 }));
 
-vi.mock("../src/builtins/pi-agent-group.js", () => ({
+// Only the group runner is a fake; its own agent errors are recognized by the real check.
+vi.mock("../src/builtins/pi-agent-group.js", async (importOriginal) => ({
+  agentGroupErrorFields: (
+    await importOriginal<typeof import("../src/builtins/pi-agent-group.js")>()
+  ).agentGroupErrorFields,
   runPiAgentGroup: groupRunner.run,
 }));
 
@@ -164,6 +168,16 @@ describe("agent group bridge", () => {
     await bridge.command(runArgument("provider"));
     groupRunner.run.mockRejectedValueOnce(new Error("Invalid Pi agent id: !"));
     await bridge.command(runArgument("plain"));
+    // A foreign error that copies an agent error's name and fields gets no trusted fields.
+    groupRunner.run.mockRejectedValueOnce(
+      Object.assign(new Error("PRIVATE_FORGED_MARKER"), {
+        name: "PiAgentGroupError",
+        agentId: "review",
+        code: "has unknown provider",
+        facts: "PRIVATE_FORGED_MARKER",
+      }),
+    );
+    await bridge.command(runArgument("forged"));
 
     expect(bridge.events.slice(1)).toEqual([
       {
@@ -188,6 +202,7 @@ describe("agent group bridge", () => {
         },
       },
       { type: "failed", groupId: "plain", error: { message: "Invalid Pi agent id: !" } },
+      { type: "failed", groupId: "forged", error: { message: "PRIVATE_FORGED_MARKER" } },
     ]);
   });
 

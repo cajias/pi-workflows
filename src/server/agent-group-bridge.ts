@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { runPiAgentGroup } from "../builtins/pi-agent-group.js";
+import { agentGroupErrorFields, runPiAgentGroup } from "../builtins/pi-agent-group.js";
 import {
   AGENT_GROUP_COMMAND,
   agentGroupIdOf,
@@ -87,7 +87,12 @@ async function runGroup(command: RunCommand, groups: Map<string, AbortController
     });
     emit({ type: "completed", groupId: command.groupId, results });
   } catch (error) {
-    emit({ type: "failed", groupId: command.groupId, error: describeAgentGroupFailure(error) });
+    // Only the group runner's own agent errors keep their facts; any other value stays private.
+    emit({
+      type: "failed",
+      groupId: command.groupId,
+      error: describeAgentGroupFailure(error, agentGroupErrorFields(error)),
+    });
   } finally {
     groups.delete(command.groupId);
   }

@@ -86,7 +86,54 @@ export type PiAgentGroupOptions = PiAgentGroupLaunchOptions & {
   now?: () => number;
 };
 
+/**
+ * Run one isolated agent group. Every error it throws is a `PiAgentGroupError` of this module,
+ * so {@link agentGroupErrorFields} can tell Pi Workflows' own facts from foreign text.
+ */
 export async function runPiAgentGroup(
+  input: PiAgentRequest[],
+  options: PiAgentGroupOptions,
+): Promise<PiAgentResult[]> {
+  try {
+    return await runGroupRequests(input, options);
+  } catch (error) {
+    throw groupBoundaryError(error);
+  }
+}
+
+/**
+ * The safe fields of an error that this module raised, or `undefined` for any other value.
+ *
+ * The check is `instanceof` against the `PiAgentGroupError` class that this module itself
+ * imports, so it holds in whatever module copy a loader made: the bridge imports this function
+ * from the same module as {@link runPiAgentGroup}. A foreign error that only copies the name
+ * and fields of an agent error is not an instance, so its text never becomes facts.
+ */
+export function agentGroupErrorFields(
+  error: unknown,
+): { agentId: string; code: string; facts: string; detail?: string } | undefined {
+  if (!(error instanceof PiAgentGroupError)) return undefined;
+  return {
+    agentId: error.agentId,
+    code: error.code,
+    facts: error.facts,
+    ...(error.detail === undefined ? {} : { detail: error.detail }),
+  };
+}
+
+/**
+ * Errors from preparing a group, such as a Pi SDK, settings, package manager, or extension
+ * failure, can be any value. Only this module's own agent errors pass; anything else keeps its
+ * text as private detail.
+ */
+function groupBoundaryError(error: unknown): PiAgentGroupError {
+  if (error instanceof PiAgentGroupError) return error;
+  return new PiAgentGroupError("group", "failed", "the agent group raised an error", {
+    detail: errorMessage(error),
+  });
+}
+
+async function runGroupRequests(
   input: PiAgentRequest[],
   options: PiAgentGroupOptions,
 ): Promise<PiAgentResult[]> {

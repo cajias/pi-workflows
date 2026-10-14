@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEphemeralCredentialStore, runPiAgentGroup } from "../src/builtins/pi-agent-group.js";
+import {
+  agentGroupErrorFields,
+  createEphemeralCredentialStore,
+  runPiAgentGroup,
+} from "../src/builtins/pi-agent-group.js";
 import {
   PiAgentGroupError,
   type PiAgentLifecycleEvent,
@@ -345,7 +349,11 @@ describe("headless pi agent group launcher", () => {
     const signal = new AbortController().signal;
     // The bridge's own description of each error, from the real group runner.
     const reported = async (run: Promise<unknown>) =>
-      JSON.stringify(describeAgentGroupFailure(await run.catch((error: unknown) => error)));
+      JSON.stringify(
+        await run.catch((error: unknown) =>
+          describeAgentGroupFailure(error, agentGroupErrorFields(error)),
+        ),
+      );
     const invalid = await reported(
       runPiAgentGroup([request("same"), request("same")], { maxConcurrency: 1, signal }),
     );
@@ -390,6 +398,24 @@ describe("headless pi agent group launcher", () => {
     );
     expect(await namedCause(loaderError)).toBe(
       "Pi agent group failed: Could not load Pi credentials for isolated agents\n\nPRIVATE_FS_MARKER permission denied\n",
+    );
+    // A foreign error that copies an agent error's name and fields stays private.
+    const forged = await reported(
+      Promise.reject(
+        Object.assign(new Error("PRIVATE_FORGED_MARKER settings text"), {
+          name: "PiAgentGroupError",
+          agentId: "group",
+          code: "has unknown provider",
+          facts: "PRIVATE_FORGED_MARKER",
+        }),
+      ),
+    );
+    const forgedError = await run(forged);
+    expect((forgedError as Error).message).toBe(
+      `Pi agent group failed: the agent group raised an error. complete cause: ${namedCausePath(forgedError)}`,
+    );
+    expect(await namedCause(forgedError)).toBe(
+      "Pi agent group failed: the agent group raised an error\n\nPRIVATE_FORGED_MARKER settings text\n",
     );
     const thrownError = await run(thrown);
     expect((thrownError as Error).message).toBe(

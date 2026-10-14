@@ -111,25 +111,17 @@ export function decodeAgentGroupEvent(line: string): AgentGroupEvent | undefined
   return groupEvent(value.groupId, value);
 }
 
-/** Describe a failure for the runner. Agent errors are recognized by shape across module copies. */
-export function describeAgentGroupFailure(error: unknown): AgentGroupFailure {
+/**
+ * Describe a failure for the runner. `fields` are the facts of an agent error that the group
+ * runner raised itself, from `agentGroupErrorFields`; without them the runner treats the whole
+ * failure as private text.
+ */
+export function describeAgentGroupFailure(
+  error: unknown,
+  fields?: { agentId: string; code: string; facts: string; detail?: string },
+): AgentGroupFailure {
   const message = error instanceof Error ? error.message : String(error);
-  const fields =
-    error instanceof Error && error.name === "PiAgentGroupError"
-      ? agentErrorFields(error)
-      : undefined;
   return fields === undefined ? { message } : { message, ...fields };
-}
-
-function agentErrorFields(
-  error: Error,
-): Pick<AgentGroupFailure, "agentId" | "code" | "facts" | "detail"> | undefined {
-  const fields: Record<string, unknown> = { ...error };
-  const { agentId, code, facts, detail } = fields;
-  if (typeof agentId !== "string" || typeof code !== "string" || typeof facts !== "string") {
-    return undefined;
-  }
-  return typeof detail === "string" ? { agentId, code, facts, detail } : { agentId, code, facts };
 }
 
 function groupEvent(groupId: string, value: Record<string, unknown>): AgentGroupEvent | undefined {
