@@ -1708,6 +1708,9 @@ These are out of scope for this plan.
     carry only codes and Pi Workflows' own facts, plus the full path of a private `0600` cause
     file, and nothing is truncated. Command-batch errors state only the exit status, and the item
     keeps its complete stdout and stderr.
+  - Second-round review fixes in `5fee020`, `6add745`, and `e233d92`: pi cleanup and start
+    failures keep the group's outcome, only the group runner's own agent errors keep visible
+    facts, and a rejected complete-label update is retried.
 - F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
@@ -1718,9 +1721,16 @@ These are out of scope for this plan.
     (`models-store.json` snapshot).
   - Done in `a7ef6fc`: groups also accept providers that Pi defines itself, resolve the model
     without a cached catalog, and run with `PI_OFFLINE=1`.
-  - Review fixes in `df024ad`, `be1f636`, and `1f1da97`: an interim OAuth gate for Pi-defined
-    providers, pending the human's choice between a pre-refresh and a shared locked store;
-    children receive only the dispatch credential; and a test rejects a virtual dispatch model.
+  - Review fixes in `be1f636` and `1f1da97`: children receive only the dispatch credential, and a
+    test rejects a virtual dispatch model.
+  - Superseded: `df024ad` added an interim gate that refused OAuth credentials for Pi-defined
+    providers, and the second-round review fix `bea8e3e` applied it to Pi providers that
+    extensions re-register.
+  - OAuth done with the human's option A in `04d1f17` and `f9c2256`: before the group starts, Pi's
+    own `AuthStorage` refreshes the dispatch provider's OAuth credential at most once, under its
+    file lock, when the credential would not outlive the run bound plus a 10-minute margin. The
+    group fails closed when the refresh fails or the token is still too short. Children never
+    refresh, and legacy extension OAuth is covered.
 - F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
@@ -1757,12 +1767,18 @@ These are out of scope for this plan.
   - Review fixes in `0bdafbe`, `bf33a4a`, and `96fcba7`: piArgs reject `--`, and the opt-in
     `PI_WORKFLOWS_HEADLESS_EXTENSIONS` loads the listed extensions for every server start path,
     including the auto-spawned server.
+  - Second-round review fixes in `455ee46`, `b06d30a`, `aa0743e`, `26428ed`, and `4d5afe0`:
+    entries must be extension files, the server pins each realpath and rechecks it before each
+    launch, the docs say that file contents are not pinned, and an entry that vanishes during its
+    check fails closed with a clear error.
 - F28: Keep the checkout clean after pi-style installs. _(done)_
   - Done in `7ec4245`: lockfile regenerated so pi-style installs leave the checkout clean.
 - F32: Fail headless steps whose configured default model cannot be resolved instead of silently
   falling back. _(done)_
   - Done in `d2afe66` (red reproduction), `7447089`, and `23f88d0`: headless pi stops before any
     model request, and the step fails with an error that names the default and how to fix it.
+  - Second-round review fix in `15ddf8e`: the error names the server restart that picks up a
+    changed `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or changed extra Pi arguments.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
