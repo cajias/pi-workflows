@@ -121,9 +121,10 @@ which both Vitest configurations load, points these at the run's temporary root:
   off;
 - npm's cache and user configuration, with the update notifier off.
 
-It also unsets `PI_CODING_AGENT_SESSION_DIR`, `PI_WORKFLOWS_E2E_PI_ENTRY`,
-`PI_WORKFLOWS_HEADLESS_EXTENSIONS`, `HERDR_ENV`, and `GITLAB_HOST`, so a parent Pi
-or Herdr session cannot change what the suite runs. Children that inherit the
+It also unsets `PI_CODING_AGENT_SESSION_DIR`, `PI_WORKFLOWS_HEADLESS_EXTENSIONS`,
+`HERDR_ENV`, and `GITLAB_HOST`, so a parent Pi or Herdr session cannot change
+what the suite runs. It keeps `PI_WORKFLOWS_E2E_PI_ENTRY`, an explicit opt-in that
+selects which Pi CLI the E2E suite runs. Children that inherit the
 environment, such as workflow servers, resolvers, runners, and `npm pack`, see
 the same values. `test/test-isolation.test.ts` fails when any of these paths
 resolves outside the temporary root. No global Git identity exists, so a test

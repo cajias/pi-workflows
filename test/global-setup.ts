@@ -36,6 +36,9 @@ const TEST_GIT_CONFIG_FILE = "gitconfig";
  *   gh or glab hosts.
  * - Variables that a parent Pi, Herdr, or shell session sets are unset, so they cannot change what
  *   the suite runs.
+ * - `PI_WORKFLOWS_E2E_PI_ENTRY` is deliberately kept. It is an explicit developer opt-in that selects
+ *   which Pi CLI the E2E suite runs. It is not a user directory and does not point tests at the
+ *   developer's home.
  */
 function isolatedTestEnvironment(root: string): Record<string, string | undefined> {
   const home = path.join(root, TEST_HOME_DIRECTORY);
@@ -56,7 +59,6 @@ function isolatedTestEnvironment(root: string): Record<string, string | undefine
     GLAB_CONFIG_DIR: path.join(root, "missing-glab-config"),
     GITLAB_HOST: undefined,
     PI_CODING_AGENT_SESSION_DIR: undefined,
-    PI_WORKFLOWS_E2E_PI_ENTRY: undefined,
     PI_WORKFLOWS_HEADLESS_EXTENSIONS: undefined,
     HERDR_ENV: undefined,
   };

@@ -45,6 +45,9 @@ describe("Herdr piw plugin", () => {
 
       const child = spawn(process.execPath, [VIEWER_ENTRY], {
         env: {
+          // The isolated test HOME. This environment is built from scratch, so without it
+          // os.homedir() in the child would fall back to the real home.
+          HOME: process.env.HOME,
           HERDR_BIN_PATH: path.join(root, "removed-herdr"),
           HERDR_PANE_ID: "w1:p1",
           PATH: `${binaryDirectory}${path.delimiter}${process.env.PATH ?? ""}`,

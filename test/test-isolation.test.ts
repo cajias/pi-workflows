@@ -13,10 +13,15 @@ import { TEST_TEMP_ROOT_ENV } from "./global-setup.js";
 
 const execFileAsync = promisify(execFile);
 
-/** Variables that a parent Pi, Herdr, or shell session sets and the suite must not inherit. */
+/**
+ * Variables that a parent Pi, Herdr, or shell session sets and the suite must not inherit.
+ *
+ * `PI_WORKFLOWS_E2E_PI_ENTRY` is not here on purpose. A developer sets it explicitly to choose which
+ * Pi CLI the E2E suite runs. It is not a user directory and does not point tests at the real home,
+ * so the suite keeps it.
+ */
 const PARENT_SESSION_ENVIRONMENT = [
   "PI_CODING_AGENT_SESSION_DIR",
-  "PI_WORKFLOWS_E2E_PI_ENTRY",
   "PI_WORKFLOWS_HEADLESS_EXTENSIONS",
   "HERDR_ENV",
   "GITLAB_HOST",

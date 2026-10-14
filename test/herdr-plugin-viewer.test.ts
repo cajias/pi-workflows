@@ -12,6 +12,11 @@ const viewerScript = path.resolve(
 );
 const packageVersion = piwPackageVersion() ?? "";
 const runId = "20260818T120000Z-monitor-a1b2c3d4";
+/**
+ * The isolated test HOME from the global setup. Each viewer child gets an environment built from
+ * scratch, so without it `os.homedir()` in the child would fall back to the real home.
+ */
+const isolatedHome = { HOME: process.env.HOME };
 
 async function writeExecutable(file: string, source: string): Promise<string> {
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -65,6 +70,7 @@ describe("Herdr piw plugin launcher", () => {
     const result = spawnSync(process.execPath, [viewerScript], {
       encoding: "utf8",
       env: {
+        ...isolatedHome,
         HERDR_BIN_PATH: herdr,
         HERDR_PANE_ID: "w1:p2",
         HERDR_ARGS_FILE: herdrArgs,
@@ -94,6 +100,7 @@ describe("Herdr piw plugin launcher", () => {
     const result = spawnSync(process.execPath, [viewerScript], {
       encoding: "utf8",
       env: {
+        ...isolatedHome,
         HERDR_BIN_PATH: herdr,
         HERDR_PANE_ID: "w1:p2",
         HERDR_ARGS_FILE: herdrArgs,
@@ -126,6 +133,7 @@ describe("Herdr piw plugin launcher", () => {
     const result = spawnSync(process.execPath, [viewerScript], {
       encoding: "utf8",
       env: {
+        ...isolatedHome,
         HERDR_BIN_PATH: herdr,
         HERDR_PANE_ID: "w1:p2",
         HERDR_ARGS_FILE: herdrArgs,
@@ -155,6 +163,7 @@ describe("Herdr piw plugin launcher", () => {
     const result = spawnSync(process.execPath, [copiedViewer], {
       encoding: "utf8",
       env: {
+        ...isolatedHome,
         HERDR_BIN_PATH: herdr,
         HERDR_PANE_ID: "w1:p2",
         HERDR_ARGS_FILE: herdrArgs,
@@ -175,6 +184,7 @@ describe("Herdr piw plugin launcher", () => {
     const result = spawnSync(process.execPath, [viewerScript], {
       encoding: "utf8",
       env: {
+        ...isolatedHome,
         PATH: process.env.PATH ?? "",
         PI_WORKFLOWS_RUN_ID: "../bad",
       },
