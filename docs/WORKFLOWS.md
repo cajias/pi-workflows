@@ -1419,7 +1419,8 @@ listed extension after its bridge. Select the extension's provider with
 - The server pins the real file behind each entry at start, and children load
   that file. Before each launch, the runner checks every entry again and fails
   that launch when the file is gone, no longer passes the checks, or now
-  resolves to another file.
+  resolves to another file. The file's contents are not pinned, so an edit to
+  the same file takes effect at the next launch.
 - The whole extension loads, with its tools, hooks, and commands, into every
   headless child for every run and project that the server handles.
 
