@@ -43,7 +43,8 @@ it already committed instead of creating a second run. When the extension cannot
 confirm the start, its error names the run ID; check `/workflow status` before
 you start the workflow again. A headless start (`executionMode: "headless"`)
 needs no Pi session and carries no session authority. Verification scripts and
-tests use an isolated server with a scratch database, never the live server; see
+tests never use the live server: they use a scratch database, or run with a
+scratch `HOME` and a scratch `PI_WORKFLOWS_CONFIG_DIR`; see
 [Verification scripts](DEVELOPMENT.md#verification-scripts).
 
 Resume uses the run's original source and graph, including ordinary workflows

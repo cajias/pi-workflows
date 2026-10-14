@@ -185,20 +185,36 @@ real model is called.
 
 Tests and ad-hoc verification scripts that drive a workflow server through
 `WorkflowClient` must stay off the live server. `new WorkflowClient()` without a
-`databasePath` connects to the live server of
-`~/.pi/agent/workflows/state.sqlite`, which real Pi sessions use. Use an isolated
-server instead. Pass a scratch database,
-`new WorkflowClient({ databasePath: "/var/tmp/<scratch>/state.sqlite" })`, and
-call `ensureAvailable()`. The client starts a server for that database with its
-own socket under `<scratch>/server/`. Keep the scratch path short, because the
-socket path must fit the operating system limit, 107 bytes on Linux. Send
-`server.stop` and delete the scratch directory when the script is done.
+`databasePath` uses the live state database,
+`<home>/.pi/agent/workflows/state.sqlite`, where `<home>` is `os.homedir()`:
+`HOME`, or `USERPROFILE` on Windows. Real Pi sessions use that database and its
+server. The server's socket is `server/server.sock` in the database's directory,
+or on Windows a named pipe derived from that directory, so the socket always
+follows the database. Use one of these isolations:
 
-`executionMode: "headless"` is not a substitute for an isolated server. A
-headless run needs no Pi session and creates no terminal workflow message, but on
-the live server it still writes its run, queue row, events, and history to the
-live state. Use headless runs on the isolated server when the check needs no
-origin session.
+- **A scratch database.** Pass
+  `new WorkflowClient({ databasePath: "/var/tmp/<scratch>/state.sqlite" })` and
+  call `ensureAvailable()`. The client starts a server for that database with
+  its own socket under `<scratch>/server/`.
+- **A scratch HOME.** Run the whole script with `HOME` (`USERPROFILE` on Windows)
+  set to a scratch directory and `PI_WORKFLOWS_CONFIG_DIR` set to a scratch
+  directory. The default database and its socket then move under the scratch
+  HOME. The scratch `PI_WORKFLOWS_CONFIG_DIR` keeps an inherited setting from
+  pointing the server at the real configuration, such as decision channels.
+
+`PI_WORKFLOWS_CONFIG_DIR` moves only configuration, such as `channels.json`,
+`credentials.json`, `shortcuts.json`, `autoimplement.json`, and OAuth refresh
+markers. It does not move the database or the socket, so it never isolates state
+on its own. `PI_CODING_AGENT_DIR` does not move the database either. Keep the
+scratch path short, because the socket path must fit the operating system limit,
+107 bytes on Linux. Send `server.stop` and delete the scratch directories when
+the script is done.
+
+`executionMode: "headless"` is not a substitute for isolation. A headless run
+needs no Pi session and creates no terminal workflow message, so it leaves no
+orphaned terminal message, but on the live server it still writes its run, queue
+row, events, and history to the live state. Use headless runs on an isolated
+server when the check needs no origin session.
 
 Never start an interactive run on the live socket with a made-up
 `originSessionId`. The run's terminal result is addressed to that session, so it
@@ -206,11 +222,12 @@ would stay pending forever and keep the run from retention. The workflow server
 rejects such a start: an interactive `run.start` needs the live coordinator
 authority of its origin session, as described in
 [Starting and resuming runs](WORKFLOWS.md#starting-and-resuming-runs). A script
-that needs interactive behavior uses an isolated server and owns the session
-there. It subscribes with `view.session.watch` and `coordinator: true`, reports
-the branch with `workflowMessage.reportBranch`, and sends `targetSessionId` and
-`coordinatorEpoch` with the start from that same connection.
-`requestInteractiveStart` in `test/helpers.ts` does this for the unit tests.
+that needs interactive behavior uses one of these isolations and owns the
+session there. It subscribes with `view.session.watch` and `coordinator: true`,
+reports the branch with `workflowMessage.reportBranch`, and sends
+`targetSessionId` and `coordinatorEpoch` with the start from that same
+connection. `requestInteractiveStart` in `test/helpers.ts` does this for the
+unit tests.
 
 ## Publishing
 
