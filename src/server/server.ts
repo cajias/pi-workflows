@@ -24,6 +24,8 @@ import {
   clientSocketPath,
   NdjsonFrameDecoder,
   parseClientRequest,
+  SESSION_BRANCH_UNREPORTED_ERROR,
+  SESSION_COORDINATOR_REPLACED_ERROR,
   type ClientEvent,
   type ClientMessage,
   type ClientOutcome,
@@ -1157,7 +1159,7 @@ export class WorkflowServer {
       coordinator.connectionId !== connection.id ||
       coordinator.epoch !== epoch
     ) {
-      throw new Error("Workflow session coordinator was replaced");
+      throw new Error(SESSION_COORDINATOR_REPLACED_ERROR);
     }
     return coordinator;
   }
@@ -1178,7 +1180,7 @@ export class WorkflowServer {
       coordinatorEpoch,
     );
     if (!coordinator.branchReported) {
-      throw new Error("Workflow session branch must be reported before session control");
+      throw new Error(SESSION_BRANCH_UNREPORTED_ERROR);
     }
     return { targetSessionId, coordinatorEpoch };
   }

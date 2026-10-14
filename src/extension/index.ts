@@ -3,16 +3,20 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_WORKFLOW_METADATA } from "../builtins/metadata.js";
 import { verifyTelegramTokenFile, writeDecisionChannelProfile } from "../channels/config.js";
-import { WorkflowClient } from "../client/client.js";
+import { WorkflowClient, WorkflowClientVersionError } from "../client/client.js";
 import { currentPiCommand } from "../client/headless-pi-command.js";
-import type { ClientResponse } from "../client/protocol.js";
+import {
+  SESSION_BRANCH_UNREPORTED_ERROR,
+  SESSION_COORDINATOR_REPLACED_ERROR,
+  type ClientResponse,
+} from "../client/protocol.js";
 import type {
   ClientInteractiveRequest,
   WorkflowRunQueueView,
   WorkflowSessionMessage,
   WorkflowSessionView,
 } from "../client/view.js";
-import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+import { canonicalJson, parseJson, type JsonObject, type JsonValue } from "../state/json.js";
 import type { WorkflowMessageContent } from "../state/workflow-messages.js";
 import { errorMessage } from "../workflows/errors.js";
 import { discoverWorkflows } from "../workflows/loader.js";
@@ -68,13 +72,26 @@ const SESSION_PROJECTION_MAX_RETRY_MS = 30_000;
  */
 const SESSION_COORDINATOR_READY_MS = 15_000;
 const SESSION_COORDINATOR_POLL_MS = 25;
+/**
+ * Sends of one interactive start. A lost connection or a replaced coordinator gets
+ * a resend with fresh authority, within the same readiness deadline.
+ */
+const MAX_INTERACTIVE_START_ATTEMPTS = 3;
+/** Server rejections of a start whose coordinator authority is no longer current. */
+const STALE_AUTHORITY_ERRORS = new Set([
+  SESSION_COORDINATOR_REPLACED_ERROR,
+  SESSION_BRANCH_UNREPORTED_ERROR,
+]);
 // Keep one model-facing tool result comfortably below Pi provider message limits.
 // The offset keeps every discovered workflow available across pages.
 const MAX_WORKFLOW_LIST_ITEMS = 50;
 const MAX_WORKFLOW_LIST_NAME_CHARS = 3_500;
 const sessionSnapshots = new Map<string, WorkflowSessionView>();
-/** Sessions whose last view is display-only until a fresh snapshot arrives. */
-const staleSessionIds = new Set<string>();
+/**
+ * Sessions whose last view is display-only until a fresh snapshot arrives, with
+ * the reason the subscription was lost.
+ */
+const staleSessions = new Map<string, string>();
 /** Whether the widget holds a node window the user scrolled to. */
 let sessionPagedWindow = false;
 /** The node window the user scrolled to, so a re-armed subscription keeps it. */
@@ -397,9 +414,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       try {
         await presentInOrder(ctx);
         const parsed = parseWorkflowArgs(args);
-        const result = await executeCommand(client, ctx, parsed, randomUUID(), "human", () =>
-          connectCurrentSession(),
-        );
+        // Pi gives a command no abort signal of its own. `ctx.signal` belongs to the
+        // agent turn and can already be aborted, so a command start does not use it.
+        const result = await executeCommand(client, ctx, parsed, randomUUID(), "human", {
+          connect: () => connectCurrentSession(),
+        });
         ctx.ui.notify(result.message, result.level ?? "info");
         await presentInOrder(ctx);
       } catch (error) {
@@ -599,9 +618,10 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           );
         }
         const parsed = toolInputToCommand(params);
-        const result = await executeCommand(client, ctx, parsed, toolCallId, "model", () =>
-          connectCurrentSession(),
-        );
+        const result = await executeCommand(client, ctx, parsed, toolCallId, "model", {
+          connect: () => connectCurrentSession(),
+          signal,
+        });
         await presentInOrder(ctx);
         return toolResult(result.message, result.details);
       });
@@ -678,7 +698,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     const generation = ++sessionGeneration;
     const sessionClient = client;
     sessionView.setNodePager(async (cursor) => {
-      if (generation !== sessionGeneration || staleSessionIds.has(sessionId)) {
+      if (generation !== sessionGeneration || staleSessions.has(sessionId)) {
         // A stale view has no authority, so the window stays where it is and the
         // request stays retryable.
         throw new Error("Workflow session view is stale");
@@ -714,11 +734,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               if (generation !== sessionGeneration || sessionContext !== ctx) return;
               if (event.event === "unavailable") {
                 subscriptionDropped = true;
-                staleSessionIds.add(sessionId);
+                const failure = subscriptionFailure(event.payload);
+                staleSessions.set(sessionId, failure.message);
                 // A snapshot the server no longer confirms must not start a Pi
                 // turn or answer a request. A fresh snapshot clears the fence.
                 workflowMessages.fence();
-                const failure = subscriptionFailure(event.payload);
                 sessionView.markStale(failure.message, ctx);
                 if (failure.reasonCode === "projection_failed") {
                   sessionSubscriptionFailures += 1;
@@ -742,7 +762,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               }
               if (!isWorkflowSessionView(event.payload)) return;
               const session = event.payload;
-              staleSessionIds.delete(sessionId);
+              staleSessions.delete(sessionId);
               sessionSubscriptionFailures = 0;
               sessionSubscriptionRetryAt = 0;
               sessionSnapshots.set(sessionId, session);
@@ -890,7 +910,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     workflowMessages.clear();
     sessionView.clear(ctx);
     sessionSnapshots.delete(ctx.sessionManager.getSessionId());
-    staleSessionIds.delete(ctx.sessionManager.getSessionId());
+    staleSessions.delete(ctx.sessionManager.getSessionId());
     if (pollTimer !== null) clearInterval(pollTimer);
     pollTimer = null;
     if (sessionUnsubscribe !== null) await sessionUnsubscribe().catch(() => undefined);
@@ -918,7 +938,7 @@ async function executeCommand(
   command: ParsedWorkflowArgs,
   idempotencyKey: string = randomUUID(),
   authority: "human" | "model" = "human",
-  connectSession: () => void = () => undefined,
+  sessionWait: SessionWait = {},
 ): Promise<CommandResult> {
   switch (command.kind) {
     case "list": {
@@ -974,14 +994,10 @@ async function executeCommand(
       const resolved = await client.resolveWorkflow({ cwd: ctx.cwd, workflowRef: command.ref });
       const runId = createRunId(resolved.workflowName);
       // The server accepts an interactive start only from this live session.
-      const session = await readySessionCommandPayload(ctx, connectSession);
-      const response = await requestAccepted(client, {
-        operation: "run.start",
-        requestId: `start-${idempotencyKey}`,
+      const response = await requestSessionStart(client, ctx, sessionWait, {
         idempotencyKey,
         runId,
         payload: {
-          ...session,
           projectPath: ctx.cwd,
           workflowName: resolved.workflowName,
           workflowSourceRef: resolved.workflowSourceRef,
@@ -990,7 +1006,7 @@ async function executeCommand(
           definitionSnapshot: resolved.definitionSnapshot,
           input: jsonValue(command.input),
           launchOptions: {},
-          originSessionId: session.targetSessionId,
+          originSessionId: ctx.sessionManager.getSessionId(),
           executionMode: "interactive",
         },
       });
@@ -1340,48 +1356,195 @@ function activeSessionRun(ctx: ExtensionContext): WorkflowRunQueueView | undefin
   return sessionRun(ctx);
 }
 
-function sessionCommandPayload(ctx: ExtensionContext): {
-  targetSessionId: string;
-  coordinatorEpoch: string;
-} {
-  const targetSessionId = ctx.sessionManager.getSessionId();
-  const session = sessionSnapshots.get(targetSessionId);
-  if (
-    session === undefined ||
-    staleSessionIds.has(targetSessionId) ||
-    !session.coordinatorActive ||
-    session.coordinatorEpoch === null ||
-    session.branchReportRequired
-  ) {
-    throw new Error("Workflow session coordinator is not ready");
+type SessionCommandPayload = { targetSessionId: string; coordinatorEpoch: string };
+
+/** How a start waits for its session's coordinator. */
+type SessionWait = {
+  /** Asks the session to connect now instead of at the next poll. */
+  connect?: () => void;
+  /** The tool call's signal. Aborting it ends the wait. */
+  signal?: AbortSignal | undefined;
+};
+
+/**
+ * Why this session cannot send a session command yet, or undefined when it can. A
+ * `staleEpoch` is authority the server already refused, so it does not count.
+ */
+function sessionNotReadyReason(ctx: ExtensionContext, staleEpoch?: string): string | undefined {
+  const sessionId = ctx.sessionManager.getSessionId();
+  const lost = staleSessions.get(sessionId);
+  if (lost !== undefined) return `the session view is stale (${lost.replace(/\.$/u, "")})`;
+  const session = sessionSnapshots.get(sessionId);
+  if (session === undefined) return "the session has no workflow server view yet";
+  if (!session.coordinatorActive || session.coordinatorEpoch === null) {
+    return "this connection is not the session's coordinator";
   }
-  return { targetSessionId, coordinatorEpoch: session.coordinatorEpoch };
+  if (session.branchReportRequired) return "the session branch is not reported yet";
+  if (session.coordinatorEpoch === staleEpoch) {
+    return "the workflow server replaced the session's coordinator";
+  }
+  return undefined;
+}
+
+function sessionCommandPayload(ctx: ExtensionContext, staleEpoch?: string): SessionCommandPayload {
+  const targetSessionId = ctx.sessionManager.getSessionId();
+  const reason = sessionNotReadyReason(ctx, staleEpoch);
+  const coordinatorEpoch = sessionSnapshots.get(targetSessionId)?.coordinatorEpoch;
+  if (reason !== undefined || typeof coordinatorEpoch !== "string") {
+    throw new Error(
+      `Workflow session coordinator is not ready because ${reason ?? "it has no epoch"}`,
+    );
+  }
+  return { targetSessionId, coordinatorEpoch };
+}
+
+function throwIfStartCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new Error("Workflow start was cancelled while it waited for the Pi session coordinator");
+  }
+}
+
+/** Wait one readiness poll, or less when `signal` aborts. */
+async function sessionPoll(signal: AbortSignal | undefined): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, SESSION_COORDINATOR_POLL_MS);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 }
 
 /**
  * Return this session's command authority once its coordinator is ready. A start
  * can arrive before the first session connection or branch report finishes, so it
- * asks for that connection and waits instead of failing at once.
+ * asks for that connection and waits until `deadline` instead of failing at once.
+ * The final error names the last reason the session was not ready.
  */
 async function readySessionCommandPayload(
   ctx: ExtensionContext,
-  connectSession: () => void,
-): Promise<{ targetSessionId: string; coordinatorEpoch: string }> {
-  const deadline = Date.now() + SESSION_COORDINATOR_READY_MS;
-  do {
-    try {
-      return sessionCommandPayload(ctx);
-    } catch {
-      connectSession();
-      await new Promise((resolve) => setTimeout(resolve, SESSION_COORDINATOR_POLL_MS));
+  wait: SessionWait & { deadline: number; staleEpoch?: string | undefined },
+): Promise<SessionCommandPayload> {
+  for (;;) {
+    throwIfStartCancelled(wait.signal);
+    if (sessionNotReadyReason(ctx, wait.staleEpoch) === undefined || Date.now() >= wait.deadline) {
+      return sessionCommandPayload(ctx, wait.staleEpoch);
     }
-  } while (Date.now() < deadline);
-  return sessionCommandPayload(ctx);
+    wait.connect?.();
+    await sessionPoll(wait.signal);
+  }
+}
+
+type InteractiveStart = { idempotencyKey: string; runId: string; payload: JsonObject };
+
+type StartSend = { response: ClientResponse } | { error: Error; uncertain: boolean };
+
+/** A failed attempt names the epoch it sent when the start may have committed. */
+type StartAttempt = { response: ClientResponse } | { error: Error; staleEpoch?: string };
+
+/**
+ * Send one interactive start with this session's current authority. A lost
+ * connection or a replaced coordinator makes the carried epoch stale, and the
+ * server may already have committed the start. The start therefore waits for the
+ * session's next epoch and resends the same idempotency key and run ID, so the
+ * server adopts a committed start instead of creating a second run.
+ */
+async function requestSessionStart(
+  client: WorkflowClient,
+  ctx: ExtensionContext,
+  wait: SessionWait,
+  start: InteractiveStart,
+): Promise<ClientResponse> {
+  const deadline = Date.now() + SESSION_COORDINATOR_READY_MS;
+  let staleEpoch: string | undefined;
+  for (let attempt = 1; ; attempt += 1) {
+    const sent = await attemptInteractiveStart(
+      client,
+      ctx,
+      { ...wait, deadline, staleEpoch },
+      start,
+      attempt,
+    );
+    if ("response" in sent) return sent.response;
+    // After one uncertain send, every later failure leaves the start unconfirmed.
+    const uncertain = staleEpoch !== undefined || sent.staleEpoch !== undefined;
+    if (sent.staleEpoch === undefined || attempt >= MAX_INTERACTIVE_START_ATTEMPTS) {
+      throw uncertain ? unconfirmedStart(start.runId, sent.error) : sent.error;
+    }
+    staleEpoch = sent.staleEpoch;
+  }
+}
+
+async function attemptInteractiveStart(
+  client: WorkflowClient,
+  ctx: ExtensionContext,
+  wait: SessionWait & { deadline: number; staleEpoch?: string | undefined },
+  start: InteractiveStart,
+  attempt: number,
+): Promise<StartAttempt> {
+  let session: SessionCommandPayload;
+  try {
+    session = await readySessionCommandPayload(ctx, wait);
+  } catch (error) {
+    return { error: toError(error) };
+  }
+  const sent = await sendInteractiveStart(client, start, session, attempt);
+  if ("response" in sent) return sent;
+  return sent.uncertain
+    ? { error: sent.error, staleEpoch: session.coordinatorEpoch }
+    : { error: sent.error };
+}
+
+async function sendInteractiveStart(
+  client: WorkflowClient,
+  start: InteractiveStart,
+  session: SessionCommandPayload,
+  attempt: number,
+): Promise<StartSend> {
+  try {
+    await client.ensureAvailable();
+  } catch (error) {
+    // Nothing was sent, so this attempt cannot have committed a start.
+    return { error: toError(error), uncertain: false };
+  }
+  let response: ClientResponse;
+  try {
+    response = await client.requestDurable({
+      operation: "run.start",
+      requestId:
+        attempt === 1
+          ? `start-${start.idempotencyKey}`
+          : `start-${start.idempotencyKey}-${attempt}`,
+      idempotencyKey: start.idempotencyKey,
+      runId: start.runId,
+      payload: { ...session, ...start.payload },
+    });
+  } catch (error) {
+    // A transport failure can follow a committed start. A version mismatch cannot.
+    return { error: toError(error), uncertain: !(error instanceof WorkflowClientVersionError) };
+  }
+  if (response.outcome === "accepted" || response.outcome === "adopted") return { response };
+  return {
+    error: new Error(response.error ?? "Workflow server rejected run.start"),
+    uncertain: response.outcome === "rejected" && STALE_AUTHORITY_ERRORS.has(response.error ?? ""),
+  };
+}
+
+function unconfirmedStart(runId: string, error: unknown): Error {
+  return new Error(
+    `Workflow run ${runId} may have been created, but its start could not be confirmed: ${errorMessage(error)}. Check /workflow status before you start it again.`,
+  );
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function sessionRun(ctx: ExtensionContext, runId?: string): WorkflowRunQueueView | undefined {
   const sessionId = ctx.sessionManager.getSessionId();
-  if (staleSessionIds.has(sessionId)) return undefined;
+  if (staleSessions.has(sessionId)) return undefined;
   const session = sessionSnapshots.get(sessionId);
   if (session?.run === null || session?.run === undefined || !isRecord(session.run.queue)) {
     return undefined;

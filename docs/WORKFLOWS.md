@@ -29,11 +29,21 @@ rejected and creates no run. Without this check, such a start would create a
 terminal message that no session can receive; the message would stay pending
 and keep its run from retention. The extension sends its session's authority
 with every start. When the session is still connecting or reporting its branch,
-the start waits up to 15 seconds for it and then fails with `Workflow session
-coordinator is not ready`. A headless start (`executionMode: "headless"`) needs
-no Pi session and carries no session authority. Verification scripts and tests
-use headless runs or an isolated server, never the live server with a made-up
-session; see [Verification scripts](DEVELOPMENT.md#verification-scripts).
+the start waits up to 15 seconds for it. Aborting the workflow tool call ends
+the wait; Pi gives a `/workflow` command no abort signal, so its wait ends at the
+deadline. At the deadline, the start fails with `Workflow session coordinator is
+not ready because ...`, which names the last reason, such as a stale session view
+or an unreported branch. When the connection drops during a start, or the server
+refuses the start's epoch as replaced, the start may already be committed. The
+extension then waits, within the same 15 seconds, for the session's next epoch
+and sends the start again with the same idempotency key and run ID, at most three
+sends in all. The server adopts a start it already committed instead of creating
+a second run. When the extension cannot confirm the start, its error names the
+run ID; check `/workflow status` before you start the workflow again. A headless
+start (`executionMode: "headless"`) needs no Pi session and carries no session
+authority. Verification scripts and tests use headless runs or an isolated
+server, never the live server with a made-up session; see
+[Verification scripts](DEVELOPMENT.md#verification-scripts).
 
 Resume uses the run's original source and graph, including ordinary workflows
 without included workflows. Source and graph checks run before any durable
