@@ -101,6 +101,13 @@ const BUILTIN_PROVIDER = "cerebras";
 const BUILTIN_MODEL = "gpt-oss-120b";
 const BUILTIN_PROVIDER_KEY = "builtin-provider-key";
 const BUILTIN_PROVIDER_KEY_ENV = "CEREBRAS_API_KEY";
+// A stored OAuth credential that does not expire during a test, so nothing refreshes it.
+const FIXTURE_OAUTH_CREDENTIAL = {
+  type: "oauth",
+  refresh: "fixture-refresh-token",
+  access: "fixture-access-token",
+  expires: Date.UTC(2100, 0, 1),
+};
 
 async function writeBuiltinProviderConfig(
   agentDir: string,
@@ -1607,6 +1614,66 @@ describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
     } finally {
       vi.unstubAllEnvs();
       await mock.close();
+    }
+  });
+
+  it("uses an environment API key for a provider built into Pi", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"environment"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-env-key");
+    const cwd = await makeTempDir("pi-agent-group-builtin-env-key-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, { auth: false });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, "environment-provider-key");
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("builtin-env-key"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: `${BUILTIN_PROVIDER}/${BUILTIN_MODEL}`,
+          text: '{"answer":"environment"}',
+        }),
+      ]);
+      expect(mock.authorizations).toEqual(["Bearer environment-provider-key"]);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("uses a long-lived OAuth credential of a native extension provider without refreshing it", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-extension-oauth");
+    const cwd = await makeTempDir("pi-agent-group-extension-oauth-project");
+    await writeNativeFixtureConfig(agentDir);
+    const authText = JSON.stringify({ "fixture-native": FIXTURE_OAUTH_CREDENTIAL });
+    await fs.writeFile(path.join(agentDir, "auth.json"), authText, "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("PI_AGENT_FIXTURE_OAUTH", "1");
+    // Without its API key, the provider can authenticate only through the stored OAuth credential.
+    vi.stubEnv("PI_AGENT_FIXTURE_DISABLE_AUTH", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("extension-oauth"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: "fixture-native/fixture-model",
+          text: '{"answer":"ok"}',
+        }),
+      ]);
+      expect(await fs.readFile(path.join(agentDir, "auth.json"), "utf8")).toBe(authText);
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 

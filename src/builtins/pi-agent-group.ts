@@ -54,6 +54,14 @@ const RESERVED_EXTENSION_NAMES = new Set([
 ]);
 const CREDENTIALS_LOAD_FAILURE = "Could not load Pi credentials for isolated agents";
 const MODELS_LOAD_FAILURE = "Could not load Pi model catalog for isolated agents";
+/**
+ * Validity that a group's OAuth credential must have beyond the group's longest possible run.
+ * Pi refreshes a stored OAuth token in a model request when it expires within five minutes
+ * (`DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` in pi-ai's `auth/resolve.js`), so five minutes keep each
+ * child clear of that threshold. The other five minutes cover session abort and disposal after
+ * a timeout, slot scheduling, and timer delays.
+ */
+const OAUTH_GROUP_MARGIN_MS = 10 * 60_000;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 type PiAgentEvent = Record<string, unknown>;
@@ -72,6 +80,11 @@ type PiAgentSession = {
   subscribe(listener: (event: PiAgentEvent) => void): () => void;
   abort(): Promise<void>;
   dispose(): void | Promise<void>;
+  /**
+   * The failure of a session that needed to refresh its OAuth credential, which children never
+   * do. Pi reports that request failure only as provider text, so the session keeps the fact.
+   */
+  credentialFailure?(): PiAgentGroupError | undefined;
   model: { provider: string; id: string } | undefined;
   thinkingLevel: PiAgentThinkingLevel;
 };
@@ -143,7 +156,12 @@ async function runGroupRequests(
 
   const groupPlan =
     options.sessionFactory === undefined
-      ? await createSdkGroupPlan(requests, options.behaviorExtensionPaths ?? [], options.signal)
+      ? await createSdkGroupPlan(requests, {
+          behaviorExtensionPaths: options.behaviorExtensionPaths ?? [],
+          maxConcurrency: options.maxConcurrency,
+          now: options.now ?? Date.now,
+          signal: options.signal,
+        })
       : undefined;
   if (options.signal.aborted) throw cancellationError("group", options.signal.reason);
   const sessionFactory =
@@ -411,11 +429,18 @@ type ChildExtensionProfile = {
   providerExtension: boolean;
 };
 
+type GroupPlanOptions = {
+  behaviorExtensionPaths: string[];
+  maxConcurrency: number;
+  now: () => number;
+  signal: AbortSignal;
+};
+
 async function createSdkGroupPlan(
   requests: PiAgentRequest[],
-  behaviorExtensionPaths: string[],
-  signal: AbortSignal,
+  options: GroupPlanOptions,
 ): Promise<SdkGroupPlan> {
+  const { signal } = options;
   signal.throwIfAborted();
   const cwd = requests[0]!.cwd;
   if (requests.some((request) => request.cwd !== cwd)) {
@@ -429,14 +454,25 @@ async function createSdkGroupPlan(
     agentDir,
     settingsManager,
     dispatch.provider,
-    behaviorExtensionPaths,
+    options.behaviorExtensionPaths,
     signal,
   );
-  if (!profile.providerExtension) await assertPiProvider(dispatch.provider, signal);
+  if (!profile.providerExtension && !(await isPiProvider(dispatch.provider, signal))) {
+    throw new PiAgentGroupError("group", "has unknown provider", dispatch.provider);
+  }
   const credentials = await createEphemeralCredentialStore(signal);
   // Children receive only the dispatch provider's stored credential. Pi resolves a provider's
   // authentication from its own entry, and the dispatch is the only provider a child may use.
-  const credential = await credentials.read(dispatch.provider);
+  const credential = await prepareDispatchCredential({
+    cwd,
+    agentDir,
+    provider: dispatch.provider,
+    extensionPaths: profile.extensionPaths,
+    credential: await credentials.read(dispatch.provider),
+    requiredValidityMs: groupRunBoundMs(requests, options.maxConcurrency) + OAUTH_GROUP_MARGIN_MS,
+    now: options.now,
+    signal,
+  });
   const credentialSnapshot: CredentialSnapshot = new Map(
     credential === undefined ? [] : [[dispatch.provider, credential]],
   );
@@ -456,14 +492,147 @@ async function createSdkGroupPlan(
 }
 
 /**
- * A dispatch provider that no admitted extension registers must be one that Pi defines
- * itself: built into Pi or configured in `models.json`.
+ * Whether Pi defines the provider itself: built into Pi or configured in `models.json`. A
+ * dispatch provider that no admitted extension registers must be one of these.
  */
-async function assertPiProvider(provider: string, signal: AbortSignal): Promise<void> {
+async function isPiProvider(provider: string, signal: AbortSignal): Promise<boolean> {
   const modelRuntime = await offlineModelRuntime(signal);
-  if (modelRuntime.getProvider(provider) === undefined) {
-    throw new PiAgentGroupError("group", "has unknown provider", provider);
+  return modelRuntime.getProvider(provider) !== undefined;
+}
+
+/**
+ * The longest time from the start of a group until its last session can make a model request.
+ * Each slot runs requests one after another, and every session stops at its own timeout, so
+ * request `k` starts at most `floor(k / slots)` timeouts after the group starts.
+ */
+function groupRunBoundMs(requests: PiAgentRequest[], maxConcurrency: number): number {
+  const slots = Math.min(maxConcurrency, requests.length);
+  const longest = Math.max(...requests.map((request) => request.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+  return Math.ceil(requests.length / slots) * longest;
+}
+
+type DispatchCredentialInput = {
+  cwd: string;
+  agentDir: string;
+  provider: string;
+  extensionPaths: readonly string[];
+  credential: StoredCredential | undefined;
+  /** How long the credential must stay valid from now: the group's run bound plus the margin. */
+  requiredValidityMs: number;
+  now: () => number;
+  signal: AbortSignal;
+};
+
+/**
+ * The dispatch credential that children receive. Children never refresh OAuth credentials, so
+ * an OAuth credential that could expire while a child still needs it is refreshed here, once,
+ * before any session starts, through Pi's own locked credential store. A credential that is
+ * still too short afterwards fails the group.
+ */
+async function prepareDispatchCredential(
+  input: DispatchCredentialInput,
+): Promise<StoredCredential | undefined> {
+  const { credential, provider, requiredValidityMs, now } = input;
+  if (credential?.type !== "oauth") return credential;
+  if (credential.expires - now() > requiredValidityMs) return credential;
+  await refreshThroughPi(input);
+  const refreshed = await (await createEphemeralCredentialStore(input.signal)).read(provider);
+  if (refreshed?.type !== "oauth" || refreshed.expires - now() > requiredValidityMs) {
+    return refreshed;
   }
+  const unchanged =
+    refreshed.access === credential.access &&
+    refreshed.refresh === credential.refresh &&
+    refreshed.expires === credential.expires;
+  if (unchanged) {
+    throw new PiAgentGroupError(
+      "group",
+      "could not refresh OAuth credentials",
+      `${provider}; sign in to the provider again in Pi, or configure an API key for it`,
+    );
+  }
+  throw new PiAgentGroupError(
+    "group",
+    "has OAuth credentials that expire too soon",
+    `${provider}; the refreshed credentials expire before the agent group can finish, which can take ${Math.ceil(requiredValidityMs / 60_000)} minutes`,
+  );
+}
+
+/**
+ * Ask Pi to refresh the dispatch provider's OAuth credential. The model runtime gets no
+ * credential store, so it uses Pi's default file-backed `AuthStorage` for `auth.json`. Pi then
+ * refreshes under that file's lock, skips the refresh when another Pi process already
+ * refreshed, and writes the result itself, as in any Pi session. The admitted extensions are
+ * registered as in each child, because a provider extension can supply the OAuth refresh.
+ */
+async function refreshThroughPi(input: DispatchCredentialInput): Promise<void> {
+  const { cwd, agentDir, provider, extensionPaths, requiredValidityMs, signal } = input;
+  const modelRuntime = await ModelRuntime.create({
+    allowModelNetwork: false,
+    refreshOnCreate: false,
+    signal,
+    modelsStore: emptyModelStore(signal),
+  });
+  const refresh = async () => {
+    try {
+      await modelRuntime.getAuth(provider, { minOAuthValidityMs: requiredValidityMs, signal });
+    } catch {
+      // A refresh error can quote the provider's token response, so its text is kept nowhere.
+      // The credential that Pi stored afterwards decides the outcome.
+    }
+  };
+  if (extensionPaths.length === 0) {
+    await refresh();
+    return;
+  }
+  const services = await createAgentSessionServices({
+    cwd,
+    agentDir,
+    settingsManager: isolatedSettings({}),
+    modelRuntime,
+    modelRuntimeSignal: signal,
+    resourceLoaderOptions: isolatedResourceLoaderOptions(extensionPaths),
+  });
+  const extensions = services.resourceLoader.getExtensions();
+  let cleanupFailed = false;
+  try {
+    await refresh();
+  } finally {
+    try {
+      await shutdownLoadedExtensions(extensions, cwd, signal);
+    } catch {
+      cleanupFailed = true;
+    } finally {
+      extensions.runtime.invalidate("Pi agent credential refresh finished");
+    }
+  }
+  if (cleanupFailed) {
+    throw new PiAgentGroupError("group", "could not settle extension preflight", "cleanup failed");
+  }
+}
+
+type IsolatedSettings = NonNullable<Parameters<typeof SettingsManager.inMemory>[0]>;
+
+/** In-memory settings for an isolated runtime: no discovered resources, no project trust. */
+function isolatedSettings(defaults: IsolatedSettings): SettingsManager {
+  return SettingsManager.inMemory(
+    { ...defaults, extensions: [], skills: [], prompts: [], themes: [] },
+    { projectTrusted: false },
+  );
+}
+
+/** Load only the given extension paths, and no other resources or context. */
+function isolatedResourceLoaderOptions(extensionPaths: readonly string[]) {
+  return {
+    additionalExtensionPaths: [...extensionPaths],
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    systemPromptOverride: () => undefined,
+    appendSystemPromptOverride: () => [],
+  };
 }
 
 function resolveGroupDispatch(
@@ -543,14 +712,7 @@ async function resolveChildExtensionProfile(
     cwd,
     agentDir,
     settingsManager: SettingsManager.inMemory({}, { projectTrusted: false }),
-    additionalExtensionPaths: candidateList.map((candidate) => candidate.path),
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-    systemPromptOverride: () => undefined,
-    appendSystemPromptOverride: () => [],
+    ...isolatedResourceLoaderOptions(candidateList.map((candidate) => candidate.path)),
   });
   let result: LoadExtensionsResult | undefined;
   let profile: ChildExtensionProfile | undefined;
@@ -632,7 +794,7 @@ async function offlineModelRuntime(signal: AbortSignal): Promise<ModelRuntime> {
     allowModelNetwork: false,
     refreshOnCreate: false,
     signal,
-    credentials: credentialStoreFromSnapshot(new Map(), signal),
+    credentials: credentialStoreFromSnapshot(new Map(), signal, readOnlyCredentials),
     modelsStore: emptyModelStore(signal),
   });
 }
@@ -800,28 +962,20 @@ function isReservedExtensionName(value: string): boolean {
   );
 }
 
+/**
+ * An isolated runtime's credentials: copies of a snapshot that never change. Pi writes a stored
+ * credential only to refresh or replace it, and isolated runtimes do neither. `refused` returns
+ * the error that rejects a write. The write's update, which would run the OAuth refresh, is
+ * never called.
+ */
 function credentialStoreFromSnapshot(
   snapshot: CredentialSnapshot,
   signal: AbortSignal,
+  refused: () => Error,
 ): CredentialStore {
   const entries = new Map(
     [...snapshot].map(([providerId, credential]) => [providerId, cloneCredential(credential)!]),
   );
-  const pending = new Map<string, Promise<Credential>>();
-  const enqueue = (
-    providerId: string,
-    operation: () => Promise<Credential>,
-  ): Promise<Credential> => {
-    const work = (pending.get(providerId) ?? Promise.resolve(undefined))
-      .catch(() => undefined)
-      .then(operation);
-    pending.set(providerId, work);
-    const release = () => {
-      if (pending.get(providerId) === work) pending.delete(providerId);
-    };
-    void work.then(release, release);
-    return work;
-  };
   return {
     async read(providerId) {
       signal.throwIfAborted();
@@ -834,23 +988,19 @@ function credentialStoreFromSnapshot(
         type: credential.type,
       }));
     },
-    async modify(providerId, update) {
-      return await enqueue(providerId, async () => {
-        signal.throwIfAborted();
-        const next = await update(cloneCredential(entries.get(providerId)));
-        signal.throwIfAborted();
-        if (next !== undefined) entries.set(providerId, cloneCredential(next)!);
-        return cloneCredential(entries.get(providerId));
-      });
+    async modify() {
+      signal.throwIfAborted();
+      throw refused();
     },
-    async delete(providerId) {
-      await enqueue(providerId, async () => {
-        signal.throwIfAborted();
-        entries.delete(providerId);
-        return undefined;
-      });
+    async delete() {
+      signal.throwIfAborted();
+      throw readOnlyCredentials();
     },
   };
+}
+
+function readOnlyCredentials(): Error {
+  return new Error("isolated agent credentials are read-only");
 }
 
 function modelStoreFromSnapshot(
@@ -962,7 +1112,9 @@ async function runOneAgent(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    failure = normalizeAgentError(request.id, error, abortKind, timeoutMs, options.signal);
+    failure =
+      session?.credentialFailure?.() ??
+      normalizeAgentError(request.id, error, abortKind, timeoutMs, options.signal);
   } finally {
     clearTimeout(timeout);
     options.signal.removeEventListener("abort", onAbort);
@@ -1045,28 +1197,30 @@ async function createSdkSession(
   signal: AbortSignal,
 ): Promise<PiAgentSession> {
   if (signal.aborted) throw cancellationError(request.id, signal.reason);
+  // The group refreshed the credential so that no child needs to. A child that would still
+  // need to refresh fails instead, before Pi runs the refresh.
+  let refreshFailure: PiAgentGroupError | undefined;
+  const refuseRefresh = () =>
+    (refreshFailure ??= new PiAgentGroupError(
+      request.id,
+      "would need to refresh OAuth credentials mid-group",
+      `${plan.dispatch.provider}; an agent group refreshes OAuth credentials only once, before it starts`,
+    ));
   let latestExtensions: LoadExtensionsResult | undefined;
   const runtime = await createAgentSessionRuntime(
     async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
-      const settingsManager = SettingsManager.inMemory(
-        {
-          defaultProvider: plan.dispatch.provider,
-          defaultModel: plan.dispatch.modelId,
-          defaultThinkingLevel: plan.dispatch.thinkingLevel,
-          extensions: [],
-          skills: [],
-          prompts: [],
-          themes: [],
-        },
-        { projectTrusted: false },
-      );
+      const settingsManager = isolatedSettings({
+        defaultProvider: plan.dispatch.provider,
+        defaultModel: plan.dispatch.modelId,
+        defaultThinkingLevel: plan.dispatch.thinkingLevel,
+      });
       // Skip the create-time refresh: createAgentSessionServices refreshes once, offline,
       // after it registers the admitted provider extension.
       const modelRuntime = await ModelRuntime.create({
         allowModelNetwork: false,
         refreshOnCreate: false,
         signal,
-        credentials: credentialStoreFromSnapshot(plan.credentialSnapshot, signal),
+        credentials: credentialStoreFromSnapshot(plan.credentialSnapshot, signal, refuseRefresh),
         modelsStore: modelStoreFromSnapshot(plan.dispatch.provider, plan.modelSnapshot, signal),
       });
       try {
@@ -1076,16 +1230,7 @@ async function createSdkSession(
           settingsManager,
           modelRuntime,
           modelRuntimeSignal: signal,
-          resourceLoaderOptions: {
-            additionalExtensionPaths: [...plan.extensionPaths],
-            noExtensions: true,
-            noSkills: true,
-            noPromptTemplates: true,
-            noThemes: true,
-            noContextFiles: true,
-            systemPromptOverride: () => undefined,
-            appendSystemPromptOverride: () => [],
-          },
+          resourceLoaderOptions: isolatedResourceLoaderOptions(plan.extensionPaths),
         });
         latestExtensions = services.resourceLoader.getExtensions();
         assertLoadedProfile(request.id, latestExtensions, plan.extensionPaths);
@@ -1133,7 +1278,12 @@ async function createSdkSession(
     });
     await session.bindExtensions({ mode: "print" });
     assertExactSession(request, session, plan.dispatch);
-    const auth = await runtime.services.modelRuntime.getAuth(session.model!, { signal });
+    let auth: Awaited<ReturnType<ModelRuntime["getAuth"]>>;
+    try {
+      auth = await runtime.services.modelRuntime.getAuth(session.model!, { signal });
+    } catch (error) {
+      throw refreshFailure ?? error;
+    }
     if (auth === undefined) {
       throw new PiAgentGroupError(
         request.id,
@@ -1167,6 +1317,7 @@ async function createSdkSession(
       subscribe: (listener) =>
         session.subscribe((event) => listener(event as unknown as PiAgentEvent)),
       abort: async () => await session.abort(),
+      credentialFailure: () => refreshFailure,
       dispose: async () => {
         if (disposed) return;
         disposed = true;

@@ -28,6 +28,23 @@ export default function nativeProvider(pi: ExtensionAPI): void {
           };
         },
       },
+      // A stored OAuth credential for this provider resolves through this method.
+      ...(process.env.PI_AGENT_FIXTURE_OAUTH === "1"
+        ? {
+            oauth: {
+              name: "Fixture provider OAuth",
+              async login(): Promise<never> {
+                throw new Error("fixture OAuth login is not interactive");
+              },
+              async refresh(): Promise<never> {
+                throw new Error("fixture OAuth must not refresh");
+              },
+              async toAuth(credential: { access: string }) {
+                return { apiKey: credential.access };
+              },
+            },
+          }
+        : {}),
     },
   });
 
