@@ -312,6 +312,65 @@ describe("sanity-check workflow", () => {
     expect(short.some((update) => update.type === "sanity-check.agent-label")).toBe(false);
   });
 
+  it("retries a complete-label update that the runtime rejected", async () => {
+    const model = `provider/${"m".repeat(250)}`;
+    const complete = `Review · ${model}`;
+    const published: Array<{ type: string; key: string; label: unknown }> = [];
+    let rejectedOnce = false;
+    setPiAgentGroupLauncher(async (requests, options) => {
+      for (const state of ["running", "running", "completed"] as const) {
+        await options.onLifecycle?.({
+          id: "review",
+          role: "Review",
+          elapsedMs: 1,
+          model,
+          state,
+          phase: state,
+        });
+      }
+      return requests.map((request) => ({
+        id: request.id,
+        text: JSON.stringify(review()),
+        model,
+        thinkingLevel: "high" as const,
+        durationMs: 1,
+      }));
+    });
+    const context = {
+      input: {},
+      outputs: { prepare: { mode: "serial" }, collectEvidence: evidence() },
+      results: {},
+      state: {},
+      signal: new AbortController().signal,
+      effect: {
+        type: "pi-workflows.sanity-check.review",
+        idempotencyKey: "review",
+        recovery: "manual",
+      },
+      publishUpdate: async (update: {
+        type: string;
+        key: string;
+        data: Record<string, unknown>;
+      }) => {
+        // The first complete-label update is rejected, as by the update rate limit.
+        if (update.type === "sanity-check.agent-label" && !rejectedOnce) {
+          rejectedOnce = true;
+          throw new Error("update rate limit exceeded");
+        }
+        published.push({ type: update.type, key: update.key, label: update.data.label });
+        return { updateId: "u", seq: published.length, at: "", type: update.type, key: update.key };
+      },
+    } as unknown as Parameters<NonNullable<typeof sanityCheckWorkflow.nodes.review.run>>[0];
+
+    await sanityCheckWorkflow.nodes.review.run!(context);
+
+    expect(rejectedOnce).toBe(true);
+    // The next lifecycle event for the key publishes the complete label again, once.
+    expect(published.filter((update) => update.type === "sanity-check.agent-label")).toEqual([
+      { type: "sanity-check.agent-label", key: "agents/review/review", label: complete },
+    ]);
+  });
+
   it("fails the review action with the launcher error and marks its progress failed", async () => {
     installFakeHost(() => new Error("Pi agent review failed: provider unavailable"));
     const result = await runAgentProbe("serial");

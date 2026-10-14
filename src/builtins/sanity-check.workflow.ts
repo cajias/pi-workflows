@@ -536,8 +536,8 @@ async function createAgentProgress(
 /**
  * Fit an agent track's label to the progress schema. A longer label, which only a long
  * provider or model ID makes, ends with `…`, and a `sanity-check.agent-label` update under
- * the same key keeps the complete label. That update is published again only when the
- * complete label changes.
+ * the same key keeps the complete label. After it is accepted, it is published again only
+ * when the complete label changes; a rejected one is retried with the key's next label.
  */
 function completeLabelKeeper(
   context: WorkflowActionContext,
@@ -546,14 +546,16 @@ function completeLabelKeeper(
   return async (key, label) => {
     if (label.length <= MAX_PROGRESS_LABEL_CHARS) return label;
     if (published.get(key) !== label) {
-      published.set(key, label);
-      await context
-        .publishUpdate({
+      try {
+        await context.publishUpdate({
           type: AGENT_LABEL_UPDATE_TYPE,
           key,
           data: { schema: AGENT_LABEL_SCHEMA, label },
-        })
-        .catch(() => undefined);
+        });
+        published.set(key, label);
+      } catch {
+        // A rejected or rate-limited update is not recorded, so the key's next label retries it.
+      }
     }
     // Never end on half of a surrogate pair.
     let end = MAX_PROGRESS_LABEL_CHARS - 1;

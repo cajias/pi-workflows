@@ -114,7 +114,7 @@ Sanity Check labels each agent progress track with the agent's role and verified
 }
 ```
 
-It publishes the update again only when the complete label changes. Labels within the limit need no such update.
+After the update is accepted, Sanity Check publishes it again only when the complete label changes. A rejected update, for example one over the update rate limit, is retried with the track's next update. Labels within the limit need no such update.
 
 ## Model-mediated observation
 
