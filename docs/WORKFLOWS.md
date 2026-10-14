@@ -1390,8 +1390,8 @@ See [RESOURCE_MANAGERS.md](RESOURCE_MANAGERS.md) for resource manager definition
 Headless Pi children start with `--no-extensions` and load only their bridge, so
 a provider that only a user extension registers is unknown there. Set
 `PI_WORKFLOWS_HEADLESS_EXTENSIONS` in the environment of whatever starts the
-workflow server to list absolute extension paths, separated by the platform
-path delimiter. A server that a Pi session starts inherits that session's
+workflow server to list the absolute paths of extension files, separated by the
+platform path delimiter. A server that a Pi session starts inherits that session's
 environment:
 
 ```bash
@@ -1405,12 +1405,21 @@ listed extension after its bridge. Select the extension's provider with
 
 - The opt-in is off by default, so headless children keep their default
   authority.
-- The server reads the list once at start and keeps it until it restarts.
-  `pi-workflows server status` reports it as `headlessExtensions`.
-- Each entry must be an absolute path that exists and is not part of
-  pi-workflows. One bad entry makes the whole list invalid. The server still
-  starts and reports the reason, and every headless child fails with it instead
-  of running without the extension.
+- The server reads the list once at start and keeps it until it restarts. After
+  changing the variable, restart the server with `pi-workflows server stop`.
+  `pi-workflows server status` reports it as `headlessExtensions`, with each
+  configured path and the real file behind it.
+- Each entry must be the absolute path of an extension file, such as
+  `<package>/dist/index.js` or `<package>/index.ts`, that is not part of
+  pi-workflows. A directory is refused: Pi would resolve it like a package and
+  could load other extension files, pi-workflows among them, plus the package's
+  skills, prompts, and themes. One bad entry makes the whole list invalid. The
+  server still starts and reports the reason, and every headless child fails
+  with it instead of running without the extension.
+- The server pins the real file behind each entry at start, and children load
+  that file. Before each launch, the runner checks every entry again and fails
+  that launch when the file is gone, no longer passes the checks, or now
+  resolves to another file.
 - The whole extension loads, with its tools, hooks, and commands, into every
   headless child for every run and project that the server handles.
 
@@ -1435,7 +1444,7 @@ Pi moves from step 3 to step 4 without a diagnostic when it cannot use the defau
 - the session did not start on that model; and
 - the child cannot use the default: it has no such provider, the provider has no such model, or the provider has no configured authentication. A usable default that a model scope leaves out is Pi's normal step 2 choice and is not an error.
 
-The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default, the settings file that sets each field, the reason, the model that Pi would have used, and the fixes: load the provider's extension through `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or with `-e`, name a model with `--provider` and `--model`, or change the default. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
+The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default, the settings file that sets each field, the reason, the model that Pi would have used, and the fixes: load the provider's extension through `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or with `-e`, name a model with `--provider` and `--model`, or change the default. It also says that the server reads `PI_WORKFLOWS_HEADLESS_EXTENSIONS` and its extra Pi arguments only when it starts, so a change needs `pi-workflows server stop`, and that `pi-workflows server status` shows the loaded `headlessExtensions`. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
 
 With no settings default, or with only one of the two fields, Pi ignores the default, as it does in an interactive session, and the step runs on Pi's first available model. Headless pi may lack the extension providers of an interactive session, so this choice can differ from the interactive one. Name a model with `--provider` and `--model` in the extra Pi arguments when the choice matters. If no model is available at all, Pi itself exits at start and the step fails with that exit.
 
