@@ -1902,12 +1902,13 @@ These are out of scope for this plan.
   - The test relies on `PI_CODING_AGENT_DIR` implicitly; comment that, or set it explicitly in
     the test environment.
 - F39: Let user workflows that reuse built-in Sanity Check nodes reach the runner's agent group
-  launcher.
+  launcher. _(done)_
   - Cause: `src/workflows/loader.ts:85-93` builds the jiti loader with `moduleCache: false` and
     the `@osolmaz/pi-workflows/builtins` aliases, so a user workflow that reuses Sanity Check
     nodes loads a fresh copy of the builtins and cannot reach the agent group launcher that the
     runner installs.
-  - In progress on `followups/f39-sanity-group-launcher` (`3c273d3`); not integrated.
+  - Done: the launcher lives in one `Symbol.for` slot on `globalThis`, so the fresh built-in
+    module copy that the workflow loader evaluates for a user file sees the runner's launcher.
 - F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
   builtin-autoimplement-forge.
   - Accepted on `followups/f40-load-sensitive-tests` (`1f52c8f`); not in this bundle. Live E2E:

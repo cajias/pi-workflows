@@ -94,11 +94,17 @@ export class PiAgentGroupError extends Error {
   }
 }
 
-let installedLauncher: PiAgentGroupLauncher | undefined;
+// The workflow loader evaluates user workflow files with a fresh copy of the built-in modules,
+// so a module-level variable would hide the runner's launcher from built-in nodes that a user
+// workflow reuses. One registered-symbol slot on `globalThis` is shared by every copy.
+const LAUNCHER_SLOT = Symbol.for("pi-workflows.pi-agent-group-launcher");
+type LauncherSlot = { [LAUNCHER_SLOT]?: PiAgentGroupLauncher };
+const launcherSlot: typeof globalThis & LauncherSlot = globalThis;
 
 /** Install the process-wide launcher, or remove it with `undefined`. The workflow runner owns it. */
 export function setPiAgentGroupLauncher(launcher: PiAgentGroupLauncher | undefined): void {
-  installedLauncher = launcher;
+  if (launcher === undefined) delete launcherSlot[LAUNCHER_SLOT];
+  else launcherSlot[LAUNCHER_SLOT] = launcher;
 }
 
 /** Run one isolated agent group through the installed launcher. */
@@ -106,6 +112,7 @@ export async function launchPiAgentGroup(
   requests: PiAgentRequest[],
   options: PiAgentGroupLaunchOptions,
 ): Promise<PiAgentResult[]> {
+  const installedLauncher = launcherSlot[LAUNCHER_SLOT];
   if (installedLauncher === undefined) {
     throw new PiAgentGroupError(
       "group",
