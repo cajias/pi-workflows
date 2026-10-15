@@ -268,8 +268,9 @@ async function pushRemote(repository: string, branch: string): Promise<string | 
 }
 
 /**
- * True when a fetch refspec of `remote` maps `refs/heads/<branch>` to `refs/remotes/<remote>/<branch>`
- * and no negative refspec excludes the branch. Git updates that ref on a successful push.
+ * True when the first positive fetch refspec of `remote` that maps `refs/heads/<branch>` maps it to
+ * `refs/remotes/<remote>/<branch>`, and no negative refspec excludes the branch. Git updates only
+ * that first match's target on a successful push, so a later refspec does not count.
  */
 async function fetchRefspecTracks(
   repository: string,
@@ -291,12 +292,15 @@ async function fetchRefspecTracks(
   ) {
     return false;
   }
-  return specs.some((spec) => {
+  for (const spec of specs) {
+    if (spec.startsWith("^")) continue;
     const positive = spec.replace(/^\+/, "");
     const colon = positive.indexOf(":");
-    if (colon < 0) return false;
-    return mapRefspec(positive.slice(0, colon), positive.slice(colon + 1), source) === target;
-  });
+    if (colon < 0) continue;
+    const mapped = mapRefspec(positive.slice(0, colon), positive.slice(colon + 1), source);
+    if (mapped !== undefined) return mapped === target;
+  }
+  return false;
 }
 
 /** Maps `name` through one refspec side pair. A side has at most one `*`, as Git requires. */
