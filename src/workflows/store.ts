@@ -1752,7 +1752,7 @@ export class WorkflowRunStore {
           database: this.state,
           now,
         });
-        context.revision = revision;
+        let committedRevision = revision;
         // The replaced attempt has ended, so its open tracks settle after run_resumed.
         for (const settled of settleAttemptProgress(
           this.state,
@@ -1764,8 +1764,10 @@ export class WorkflowRunStore {
           state.updates = updateProjection(state.updates, settled.record);
           state.traceSeq = settled.event.seq;
           recordViewerDeltas(this.state, runId, runViewerTargets(state, settled.event), now);
-          context.revision = settled.event.seq;
+          committedRevision = settled.event.seq;
         }
+        // Advance the cached revision only after every write that can still throw.
+        context.revision = committedRevision;
         accepted = traceEvent;
       });
       if (accepted === undefined) throw new Error("Workflow snapshot transaction did not commit");

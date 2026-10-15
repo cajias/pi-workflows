@@ -273,6 +273,58 @@ describe("progress of a cancelled run", () => {
     run.state.close();
   }, 60_000);
 
+  it("settles a waiting attempt's tracks when the missing-submission reminders run out", async () => {
+    const run = await startRun("missing-submission-fail");
+    const attemptId = run.runs.readRunState(run.runId)?.currentAttemptId;
+    if (attemptId === undefined) throw new Error("active attempt missing");
+    // The runner parks while the attempt waits for its interactive submission.
+    expect(run.queue.parkWorkflowRun({ runId: run.runId, claimToken: run.claimToken })).toBe(true);
+    run.engine.park();
+    await run.running;
+    run.state.connection
+      .prepare("UPDATE node_attempts SET status = 'waiting' WHERE attempt_id = ?")
+      .run(attemptId);
+    run.state.connection
+      .prepare("UPDATE runs SET status = 'waiting' WHERE run_id = ?")
+      .run(run.runId);
+    const before = run.runs.runRevision(run.runId);
+
+    // The same claim-then-fail sequence as the server's missing-submission failure.
+    const claimToken = "missing-submission-control";
+    run.state.transaction(() => {
+      expect(
+        run.queue.claimWorkflowRunForControl({
+          runId: run.runId,
+          runnerId: "server",
+          claimToken,
+          leaseMs: 30_000,
+        }),
+      ).toBeDefined();
+      expect(
+        run.queue.failWorkflowRun({
+          runId: run.runId,
+          claimToken,
+          errorCode: "missingSubmission",
+          errorMessage: "Workflow step ended without its required result after 3 reminders.",
+        }),
+      ).toBe(true);
+    });
+
+    // +2 for the claim and the failure, plus one for each settled track.
+    expect(run.runs.runRevision(run.runId)).toBe(before + 2 + open.length);
+    const loaded = run.runs.readRun(run.runId, { includeTrace: true });
+    expect(loaded?.state.status).toBe("failed");
+    expectSettled(loaded?.state.updates, attemptId, "failed");
+    expect(loaded?.traceEvents?.at(-1)?.type).toBe("run.queue_failed");
+    expect(
+      run.state.connection
+        .prepare("SELECT status FROM node_attempts WHERE attempt_id = ?")
+        .get(attemptId),
+    ).toEqual({ status: "failed" });
+    expect(workflowStateViolations(run.state)).toEqual([]);
+    run.state.close();
+  }, 60_000);
+
   it("settles open tracks when a paused run without a live claim is cancelled", async () => {
     const run = await startRun("paused-cancel");
     const attemptId = run.runs.readRunState(run.runId)?.currentAttemptId;

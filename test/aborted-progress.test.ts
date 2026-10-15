@@ -11,6 +11,7 @@ import { ClaimLostError } from "../src/workflows/errors.js";
 import { abortedAttemptProgress } from "../src/workflows/progress.js";
 import { WorkflowRunStore, readWorkflowRun } from "../src/workflows/store.js";
 import type {
+  AgentStepExecutor,
   WorkflowActionContext,
   WorkflowRunState,
   WorkflowTraceEvent,
@@ -202,6 +203,50 @@ describe("abortedAttemptProgress", () => {
     expect(abortedAttemptProgress(undefined, "a1", "cancelled")).toEqual([]);
   });
 });
+
+/**
+ * Run an action whose first attempt publishes `first` and hangs, park it, and
+ * return the parked run and that attempt's id. Later attempts publish nothing
+ * and hang, so the resumed run stays active until the test cancels it.
+ */
+async function parkedAction(name: string, first: WorkflowUpdateInput[]) {
+  const databasePath = await makeStateDatabasePath(name);
+  let published = 0;
+  let attempts = 0;
+  const workflow = defineWorkflow({
+    name,
+    startAt: "work",
+    nodes: {
+      work: action({
+        effect: idempotentEffect(`test.${name}`),
+        run: async ({ publishUpdate }) => {
+          attempts += 1;
+          if (attempts === 1) for (const update of first) await publishUpdate(update);
+          published = attempts;
+          return await hang();
+        },
+      }),
+    },
+    edges: [],
+  });
+  const engine = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
+  const running = engine.run(workflow, {});
+  await waitUntil(() => published === 1);
+  engine.park();
+  const parked = await running;
+  const store = new WorkflowRunStore(databasePath);
+  const parkedAttempt = store.readRunState(parked.runId)?.currentAttemptId;
+  if (parkedAttempt === undefined) throw new Error("parked attempt missing");
+  expect(await store.recoverApplyingEffects(parked.runId)).toBe("safe");
+  return {
+    databasePath,
+    workflow,
+    store,
+    runId: parked.runId,
+    parkedAttempt,
+    resumedStarted: () => published === 2,
+  };
+}
 
 describe("progress of aborted attempts", () => {
   it("settles open tracks of a timed-out action and keeps terminal and other updates", async () => {
@@ -711,6 +756,135 @@ describe("progress of aborted attempts", () => {
       later.filter((event) => event.type === "update_published" && event.attemptId === discarded),
     ).toEqual([]);
     store.close();
+  });
+
+  it("writes no settlement when a resume replaces an attempt without open tracks", async () => {
+    const run = await parkedAction("replaced-without-tracks", [track("done", "completed")]);
+    const engine = new WorkflowEngine({ store: run.store, executor: new ScriptedExecutor() });
+    const resumed = engine.resumeRun(run.workflow, run.runId);
+    await waitUntil(run.resumedStarted);
+
+    const { trace, updates } = durableUpdates(run.databasePath, run.runId);
+    const resumedAt = trace.findIndex((event) => event.type === "run_resumed");
+    // The resume commits only run_resumed (+1); the next revision is the new attempt.
+    expect(trace[resumedAt + 1]).toMatchObject({
+      type: "node_started",
+      seq: trace[resumedAt]!.seq + 1,
+    });
+    expect(trace.slice(resumedAt).filter((event) => event.type === "update_published")).toEqual([]);
+    expect(updates.get("done")).toMatchObject({
+      attemptId: run.parkedAttempt,
+      data: progress("completed"),
+    });
+    expect(
+      run.store.state.connection
+        .prepare("SELECT status FROM node_attempts WHERE attempt_id = ?")
+        .get(run.parkedAttempt),
+    ).toEqual({ status: "cancelled" });
+    engine.cancel();
+    await resumed;
+    run.store.close();
+  });
+
+  it("rolls back a resume and its cached revision when a settlement record fails", async () => {
+    const run = await parkedAction("rolled-back-resume", [track("open", "running")]);
+    const before = run.store.runRevision(run.runId);
+    run.store.state.connection.exec(
+      `CREATE TEMP TRIGGER reject_settlement BEFORE INSERT ON workflow_updates
+       BEGIN SELECT RAISE(ABORT, 'settlement rejected'); END`,
+    );
+    const engine = new WorkflowEngine({ store: run.store, executor: new ScriptedExecutor() });
+
+    await expect(engine.resumeRun(run.workflow, run.runId)).rejects.toThrow(/settlement rejected/);
+
+    // Only the resume preparation committed; the retirement and run_resumed rolled back.
+    const prepared = before + 1;
+    expect(run.store.runRevision(run.runId)).toBe(prepared);
+    const { trace, updates } = durableUpdates(run.databasePath, run.runId);
+    expect(trace.at(-1)).toMatchObject({ type: "run_resume_prepared", seq: prepared });
+    expect(updates.get("open")?.data).toEqual(progress("running"));
+    expect(
+      run.store.state.connection
+        .prepare("SELECT status FROM node_attempts WHERE attempt_id = ?")
+        .get(run.parkedAttempt),
+    ).toEqual({ status: "interrupted" });
+    run.store.state.connection.exec("DROP TRIGGER reject_settlement");
+
+    // The cached revision did not advance past the rollback, so the next write
+    // through the same store is accepted.
+    const accepted = await run.store.publishUpdate(
+      run.runId,
+      "work",
+      run.parkedAttempt,
+      track("open", "running", { phase: "after rollback" }),
+    );
+    expect(accepted.event.seq).toBe(prepared + 1);
+    run.store.close();
+  });
+
+  it("keeps the tracks of an attempt that a resume keeps", async () => {
+    const databasePath = await makeStateDatabasePath("kept-tracks");
+    const workflow = defineWorkflow({
+      name: "kept-tracks",
+      startAt: "ask",
+      nodes: { ask: agent({ prompt: () => "answer" }) },
+      edges: [],
+    });
+    let firstStarted = false;
+    const first: AgentStepExecutor = {
+      enforcesToolAllowlist: true,
+      assistantMessageMode: "visible",
+      runAgentStep: async (request, signal) => {
+        await request.publishUpdate?.(track("agents/ask", "running", { label: "Ask" }));
+        firstStarted = true;
+        return await new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    };
+    const parkedEngine = new WorkflowEngine({ databasePath, executor: first });
+    const running = parkedEngine.run(workflow, {});
+    await waitUntil(() => firstStarted);
+    parkedEngine.park();
+    const parked = await running;
+    const recovery = new WorkflowRunStore(databasePath);
+    const kept = recovery.readRunState(parked.runId)?.currentAttemptId;
+    recovery.close();
+    if (kept === undefined) throw new Error("parked attempt missing");
+
+    let seenByResumedAttempt: WorkflowUpdateRecord | undefined;
+    let resumedAttemptId: string | undefined;
+    const second: AgentStepExecutor = {
+      enforcesToolAllowlist: true,
+      assistantMessageMode: "visible",
+      runAgentStep: async (request) => {
+        resumedAttemptId = request.contract.attemptId;
+        seenByResumedAttempt = durableUpdates(databasePath, parked.runId).updates.get("agents/ask");
+        const accepted = await request.accept({ done: true });
+        if (!accepted.ok) throw new Error(accepted.error);
+        return { output: accepted.value };
+      },
+    };
+    const resumed = await new WorkflowEngine({ databasePath, executor: second }).resumeRun(
+      workflow,
+      parked.runId,
+      { resumeInteractionAttemptId: kept },
+    );
+
+    expect(resumed.state.status).toBe("completed");
+    expect(resumedAttemptId).toBe(kept);
+    expect(seenByResumedAttempt).toMatchObject({
+      attemptId: kept,
+      data: progress("running", { label: "Ask" }),
+    });
+    const { trace } = durableUpdates(databasePath, parked.runId);
+    const resumedEvent = trace.find((event) => event.type === "run_resumed");
+    expect(resumedEvent?.payload.resumedAttemptId).toBe(kept);
+    expect(
+      trace.filter(
+        (event) => event.type === "update_published" && event.seq > (resumedEvent?.seq ?? 0),
+      ),
+    ).toEqual([]);
   });
 
   it("writes no settlement when a run is cancelled at a pause boundary", async () => {
