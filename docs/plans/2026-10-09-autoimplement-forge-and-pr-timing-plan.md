@@ -1910,9 +1910,11 @@ These are out of scope for this plan.
   - Done: the launcher lives in one `Symbol.for` slot on `globalThis`, so the fresh built-in
     module copy that the workflow loader evaluates for a user file sees the runner's launcher.
 - F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
-  builtin-autoimplement-forge.
-  - Accepted on `followups/f40-load-sensitive-tests` (`1f52c8f`); not in this bundle. Live E2E:
-    waived under the human's no-live/no-billable rule for F35-F41.
+  builtin-autoimplement-forge. _(done)_
+  - Root cause was quadratic run persistence, not test waits: every transition rewrote every
+    recorded attempt. Now each transition syncs only new attempts and attempts that newer
+    session entries relink, and it reuses prepared statements. A row-equivalence test and a
+    per-transition statement-count guard cover this. The suites pass 10/10 under 36-core load.
   - Review P2s left unfixed: the sync-position map never shrinks, consistent with the existing
     contexts map; the full-sync baseline test runs the new code; and the Buffer helper's failure
     message is less detailed.

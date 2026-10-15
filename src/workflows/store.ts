@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
 import { closeAttemptTime, closeRunTime } from "../state/attempt-time.js";
 import { StateDatabase, workflowStatePath } from "../state/database.js";
 import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
@@ -243,6 +244,15 @@ type RunContext = {
   revision: number;
   lock: Promise<void>;
 };
+
+type PreparedStatement = Database.Statement<unknown[]>;
+
+/**
+ * What one committed node attempt sync wrote for a run: the recorded step count and the
+ * last session entry it considered. Later syncs rewrite only new steps and steps that
+ * newer session entries can relink.
+ */
+type AttemptSyncCursor = { steps: number; entrySeq: number };
 
 type RunRow = {
   runId: string;
@@ -509,6 +519,9 @@ export class WorkflowRunStore {
   private readonly snapshotLifecycle: WorkflowRunStoreOptions["snapshotLifecycle"];
   private readonly allowServerSessionRecording: boolean;
   private readonly contexts = new Map<string, RunContext>();
+  private readonly statements = new Map<string, PreparedStatement>();
+  private readonly attemptSyncCursors = new Map<string, AttemptSyncCursor>();
+  private readonly pendingAttemptSyncCursors = new Map<string, AttemptSyncCursor>();
   private readonly ownsState: boolean;
   private readonly mutations: StateMutationStore;
   private readonly workflowMessages: WorkflowMessageStore;
@@ -536,6 +549,8 @@ export class WorkflowRunStore {
 
   /** Server-only synchronization after a queue lifecycle mutation on the run resource. */
   synchronizeRevision(runId: string): number {
+    // Another writer may have advanced the run, so the next sync rewrites every step.
+    this.attemptSyncCursors.delete(runId);
     const revision = this.resourceRevision(runId);
     const context = this.contexts.get(runId);
     if (context === undefined) {
@@ -2634,10 +2649,39 @@ export class WorkflowRunStore {
     });
     await prior;
     try {
-      return await operation();
+      const result = await operation();
+      this.settleAttemptSyncCursor(runId, true);
+      return result;
+    } catch (error) {
+      this.settleAttemptSyncCursor(runId, false);
+      throw error;
     } finally {
       release?.();
     }
+  }
+
+  /**
+   * Keep a sync cursor only after its transaction committed. A failed or still-open
+   * transaction drops the cursor, so the next sync rewrites every step.
+   */
+  private settleAttemptSyncCursor(runId: string, succeeded: boolean): void {
+    const pending = this.pendingAttemptSyncCursors.get(runId);
+    this.pendingAttemptSyncCursors.delete(runId);
+    if (!succeeded || this.state.connection.inTransaction) {
+      this.attemptSyncCursors.delete(runId);
+      return;
+    }
+    if (pending !== undefined) this.attemptSyncCursors.set(runId, pending);
+  }
+
+  /** Reuse one prepared statement per SQL text on this store's connection. */
+  private statement(sql: string): PreparedStatement {
+    let statement = this.statements.get(sql);
+    if (statement === undefined) {
+      statement = this.state.connection.prepare(sql);
+      this.statements.set(sql, statement);
+    }
+    return statement;
   }
 
   private assertSessionWriteAuthority(runId: string): void {
@@ -3229,80 +3273,37 @@ export class WorkflowRunStore {
     snapshot: WorkflowDefinitionSnapshot,
     now: number,
   ): void {
-    for (const step of state.steps) {
-      closeAttemptTime(this.state, step.attemptId);
-      const promptEntryId = this.findAttemptPromptEntry(state.runId, step.attemptId);
-      const promptHash =
-        promptEntryId === undefined && step.prompt !== null
-          ? this.state.putText(step.prompt, now)
-          : null;
-      const receipt = attemptReceipt(step);
-      const receiptHash =
-        Object.keys(receipt).length === 0 ? null : this.state.putJson(receipt, now);
-      const outputHash = step.output === undefined ? null : this.state.putJson(step.output, now);
-      const errorHash = step.error === undefined ? null : this.state.putText(step.error, now);
-      const existing = this.state.connection
-        .prepare("SELECT attempt_id AS attemptId FROM node_attempts WHERE attempt_id = ?")
-        .get(step.attemptId);
-      if (existing === undefined) {
-        const attemptNumber = this.nextAttemptNumber(state.runId, step.nodeId);
-        this.state.connection
-          .prepare(
-            `INSERT INTO node_attempts(
-               attempt_id, run_id, node_id, attempt_number, node_type, status,
-               prompt_hash, output_hash, receipt_hash, error_hash,
-               settings_scope_id, settings_change_number, settings_hash,
-               started_at, finished_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            step.attemptId,
-            state.runId,
-            step.nodeId,
-            attemptNumber,
-            step.nodeType,
-            outcomeStatus(step.outcome),
-            promptHash,
-            outputHash,
-            receiptHash,
-            errorHash,
-            step.settingsScopeId ?? null,
-            step.settingsChangeNumber ?? null,
-            step.settingsHash === undefined ? null : Buffer.from(step.settingsHash, "hex"),
-            Date.parse(step.startedAt),
-            Date.parse(step.finishedAt),
-            Date.parse(step.startedAt),
-            now,
-          );
-      } else {
-        this.state.connection
-          .prepare(
-            `UPDATE node_attempts
-             SET status = ?, prompt_hash = ?, output_hash = ?, receipt_hash = ?, error_hash = ?,
-                 settings_scope_id = ?, settings_change_number = ?,
-                 settings_hash = ?, finished_at = ?, updated_at = ?
-             WHERE attempt_id = ?`,
-          )
-          .run(
-            outcomeStatus(step.outcome),
-            promptHash,
-            outputHash,
-            receiptHash,
-            errorHash,
-            step.settingsScopeId ?? null,
-            step.settingsChangeNumber ?? null,
-            step.settingsHash === undefined ? null : Buffer.from(step.settingsHash, "hex"),
-            Date.parse(step.finishedAt),
-            now,
-            step.attemptId,
-          );
-      }
-      if (this.syncAttemptEntries(state.runId, step, promptEntryId)) {
-        this.state.connection
-          .prepare("UPDATE node_attempts SET output_hash = NULL WHERE attempt_id = ?")
-          .run(step.attemptId);
+    const runId = state.runId;
+    const entrySeq = this.lastSessionEntrySeq(runId);
+    const cursor = this.attemptSyncCursors.get(runId);
+    const recorded =
+      cursor !== undefined &&
+      cursor.steps <= state.steps.length &&
+      cursor.steps === this.runStepCount(runId)
+        ? cursor.steps
+        : 0;
+    if (recorded > 0 && cursor !== undefined) {
+      // Recorded steps were written by a committed sync and change only through newer
+      // session entries. Close their intervals and refresh updated_at in two statements, as
+      // the per-step rewrite did, and rewrite only steps that newer entries can relink.
+      this.statement(
+        `UPDATE attempt_active_intervals SET ended_at = observed_at
+         WHERE ended_at IS NULL
+           AND attempt_id IN (SELECT attempt_id FROM run_steps WHERE run_id = ?)`,
+      ).run(runId);
+      this.statement(
+        `UPDATE node_attempts SET updated_at = ?
+         WHERE attempt_id IN (SELECT attempt_id FROM run_steps WHERE run_id = ?)`,
+      ).run(now, runId);
+      const relinked =
+        entrySeq > cursor.entrySeq
+          ? this.attemptsRelinkedByEntries(runId, state.steps.slice(0, recorded), cursor.entrySeq)
+          : new Set<string>();
+      for (const step of state.steps.slice(0, recorded)) {
+        if (relinked.has(step.attemptId)) this.syncNodeAttempt(state, step, now);
       }
     }
+    for (const step of state.steps.slice(recorded)) this.syncNodeAttempt(state, step, now);
     if (state.currentAttemptId !== undefined && state.currentNode !== undefined) {
       this.ensureAttempt(state, state.currentNode, state.currentAttemptId, now, snapshot);
       if (state.currentNodeTimeoutMs !== undefined) {
@@ -3316,14 +3317,147 @@ export class WorkflowRunStore {
       }
     }
     this.syncRunSteps(state);
+    this.pendingAttemptSyncCursors.set(runId, { steps: state.steps.length, entrySeq });
+  }
+
+  private syncNodeAttempt(state: WorkflowRunState, step: WorkflowStepRecord, now: number): void {
+    closeAttemptTime(this.state, step.attemptId);
+    const promptEntryId = this.findAttemptPromptEntry(state.runId, step.attemptId);
+    const promptHash =
+      promptEntryId === undefined && step.prompt !== null
+        ? this.state.putText(step.prompt, now)
+        : null;
+    const receipt = attemptReceipt(step);
+    const receiptHash = Object.keys(receipt).length === 0 ? null : this.state.putJson(receipt, now);
+    const outputHash = step.output === undefined ? null : this.state.putJson(step.output, now);
+    const errorHash = step.error === undefined ? null : this.state.putText(step.error, now);
+    const existing = this.statement(
+      "SELECT attempt_id AS attemptId FROM node_attempts WHERE attempt_id = ?",
+    ).get(step.attemptId);
+    if (existing === undefined) {
+      const attemptNumber = this.nextAttemptNumber(state.runId, step.nodeId);
+      this.statement(
+        `INSERT INTO node_attempts(
+           attempt_id, run_id, node_id, attempt_number, node_type, status,
+           prompt_hash, output_hash, receipt_hash, error_hash,
+           settings_scope_id, settings_change_number, settings_hash,
+           started_at, finished_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        step.attemptId,
+        state.runId,
+        step.nodeId,
+        attemptNumber,
+        step.nodeType,
+        outcomeStatus(step.outcome),
+        promptHash,
+        outputHash,
+        receiptHash,
+        errorHash,
+        step.settingsScopeId ?? null,
+        step.settingsChangeNumber ?? null,
+        step.settingsHash === undefined ? null : Buffer.from(step.settingsHash, "hex"),
+        Date.parse(step.startedAt),
+        Date.parse(step.finishedAt),
+        Date.parse(step.startedAt),
+        now,
+      );
+    } else {
+      this.statement(
+        `UPDATE node_attempts
+         SET status = ?, prompt_hash = ?, output_hash = ?, receipt_hash = ?, error_hash = ?,
+             settings_scope_id = ?, settings_change_number = ?,
+             settings_hash = ?, finished_at = ?, updated_at = ?
+         WHERE attempt_id = ?`,
+      ).run(
+        outcomeStatus(step.outcome),
+        promptHash,
+        outputHash,
+        receiptHash,
+        errorHash,
+        step.settingsScopeId ?? null,
+        step.settingsChangeNumber ?? null,
+        step.settingsHash === undefined ? null : Buffer.from(step.settingsHash, "hex"),
+        Date.parse(step.finishedAt),
+        now,
+        step.attemptId,
+      );
+    }
+    if (this.syncAttemptEntries(state.runId, step, promptEntryId)) {
+      this.statement("UPDATE node_attempts SET output_hash = NULL WHERE attempt_id = ?").run(
+        step.attemptId,
+      );
+    }
+  }
+
+  private lastSessionEntrySeq(runId: string): number {
+    const row = this.statement(
+      "SELECT COALESCE(MAX(run_seq), 0) AS count FROM session_entries WHERE run_id = ?",
+    ).get(runId);
+    /* istanbul ignore if -- exact schema and internal query shape */
+    if (!isCountRow(row)) throw new Error("Workflow session entry sequence is unavailable");
+    return row.count;
+  }
+
+  private runStepCount(runId: string): number {
+    const row = this.statement("SELECT count(*) AS count FROM run_steps WHERE run_id = ?").get(
+      runId,
+    );
+    /* istanbul ignore if -- exact schema and internal query shape */
+    if (!isCountRow(row)) throw new Error("Workflow run step count is unavailable");
+    return row.count;
+  }
+
+  /**
+   * Recorded attempts whose prompt or entry links can change because of session entries
+   * after `afterSeq`: a newer step prompt entry for the attempt, or a newer entry that
+   * reuses an id the attempt links or names.
+   */
+  private attemptsRelinkedByEntries(
+    runId: string,
+    steps: WorkflowStepRecord[],
+    afterSeq: number,
+  ): Set<string> {
+    const entries = this.statement(
+      `SELECT e.entry_id AS entryId,
+              CASE WHEN json_extract(CAST(b.content AS TEXT), '$.customType') = 'pi-workflows-step'
+                THEN json_extract(CAST(b.content AS TEXT), '$.details.contract.attemptId')
+              END AS promptAttemptId
+       FROM session_entries e JOIN blobs b ON b.blob_hash = e.entry_hash
+       WHERE e.run_id = ? AND e.run_seq > ?`,
+    )
+      .all(runId, afterSeq)
+      .flatMap(newSessionEntry);
+    const entryIds = new Set(entries.map((entry) => entry.entryId));
+    const relinked = new Set(entries.flatMap((entry) => entry.promptAttemptId ?? []));
+    const linked = this.statement(
+      `SELECT DISTINCT ae.attempt_id AS attemptId
+       FROM attempt_entries ae JOIN run_steps s ON s.attempt_id = ae.attempt_id
+       WHERE s.run_id = ? AND ae.entry_id IN (
+         SELECT entry_id FROM session_entries WHERE run_id = ? AND run_seq > ?
+       )`,
+    )
+      .all(runId, runId, afterSeq)
+      .filter(isAttemptIdRow);
+    for (const row of linked) relinked.add(row.attemptId);
+    for (const step of steps) {
+      const named = [
+        step.conversation?.firstEntryId,
+        step.conversation?.lastEntryId,
+        step.assistantMessage?.entryId,
+      ];
+      if (named.some((entryId) => entryId !== undefined && entryIds.has(entryId))) {
+        relinked.add(step.attemptId);
+      }
+    }
+    return relinked;
   }
 
   private syncRunSteps(state: WorkflowRunState): void {
-    const existingRows = this.state.connection
-      .prepare(
-        `SELECT step_index AS stepIndex, attempt_id AS attemptId
-         FROM run_steps WHERE run_id = ? ORDER BY step_index`,
-      )
+    const existingRows = this.statement(
+      `SELECT step_index AS stepIndex, attempt_id AS attemptId
+       FROM run_steps WHERE run_id = ? ORDER BY step_index`,
+    )
       .all(state.runId)
       .filter(isRunStepIdentityRow);
     if (existingRows.length > state.steps.length) {
@@ -3338,16 +3472,14 @@ export class WorkflowRunStore {
       const step = state.steps[stepIndex];
       /* istanbul ignore if -- array index follows a checked bound */
       if (step === undefined) throw new Error("Workflow run step became unavailable");
-      const attempt = this.state.connection
-        .prepare("SELECT run_id AS runId FROM node_attempts WHERE attempt_id = ?")
-        .get(step.attemptId) as { runId: string } | undefined;
+      const attempt = this.statement(
+        "SELECT run_id AS runId FROM node_attempts WHERE attempt_id = ?",
+      ).get(step.attemptId) as { runId: string } | undefined;
       if (attempt?.runId !== state.runId) throw new Error("A run cannot own another run's step");
-      this.state.connection
-        .prepare(
-          `INSERT INTO run_steps(run_id, step_index, attempt_id)
-           VALUES (?, ?, ?)`,
-        )
-        .run(state.runId, stepIndex, step.attemptId);
+      this.statement(
+        `INSERT INTO run_steps(run_id, step_index, attempt_id)
+         VALUES (?, ?, ?)`,
+      ).run(state.runId, stepIndex, step.attemptId);
     }
   }
 
@@ -3369,15 +3501,13 @@ export class WorkflowRunStore {
     }
     let responseLinked = false;
     for (const [role, entryId] of links) {
-      const row = this.state.connection
-        .prepare(
-          `SELECT e.segment_id AS segmentId, e.entry_hash AS entryHash
-           FROM session_entries e
-           JOIN session_segments s ON s.segment_id = e.segment_id
-           WHERE s.run_id = ? AND e.entry_id = ?
-           ORDER BY e.recorded_at DESC LIMIT 1`,
-        )
-        .get(runId, entryId);
+      const row = this.statement(
+        `SELECT e.segment_id AS segmentId, e.entry_hash AS entryHash
+         FROM session_entries e
+         JOIN session_segments s ON s.segment_id = e.segment_id
+         WHERE s.run_id = ? AND e.entry_id = ?
+         ORDER BY e.recorded_at DESC LIMIT 1`,
+      ).get(runId, entryId);
       if (!isSegmentIdentityRow(row)) continue;
       if (role === "response") {
         const output = assistantOutputFromEntry(
@@ -3391,32 +3521,28 @@ export class WorkflowRunStore {
           throw new Error(`Assistant response entry conflicts with attempt ${step.attemptId}`);
         }
       }
-      this.state.connection
-        .prepare(
-          `INSERT INTO attempt_entries(attempt_id, role, segment_id, entry_id)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(attempt_id, role) DO UPDATE SET
-             segment_id = excluded.segment_id, entry_id = excluded.entry_id`,
-        )
-        .run(step.attemptId, role, row.segmentId, entryId);
+      this.statement(
+        `INSERT INTO attempt_entries(attempt_id, role, segment_id, entry_id)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(attempt_id, role) DO UPDATE SET
+           segment_id = excluded.segment_id, entry_id = excluded.entry_id`,
+      ).run(step.attemptId, role, row.segmentId, entryId);
       if (role === "response") responseLinked = true;
     }
     return responseLinked;
   }
 
   private findAttemptPromptEntry(runId: string, attemptId: string): string | undefined {
-    const row = this.state.connection
-      .prepare(
-        `SELECT e.entry_id AS entryId
-         FROM session_entries e
-         JOIN session_segments s ON s.segment_id = e.segment_id
-         JOIN blobs b ON b.blob_hash = e.entry_hash
-         WHERE s.run_id = ?
-           AND json_extract(CAST(b.content AS TEXT), '$.customType') = 'pi-workflows-step'
-           AND json_extract(CAST(b.content AS TEXT), '$.details.contract.attemptId') = ?
-         ORDER BY e.recorded_at DESC LIMIT 1`,
-      )
-      .get(runId, attemptId);
+    const row = this.statement(
+      `SELECT e.entry_id AS entryId
+       FROM session_entries e
+       JOIN session_segments s ON s.segment_id = e.segment_id
+       JOIN blobs b ON b.blob_hash = e.entry_hash
+       WHERE s.run_id = ?
+         AND json_extract(CAST(b.content AS TEXT), '$.customType') = 'pi-workflows-step'
+         AND json_extract(CAST(b.content AS TEXT), '$.details.contract.attemptId') = ?
+       ORDER BY e.recorded_at DESC LIMIT 1`,
+    ).get(runId, attemptId);
     return isEntryIdentityRow(row) ? row.entryId : undefined;
   }
 
@@ -5087,6 +5213,18 @@ function isSegmentIdentityRow(value: unknown): value is { segmentId: string; ent
 
 function isEntryIdentityRow(value: unknown): value is { entryId: string } {
   return isRecord(value) && typeof value.entryId === "string";
+}
+
+function newSessionEntry(value: unknown): { entryId: string; promptAttemptId?: string }[] {
+  if (!isRecord(value) || typeof value.entryId !== "string") return [];
+  // A non-string attempt id never matches the per-attempt prompt lookup.
+  return typeof value.promptAttemptId === "string"
+    ? [{ entryId: value.entryId, promptAttemptId: value.promptAttemptId }]
+    : [{ entryId: value.entryId }];
+}
+
+function isAttemptIdRow(value: unknown): value is { attemptId: string } {
+  return isRecord(value) && typeof value.attemptId === "string";
 }
 
 function isActiveAttemptRow(value: unknown): value is {
