@@ -1621,11 +1621,13 @@ These are out of scope for this plan.
   - With `+refs/heads/feat/*:refs/remotes/origin/feat-alias/*` before
     `+refs/heads/*:refs/remotes/origin/*`, a push updates only `origin/feat-alias/<name>`, while
     the code trusts a stale `origin/feat/<name>`, so every reviewed publish fails.
-  - Take the first positive refspec that matches and compare only its target.
+  - Take the first positive refspec that matches and compare only its target. _(done)_
+  - `fetchRefspecTracks` now skips negative refspecs and refspecs without a target, and compares only the first match's target.
 - F12: Restore two no-reflog test cases (review N6) in "falls back to the ref value when Git keeps
   no reflog for it" (`test/builtin-autoimplement-pr-timing.test.ts`):
   - an accepted `verifyP2` as the newest published head;
-  - a failed `publish` that does not count as a published head.
+  - a failed `publish` that does not count as a published head. _(done)_
+  - Both cases are back in that test, which now also pushes a P2 commit without a reflog.
 - F13: Keep a `verifyP2` push excused across a runner restart (review R1).
   - The gap: a P2 commit is unreviewed, so only its `verifyP2` attempt window excuses its push in
     `publicationPush` (`src/builtins/autoimplement.workflow.ts`). A resume marks the interrupted
@@ -1641,7 +1643,8 @@ These are out of scope for this plan.
   - Scenario: `core.logAllRefUpdates=false`. A reviewed publish pushes H and then fails or is
     lost. The `commitLocal` after the repair is rejected with "moved to H, a commit this run did
     not publish".
-  - Fix: also accept when `revisionPassesGate(steps, id, tracking.headRevision)` holds.
+  - Fix: also accept when `revisionPassesGate(steps, id, tracking.headRevision)` holds. _(done)_
+  - The no-reflog fallback now accepts a gate-passing ref value first; a new test covers a failed reviewed publish.
 - F15: Skip the push check in `verifyP2Local` under `early` timing (review R3). Track it with F2.
   - The gap: `verifyP2Local` calls `assertNotPushedBeforeGate` even when `publicationTiming` is
     `early`.
