@@ -1666,7 +1666,8 @@ function secondOverlaps(seconds: number, from: number, to: number): boolean {
  *   excused;
  * - it pushed a head that an accepted `publish` or `verifyP2` recorded; or
  * - it happened during a `verifyP2` attempt, which may have failed after pushing. P2 work is pushed
- *   without another review, so only its attempt window identifies it.
+ *   without another review, so only its attempt window identifies it. An attempt that a runner
+ *   restart interrupted has no step record, so its window comes from `unrecordedAttempts`.
  *
  * A `publish` attempt's window alone excuses nothing, because a reviewed publication must push only
  * the reviewed head.
@@ -1675,6 +1676,17 @@ function publicationPush(context: WorkflowNodeContext, id: string, update: RefUp
   const steps = context.state.steps;
   return (
     revisionPassesGate(steps, id, update.headRevision) ||
+    (context.state.unrecordedAttempts ?? []).some(
+      (attempt) =>
+        attempt.nodeId === "verifyP2" &&
+        secondOverlaps(
+          update.seconds,
+          Date.parse(attempt.startedAt),
+          attempt.finishedAt === undefined
+            ? Number.POSITIVE_INFINITY
+            : Date.parse(attempt.finishedAt),
+        ),
+    ) ||
     steps.some(
       (step) =>
         PUSHING_NODES.has(step.nodeId) &&

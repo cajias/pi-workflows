@@ -1485,6 +1485,8 @@ type RunOptions = {
   commitLocal?: (request: AgentStepRequest, work: LocalWork) => Promise<AgentStepSubmission>;
   /** Replaces the scripted fix answer. */
   fix?: (request: AgentStepRequest, work: LocalWork) => Promise<AgentStepSubmission>;
+  /** Replaces the scripted verifyP2 answer. */
+  verifyP2?: (request: AgentStepRequest, work: LocalWork) => Promise<AgentStepSubmission>;
 };
 
 /** A tracked CI assessment of the one fixture repository. */
@@ -1559,13 +1561,18 @@ function timingScenario(options: RunOptions) {
         repositories: localCommit(await work.commit("p2")).repositories,
       }),
     )
-    .respond("verifyP2", async (request) =>
-      acceptedOutput(request, {
-        passed: true,
-        commands: [{ command: "npm test", outcome: "passed" }],
-        pushed: true,
-        repositories: published(repository, work.head, pr).repositories,
-      }),
+    .respond(
+      "verifyP2",
+      options.verifyP2 === undefined
+        ? async (request) =>
+            acceptedOutput(request, {
+              passed: true,
+              commands: [{ command: "npm test", outcome: "passed" }],
+              pushed: true,
+              repositories: published(repository, work.head, pr).repositories,
+            })
+        : async (request) =>
+            await (options.verifyP2 as NonNullable<RunOptions["verifyP2"]>)(request, work),
     )
     .respond("inspectComments", ...(options.comments ?? [NO_ACTIONABLE_COMMENTS]))
     .respond(
@@ -2140,6 +2147,116 @@ describe.each(["github", "gitlab"] as const)(
         expect(ids.indexOf("fix")).toBeGreaterThan(state.steps.indexOf(publishes[0]!));
         expect(okSteps(state, "publish").map(headsOf)).toEqual([[scenario.work.head]]);
         expect(scenario.work.head).not.toBe(reviewedHead);
+      },
+      GRAPH_RUN_TIMEOUT_MS,
+    );
+  },
+);
+
+describe.each(["github", "gitlab"] as const)(
+  "autoimplement %s × end repair after a runner restart during a P2 push",
+  (forge) => {
+    it(
+      "accepts the P2 commit that the lost verifyP2 attempt pushed and commits the repair",
+      async () => {
+        await addBareOrigin(fixture.repository);
+        const databasePath = await makeStateDatabasePath(`autoimplement-${forge}-restart-p2`);
+        let engine: WorkflowEngine | undefined;
+        let attempts = 0;
+        let reviewedAgain = false;
+        let repaired = false;
+        let p2Head = "";
+        let localCommits = 0;
+        let pushedSecond = 0;
+        const refused: string[] = [];
+        const scenario = timingScenario({
+          forge,
+          prTiming: "end",
+          reviews: [{ p2: ["tidy"] }, { p2: ["tidy"] }, {}],
+          publish: async (request, local) => {
+            await git(fixture.repository, ["push", "-q", "-u", "origin", "feat/demo"]);
+            return await acceptedOutput(
+              request,
+              published(fixture.repository, local.head, prFor(forge)),
+            );
+          },
+          verifyP2: async (request, local) => {
+            attempts += 1;
+            if (attempts === 1) {
+              // The runner stops after the P2 push. Parking never records the attempt, so no step
+              // record keeps its window, as after a restart.
+              p2Head = await local.commit("p2-pushed");
+              pushedSecond = Math.floor(Date.now() / 1000);
+              await pushAt(fixture.repository, new Date(pushedSecond * 1000).toISOString());
+              engine?.park();
+              return await new Promise<AgentStepSubmission>(() => {});
+            }
+            // The replacement reports a head other than the pushed one, so it fails.
+            const result = await request.accept({
+              passed: true,
+              commands: [{ command: "npm test", outcome: "passed" }],
+              pushed: true,
+              repositories: published(fixture.repository, fixture.baseRevision, prFor(forge))
+                .repositories,
+            });
+            if (result.ok) throw new Error("the replacement verifyP2 must be rejected");
+            throw new Error(result.error);
+          },
+          commitLocal: async (request, local) => {
+            localCommits += 1;
+            const result = await request.accept({
+              repositories: [localRecord(await local.commit(`local-${localCommits}`))],
+            });
+            if (!result.ok) {
+              refused.push(result.error);
+              throw new Error(result.error);
+            }
+            return { output: result.value };
+          },
+          decide: (request) => {
+            const observation = observationOf(request);
+            const latest = observation.latestAttempt;
+            if (latest?.nodeId === "commitLocal" && latest.outcome === "failed") {
+              return controlDecision("blocked", "The local commit was rejected.");
+            }
+            if (latest?.nodeId === "verifyP2" && latest.outcome === "failed" && !repaired) {
+              repaired = true;
+              return controlDecision("repair", "Repair after the failed P2 verification.");
+            }
+            if (
+              !reviewedAgain &&
+              observation.availableRoutes.includes("comments") &&
+              observation.availableRoutes.includes("review")
+            ) {
+              reviewedAgain = true;
+              return controlDecision("review", "Review the published P2 head.");
+            }
+            return chooseFirstControlRoute(request);
+          },
+        });
+        engine = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const parked = await engine.run(autoimplementWorkflow, scenario.input);
+        expect(parked.state.status).toBe("running");
+        expect(parked.state.steps.some((entry) => entry.nodeId === "verifyP2")).toBe(false);
+        expect(await git(fixture.repository, ["rev-parse", "origin/feat/demo"])).toBe(p2Head);
+        // Restart in a later second, so the replacement attempt's window cannot cover the push.
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, (pushedSecond + 2) * 1000 - Date.now())),
+        );
+        const resumed = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const { state } = await resumed.resumeRun(autoimplementWorkflow, parked.runId);
+        expect(refused).toEqual([]);
+        expect(state.status, state.error).toBe("completed");
+        expect(attempts).toBe(2);
+        expect(
+          state.steps.filter((entry) => entry.nodeId === "verifyP2").map((entry) => entry.outcome),
+        ).toEqual(["failed"]);
+        const commits = state.steps.filter((entry) => entry.nodeId === "commitLocal");
+        expect(commits.map((entry) => entry.outcome)).toEqual(["ok", "ok"]);
+        const ids = nodeIdsOf(state);
+        expect(ids.indexOf("fix")).toBeGreaterThan(ids.indexOf("verifyP2"));
+        expect(okSteps(state, "publish").map(headsOf).at(-1)).toEqual([scenario.work.head]);
+        expect(scenario.work.head).not.toBe(p2Head);
       },
       GRAPH_RUN_TIMEOUT_MS,
     );

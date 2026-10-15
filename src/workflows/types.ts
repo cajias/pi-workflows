@@ -600,6 +600,18 @@ export type WorkflowActionReceipt = {
   durationMs?: number;
 };
 
+/**
+ * A started node attempt that ended without a step record, such as one that a runner restart
+ * interrupted and a resume then replaced. Derived from `node_attempts`; never stored separately.
+ */
+export type WorkflowUnrecordedAttempt = {
+  attemptId: string;
+  nodeId: string;
+  startedAt: string;
+  /** When the attempt was retired. Absent while no end time is recorded. */
+  finishedAt?: string;
+};
+
 export type WorkflowStepRecord = {
   attemptId: string;
   nodeId: string;
@@ -680,6 +692,11 @@ export type WorkflowRunState = {
   outputs: Record<string, unknown>;
   results: Record<string, WorkflowNodeResult>;
   steps: WorkflowStepRecord[];
+  /**
+   * Started attempts that are not active and have no step record, in start order. Absent when
+   * every started attempt that is not active has a step record.
+   */
+  unrecordedAttempts?: WorkflowUnrecordedAttempt[];
   /** Latest update for each `(type, key)` pair, sorted by trace sequence. */
   updates?: WorkflowUpdateRecord[];
   currentNode?: string;

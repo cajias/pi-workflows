@@ -65,6 +65,7 @@ import type {
   WorkflowSettingsSnapshot,
   WorkflowTraceEvent,
   WorkflowTraceEventDraft,
+  WorkflowUnrecordedAttempt,
   WorkflowUpdateInput,
   WorkflowUpdateRecord,
 } from "./types.js";
@@ -3583,6 +3584,7 @@ export class WorkflowRunStore {
         ? (activeAttempt?.nodeId ?? projectionSteps.at(-1)?.nodeId)
         : undefined;
     const humanDecision = this.readHumanDecisionReceipt(row.runId);
+    const unrecordedAttempts = this.readUnrecordedAttempts(row.runId);
     const outputs: Record<string, unknown> = {};
     const results: Record<string, WorkflowNodeResult> = {};
     for (const step of projectionSteps) {
@@ -3619,6 +3621,7 @@ export class WorkflowRunStore {
       outputs,
       results,
       steps: visibleSteps,
+      ...(unrecordedAttempts.length === 0 ? {} : { unrecordedAttempts }),
       ...(visibleUpdates.length === 0 ? {} : { updates: visibleUpdates }),
       ...(runningAttempt === undefined ? {} : { currentNode: runningAttempt.nodeId }),
       ...(activeAttempt === undefined ? {} : { currentAttemptId: activeAttempt.attemptId }),
@@ -3784,6 +3787,34 @@ export class WorkflowRunStore {
         source: workflowSourceFromRow(row),
       }));
     return { ...(root === undefined ? {} : { root }), mounted };
+  }
+
+  /**
+   * Started attempts that are not active and have no `run_steps` row, such as an attempt that a
+   * runner restart interrupted and a resume then retired. Their window comes from the stored
+   * `started_at` and `finished_at`.
+   */
+  private readUnrecordedAttempts(runId: string): WorkflowUnrecordedAttempt[] {
+    return this.state.connection
+      .prepare(
+        `SELECT attempt_id AS attemptId, node_id AS nodeId, started_at AS startedAt,
+                finished_at AS finishedAt
+         FROM node_attempts a
+         WHERE a.run_id = ? AND a.started_at IS NOT NULL
+           AND a.status NOT IN ('pending', 'running', 'waiting', 'interrupted')
+           AND NOT EXISTS (SELECT 1 FROM run_steps s WHERE s.attempt_id = a.attempt_id)
+         ORDER BY a.started_at, a.attempt_number, a.attempt_id`,
+      )
+      .all(runId)
+      .filter(isUnrecordedAttemptRow)
+      .map((attempt) => ({
+        attemptId: attempt.attemptId,
+        nodeId: attempt.nodeId,
+        startedAt: new Date(attempt.startedAt).toISOString(),
+        ...(attempt.finishedAt === null
+          ? {}
+          : { finishedAt: new Date(attempt.finishedAt).toISOString() }),
+      }));
   }
 
   private readActiveAttempt(runId: string):
@@ -4951,6 +4982,15 @@ function isActiveAttemptRow(value: unknown): value is {
   settingsScopeId: string | null;
   settingsChangeNumber: number | null;
   settingsHash: Buffer | null;
+} {
+  return isRecord(value);
+}
+
+function isUnrecordedAttemptRow(value: unknown): value is {
+  attemptId: string;
+  nodeId: string;
+  startedAt: number;
+  finishedAt: number | null;
 } {
   return isRecord(value);
 }
