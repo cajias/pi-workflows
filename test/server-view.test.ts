@@ -167,6 +167,16 @@ async function pendingStepFixture(label: string, delivered = false) {
   return { state, views, runId, sessionId, requestId, pending };
 }
 
+/**
+ * Compare multi-megabyte buffers by their bytes. Deep equality walks a Buffer one element
+ * at a time, which makes a 2 MB comparison take seconds of CPU.
+ */
+function expectSameBytes(actual: Buffer | undefined, expected: Buffer): void {
+  expect(actual).toBeInstanceOf(Buffer);
+  expect(actual?.byteLength).toBe(expected.byteLength);
+  expect(actual?.equals(expected)).toBe(true);
+}
+
 describe("workflow server display reducer", () => {
   it("keeps the server-owned control fixture aligned with the reducer", () => {
     expect(WORKFLOW_DISPLAY_CONTROLS).toEqual(controlFixture.controls);
@@ -375,7 +385,8 @@ describe("workflow server display reducer", () => {
       Buffer.from(collidingText, "utf8"),
       "text/plain",
     );
-    expect(runs.readContentBlob("run-large-view", collidingDigest, "text/plain")?.content).toEqual(
+    expectSameBytes(
+      runs.readContentBlob("run-large-view", collidingDigest, "text/plain")?.content,
       Buffer.from(collidingText, "utf8"),
     );
     const unlinkedContent = Buffer.from("unlinked view content", "utf8");
@@ -475,9 +486,10 @@ describe("workflow server display reducer", () => {
     });
     expect(views.run("run-large-view")).toBe(view);
     expect(boundedRead).toHaveBeenCalledTimes(1);
-    expect(
+    expectSameBytes(
       runs.readContentBlob("run-large-view", collidingDigest, "application/json")?.content,
-    ).toEqual(Buffer.from(collidingText, "utf8"));
+      Buffer.from(collidingText, "utf8"),
+    );
     expect(
       views.page("run-large-view", { kind: "trace_at_step", cursor: 0 })?.tracePage,
     ).toMatchObject({ total: expect.any(Number), items: expect.any(Array) });
