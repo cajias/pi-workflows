@@ -196,6 +196,31 @@ Pause stops the runner and parks at the last durable boundary. Resume takes a
 new generation. Cancellation can stop a live runner or atomically claim and
 cancel an expired running row. Resume refuses changed workflow source.
 
+### Unrecorded attempts
+
+`state.steps` lists only attempts that finished with a step record. A resume
+that starts a new attempt retires the interrupted one without a step record,
+so its work would otherwise leave no trace in the run state. The run state
+therefore lists such attempts in `unrecordedAttempts`, in start order:
+
+```typescript
+type WorkflowUnrecordedAttempt = {
+  attemptId: string;
+  nodeId: string;
+  startedAt: string; // when the attempt started
+  finishedAt?: string; // when it was retired, when recorded
+};
+```
+
+The list holds every started attempt of the run that is not active and has no
+step record. It is derived from the stored attempt rows and is never stored
+separately. The field is absent when there is no such attempt, so a run without
+a restart has the same state as before. After a resume, the engine reads the
+list from the store, so node callbacks see it in `context.state`. A retired
+attempt's window ends when the resume retired it, so it also covers the time the
+runner was down. Use the list to account for side effects that a lost attempt
+may have made. It is not proof that the attempt made any.
+
 ## Node types
 
 ### agent
@@ -845,13 +870,13 @@ Nothing may be pushed before the review gate passes. `commitLocal` and `verifyP2
 
 - that commit passed the review gate, as described below. Pushing it exposes no unreviewed work, whichever step pushed it. This covers a reviewed `publish` that pushed the reviewed head and then failed or timed out, and one whose attempt a runner restart discarded: a resume records no step for the interrupted attempt, so its time window is lost;
 - an accepted `publish` or `verifyP2` recorded that commit as its head; or
-- it was written during a `verifyP2` attempt, including one that failed after it pushed. P2 work is pushed without another review, so its attempt window is what identifies it. Reflog times have one-second resolution, so a push in the same second as such an attempt counts as part of it.
+- it was written during a `verifyP2` attempt, including one that failed after it pushed. P2 work is pushed without another review, so its attempt window is what identifies it. Reflog times have one-second resolution, so a push in the same second as such an attempt counts as part of it. A `verifyP2` attempt that a runner restart interrupted has no step record. Its window comes from the run state's [unrecorded attempts](#unrecorded-attempts), from its start until the resume retired it. A push from this clone while the runner was down is therefore excused too.
 
 A `publish` attempt's window excuses nothing by itself, because a reviewed publication must push only the reviewed head. An unreviewed commit that a failing `publish` attempt pushed therefore still fails the next local commit.
 
 Fetch and pull entries never fail the step. Commits that someone else adds on the forge, such as an applied review suggestion or a branch update, therefore do not block the run. The agent can pull them, commit on top of them, pass review, and push the result as a fast-forward.
 
-When Git keeps no reflog for the ref, for example with `core.logAllRefUpdates` turned off, the ref value decides instead. After a publication of this run, the ref must record the newest published head. Before any publication, it must record a commit whose committer time is earlier than the run start. That fallback cannot tell a push by this run from a commit that someone else added, so its error names a commit this run did not publish, pushed by this run or by someone else.
+When Git keeps no reflog for the ref, for example with `core.logAllRefUpdates` turned off, the ref value decides instead. A ref that records a commit that passed the review gate is accepted, so a reviewed `publish` that pushed the reviewed head and then failed or was lost does not fail the next local commit. Otherwise, after a publication of this run, the ref must record the newest published head: the head of the newest accepted `publish` or `verifyP2`. A failed `publish` records no published head. Before any publication, it must record a commit whose committer time is earlier than the run start. That fallback cannot tell a push by this run from a commit that someone else added, so its error names a commit this run did not publish, pushed by this run or by someone else.
 
 The run start is the start of the run's first recorded step. Step records are persisted, so a resume keeps that time.
 
@@ -862,7 +887,7 @@ The review gate passes when the newest work event records a head and every head 
 That publication runs `publish` with the reviewed-head prompt. The model pushes exactly that head without force and creates no commits. It reuses the one pull request or merge request for the branch and base, or opens it when none exists, and never creates a second one. Validation requires the published head, branch, base branch, and dependency fingerprint to equal the reviewed head, and the branch to be the prepared task branch. It also reads local Git state without any network call. The reviewed head must be the checked-out `HEAD` of that branch, with only paths that were already changed before the run left uncommitted. The prompt asks for `git push -u <remote> <task branch>`, so the branch gets an upstream. The workflow then finds the push destination's remote-tracking ref, which must record the reviewed head:
 
 1. `<branch>@{push}`, when Git resolves it to `refs/remotes/<remote>/<branch>`.
-2. Otherwise `refs/remotes/<remote>/<branch>` of the first remote set among `branch.<branch>.pushRemote`, `remote.pushDefault`, and `branch.<branch>.remote`, else of `origin`, which Git pushes to by default, else of the only remote. A configured value that names no remote, such as a URL, leaves the destination unknown, and so do several remotes when none is `origin`. This ref counts only when a fetch refspec of that remote maps `refs/heads/<branch>` to it, with no negative refspec excluding the branch, because only then does a push update it. A stale ref that a push never updates is ignored.
+2. Otherwise `refs/remotes/<remote>/<branch>` of the first remote set among `branch.<branch>.pushRemote`, `remote.pushDefault`, and `branch.<branch>.remote`, else of `origin`, which Git pushes to by default, else of the only remote. A configured value that names no remote, such as a URL, leaves the destination unknown, and so do several remotes when none is `origin`. This ref counts only when the first positive fetch refspec of that remote that matches `refs/heads/<branch>` maps it to this ref, with no negative refspec excluding the branch, because Git updates only that first match's target on a push. A later refspec that would map the branch here does not count. A stale ref that a push never updates is ignored.
 
 When that ref is absent although the refspec maps the branch to it, the claimed push did not happen, because Git creates the ref on a successful push, so the publish is rejected. When no remote is known, or the refspec does not map the branch, the ref check is skipped. A later reviewed push must report the same pull request or merge request URL as the earlier publication of the run. Its prompt names that URL and tells the model to check it before pushing. If it is closed or merged, the model does not push, because a push to a deleted branch would recreate it, and does not open another request; it reports that the request is no longer open so the controller can choose `blocked`. Otherwise it pushes to it. If the model reports another URL anyway, the error tells it not to open another one and to let the controller choose `blocked`, because one run publishes to one request. A publish that breaks any of these rules fails the step and returns to the controller, which offers `publication` again. After the push, comment handling, CI, and delivery run on that single pull request or merge request.
 

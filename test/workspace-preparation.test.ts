@@ -541,6 +541,39 @@ describe("push tracking head", () => {
     expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
   });
 
+  it("uses only the first positive fetch refspec that maps the branch", async () => {
+    const { repo, head } = await taskBranch("tracking-first-refspec");
+    const fetchSpecs = async (...specs: string[]) => {
+      await git(repo, ["config", "--unset-all", "remote.origin.fetch"]);
+      for (const spec of specs) await git(repo, ["config", "--add", "remote.origin.fetch", spec]);
+    };
+    // Git maps the branch through the first match, so a push updates only the alias ref and the
+    // ordinary ref stays stale.
+    await fetchSpecs(
+      "+refs/heads/feat/*:refs/remotes/origin/feat-alias/*",
+      "+refs/heads/*:refs/remotes/origin/*",
+    );
+    await git(repo, ["update-ref", "refs/remotes/origin/feat/x", "HEAD"]);
+    await fs.writeFile(path.join(repo, "pushed.txt"), "pushed\n");
+    await git(repo, ["add", "pushed.txt"]);
+    await git(repo, ["commit", "-q", "-m", "pushed"]);
+    const pushed = await git(repo, ["rev-parse", "HEAD"]);
+    await git(repo, ["push", "-q", "origin", "feat/x"]);
+    expect(await git(repo, ["rev-parse", "refs/remotes/origin/feat-alias/x"])).toBe(pushed);
+    expect(await git(repo, ["rev-parse", "refs/remotes/origin/feat/x"])).toBe(head);
+    expect(await pushTrackingHead(repo, "feat/x")).toBeUndefined();
+    // A negative refspec is not the first match; the next positive refspec is.
+    await fetchSpecs(
+      "^refs/heads/main",
+      "+refs/heads/*:refs/remotes/origin/*",
+      "+refs/heads/feat/*:refs/remotes/origin/feat-alias/*",
+    );
+    expect(await pushTrackingHead(repo, "feat/x")).toEqual({
+      ref: "refs/remotes/origin/feat/x",
+      headRevision: head,
+    });
+  });
+
   it("reads the push and fetch entries of a remote-tracking reflog", async () => {
     const { repo, head, bare } = await taskBranch("tracking-reflog");
     const ref = "refs/remotes/origin/feat/x";

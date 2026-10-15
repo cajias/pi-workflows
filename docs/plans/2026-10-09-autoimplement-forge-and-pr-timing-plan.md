@@ -1478,6 +1478,20 @@ model.
    Also run one GitHub `early` smoke on a disposable repository. These runs push to real remotes, so
    they need explicit authority, and they are not part of `npm run check`.
 
+**Live E2E waived for the F11-F14 branch.** The human waived step 1 for
+`fix/autoimplement-end-timing-f11-f14`, because no run could reach a model on this host:
+
+- run 1 (`--provider openai --model gpt-5.6-luna`) completed the model-free workflow, then failed
+  with `Provider is not configured: openai` (`/tmp/livee2e-f11f14.log`);
+- run 2 (`--provider openrouter --model deepseek/deepseek-v4-flash`) failed before any model call,
+  on the paused-status check: "Timed out waiting for the paused Pi workflow widget and status"
+  (`/tmp/livee2e-f11f14-or.log`, F42);
+- run 3 (the same openrouter model) completed the model-free workflow, then failed with
+  `Provider is not configured: openrouter` (`/tmp/livee2e-f11f14-or2.log`).
+
+The livee2e and livee2e2 agent results record the details. No real-model live E2E has verified
+this branch.
+
 ## Risks and open issues
 
 ### Owner decisions (2026-10-11)
@@ -1621,11 +1635,13 @@ These are out of scope for this plan.
   - With `+refs/heads/feat/*:refs/remotes/origin/feat-alias/*` before
     `+refs/heads/*:refs/remotes/origin/*`, a push updates only `origin/feat-alias/<name>`, while
     the code trusts a stale `origin/feat/<name>`, so every reviewed publish fails.
-  - Take the first positive refspec that matches and compare only its target.
+  - Take the first positive refspec that matches and compare only its target. _(done)_
+  - `fetchRefspecTracks` now skips negative refspecs and refspecs without a target, and compares only the first match's target.
 - F12: Restore two no-reflog test cases (review N6) in "falls back to the ref value when Git keeps
   no reflog for it" (`test/builtin-autoimplement-pr-timing.test.ts`):
   - an accepted `verifyP2` as the newest published head;
-  - a failed `publish` that does not count as a published head.
+  - a failed `publish` that does not count as a published head. _(done)_
+  - Both cases are back in that test, which now also pushes a P2 commit without a reflog.
 - F13: Keep a `verifyP2` push excused across a runner restart (review R1).
   - The gap: a P2 commit is unreviewed, so only its `verifyP2` attempt window excuses its push in
     `publicationPush` (`src/builtins/autoimplement.workflow.ts`). A resume marks the interrupted
@@ -1634,14 +1650,17 @@ These are out of scope for this plan.
   - Scenario: a `verifyP2` attempt pushes P2 commit P, then the runner restarts. The replacement
     `verifyP2` fails, the controller picks `repair`, and every later `commitLocal` is rejected.
   - Fix idea: also consult the windows of interrupted `node_attempts`, or record each attempt's
-    start.
+    start. _(done)_
+  - The run state now derives `unrecordedAttempts` from `node_attempts`, and `publicationPush` excuses
+    a push inside an unrecorded `verifyP2` attempt's window.
 - F14: Use the reviewed-head excuse in the no-reflog fallback (review R2). Group it with F12.
   - The gap: when Git keeps no reflog for the ref, `assertNotPushedBeforeGate` compares the ref
     value with the last published head only and does not call `revisionPassesGate`.
   - Scenario: `core.logAllRefUpdates=false`. A reviewed publish pushes H and then fails or is
     lost. The `commitLocal` after the repair is rejected with "moved to H, a commit this run did
     not publish".
-  - Fix: also accept when `revisionPassesGate(steps, id, tracking.headRevision)` holds.
+  - Fix: also accept when `revisionPassesGate(steps, id, tracking.headRevision)` holds. _(done)_
+  - The no-reflog fallback now accepts a gate-passing ref value first; a new test covers a failed reviewed publish.
 - F15: Skip the push check in `verifyP2Local` under `early` timing (review R3). Track it with F2.
   - The gap: `verifyP2Local` calls `assertNotPushedBeforeGate` even when `publicationTiming` is
     `early`.
@@ -1709,3 +1728,48 @@ These are out of scope for this plan.
     (`/tmp/resolver-peers-int3-check.attempt1-flake.log`).
   - It passed alone (3/3 and 36/36) and on full reruns. It predates the resolver host-peer fix,
     which changed only its imports.
+- F42: Accept the step suffix in the live E2E paused-status check.
+  - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
+    text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
+    wait can time out with "Timed out waiting for the paused Pi workflow widget and status"
+    (`scripts/live-e2e.mjs:740`).
+  - Evidence: run 2 of the F11-F14 live E2E (`/tmp/livee2e-f11f14-or.log`) saw
+    `live-runtime-e2e [paused] hold` 10 times and timed out after 30 s. Other runs passed this
+    check, so it may also be a race in when the status carries the step name.
+  - Fix: accept the step suffix, or find out why the status sometimes carries it.
+- F43: Do not excuse pushes forever for an unrecorded attempt without an end time (review2 P2 1).
+  - The gap: when an unrecorded `verifyP2` attempt has no `finishedAt`, the `publicationPush`
+    window runs to `Number.POSITIVE_INFINITY` (`src/builtins/autoimplement.workflow.ts:1684-1686`),
+    so it would excuse every later push, including unreviewed `fix` work.
+  - Unreachable today: every path that moves an attempt to a non-active status sets `finished_at`.
+  - Fix: skip entries without `finishedAt`, or make `finishedAt` required in
+    `WorkflowUnrecordedAttempt` and filter the query with `finished_at IS NOT NULL`.
+- F44: Correct the `unrecordedAttempts` wording (review2 P2 2).
+  - The gap: `docs/WORKFLOWS.md` ("Unrecorded attempts"), the `WorkflowUnrecordedAttempt` comment
+    in `src/workflows/types.ts:603-606`, and `docs/SQLITE_STATE.md:167` say "a run without a
+    restart has the same state as before". Runs that are cancelled or fail while an attempt is in
+    flight also get `unrecordedAttempts` (`src/workflows/queue.ts:1995`, `:2046`). This is harmless,
+    because the run is terminal.
+  - Fix: reword the docs and the comment, for example "the field is absent when every started
+    attempt has a step record".
+- F45: Add the missing `unrecordedAttempts` resume tests (review2 P2 3).
+  - `test/park-resume.test.ts:61-141` covers one restart and no restart. Add cases for:
+    - two successive restarts, which give two entries in start order;
+    - a resume that keeps the interrupted attempt, where the field must not grow;
+    - the server-backed `WorkflowRunnerStore` path (`src/server/workflow-runner-store.ts:64-70`).
+- F46: Check the negative-refspec exclusion against real Git (review1 P2 1).
+  - The gap: when a `^` refspec excludes the branch, `fetchRefspecTracks` returns false, so
+    `pushTrackingHead` is undefined and `assertNotPushedBeforeGate` skips the check
+    (`src/builtins/workspace-preparation.workflow.ts:288-294`). This fails open if Git still
+    updates the tracking ref on push.
+  - The test at `test/workspace-preparation.test.ts:538` asserts only the code's result. No
+    real-Git test checks whether Git skips the tracking-ref update in that case.
+  - Fix: push with a negative refspec configured against a temp bare remote and assert whether
+    `refs/remotes/origin/<branch>` moved. If it moved, drop the exclusion for the push case.
+- F47: Keep the push check when the first matching refspec maps to an alias (review1 P2 2).
+  - The gap: with `+refs/heads/feat/*:refs/remotes/origin/feat-alias/*` first, `pushTrackingHead`
+    is undefined and the push-before-gate check is skipped silently
+    (`src/builtins/workspace-preparation.workflow.ts:300-301`, `:229`). This is no worse than
+    before F11.
+  - Consider returning the mapped target ref, for example `refs/remotes/origin/feat-alias/<name>`,
+    as the tracking ref, so the reflog and value checks keep working. This is a scope decision.

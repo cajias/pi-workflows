@@ -1666,7 +1666,8 @@ function secondOverlaps(seconds: number, from: number, to: number): boolean {
  *   excused;
  * - it pushed a head that an accepted `publish` or `verifyP2` recorded; or
  * - it happened during a `verifyP2` attempt, which may have failed after pushing. P2 work is pushed
- *   without another review, so only its attempt window identifies it.
+ *   without another review, so only its attempt window identifies it. An attempt that a runner
+ *   restart interrupted has no step record, so its window comes from `unrecordedAttempts`.
  *
  * A `publish` attempt's window alone excuses nothing, because a reviewed publication must push only
  * the reviewed head.
@@ -1675,6 +1676,17 @@ function publicationPush(context: WorkflowNodeContext, id: string, update: RefUp
   const steps = context.state.steps;
   return (
     revisionPassesGate(steps, id, update.headRevision) ||
+    (context.state.unrecordedAttempts ?? []).some(
+      (attempt) =>
+        attempt.nodeId === "verifyP2" &&
+        secondOverlaps(
+          update.seconds,
+          Date.parse(attempt.startedAt),
+          attempt.finishedAt === undefined
+            ? Number.POSITIVE_INFINITY
+            : Date.parse(attempt.finishedAt),
+        ),
+    ) ||
     steps.some(
       (step) =>
         PUSHING_NODES.has(step.nodeId) &&
@@ -1695,8 +1707,8 @@ function publicationPush(context: WorkflowNodeContext, id: string, update: RefUp
  * of the push destination's remote-tracking ref in this clone: an `update by push` entry written
  * after the run started must be excused by {@link publicationPush}. Fetch and pull entries are
  * ignored, so commits that someone else added on the forge do not block the run. Without a reflog
- * the ref value decides: it must record the newest head this run published, or, before any
- * publication, a commit made before the run started. Local refs only.
+ * the ref value decides: it must record a commit that passed the review gate, the newest head this
+ * run published, or, before any publication, a commit made before the run started. Local refs only.
  */
 async function assertNotPushedBeforeGate(
   repository: CandidateRepository,
@@ -1719,6 +1731,7 @@ async function assertNotPushedBeforeGate(
       `${label}: this clone pushed ${stray.headRevision} to ${tracking.ref} at ${new Date(stray.seconds * 1000).toISOString()}, a commit that did not pass the review gate and that no publication of this run recorded. ${PUSH_BEFORE_GATE_GUIDANCE}`,
     );
   }
+  if (revisionPassesGate(context.state.steps, repository.id, tracking.headRevision)) return;
   const published = lastPublishedHead(context, repository.id);
   if (published === tracking.headRevision) return;
   if (published === undefined) {

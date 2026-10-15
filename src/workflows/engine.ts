@@ -396,6 +396,7 @@ export class WorkflowEngine {
         replayedSteps: state.steps.length,
       },
     });
+    if (resumedAttempt === undefined) await this.refreshUnrecordedAttempts(runId, state);
     await this.onRunStarted?.(runId, state);
 
     if (point.nodeId === null) {
@@ -1478,6 +1479,17 @@ export class WorkflowEngine {
       });
       throw error;
     }
+  }
+
+  /**
+   * A resume that does not keep the interrupted attempt retires it in the store, which then derives
+   * it as an unrecorded attempt. Node callbacks read this engine state, so it takes the same list.
+   */
+  private async refreshUnrecordedAttempts(runId: string, state: WorkflowRunState): Promise<void> {
+    const stored = await this.store.readRunState(runId);
+    if (stored === null) throw new Error(`Workflow run became unreadable: ${runId}`);
+    if (stored.unrecordedAttempts === undefined) delete state.unrecordedAttempts;
+    else state.unrecordedAttempts = stored.unrecordedAttempts;
   }
 
   private async persist(
