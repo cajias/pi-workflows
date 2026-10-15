@@ -62,9 +62,12 @@ export class RpcStepExecutor implements AgentStepExecutor {
   private modelError: string | null = null;
   private stderrDrain: Promise<void> | null = null;
   /**
-   * The child's other stderr lines until the bridge reports that the session started. Pi
-   * prints why it exits during startup there, for example when no model is available at all.
-   * Collection stops at the start, so only startup output is held, however long the run.
+   * The child's other stderr lines during startup. Pi prints why it exits during startup
+   * there, for example when no model is available at all. The window ends, and the kept lines
+   * are dropped, at the bridge's session-started line or at Pi's first stdout, whichever comes
+   * first: Pi writes RPC events on stdout only after its session started, and the executor's
+   * prompt draws a response. So only startup output is held, however long the run, even when
+   * the bridge's line is lost.
    */
   private startupStderr: string[] | null = [];
 
@@ -122,6 +125,7 @@ export class RpcStepExecutor implements AgentStepExecutor {
     }
     const child = new HeadlessPiProcess(BRIDGE_PATH, this.options, {
       onStderrLine: (line) => this.acceptStderrLine(line),
+      onStdoutChunk: () => this.endStartupWindow(),
       onExit: () => this.wakeSubmissionWaiters(),
     });
     this.child = child;
@@ -148,9 +152,14 @@ export class RpcStepExecutor implements AgentStepExecutor {
     return reason === "" ? "" : ` before its session started. Pi reported:\n${reason}`;
   }
 
+  /** Pi's session started, so later stderr is not why startup failed. */
+  private endStartupWindow(): void {
+    this.startupStderr = null;
+  }
+
   private acceptStderrLine(line: string): void {
     if (line === RPC_SESSION_STARTED_LINE) {
-      this.startupStderr = null;
+      this.endStartupWindow();
       return;
     }
     const modelError = decodeRpcModelError(line);

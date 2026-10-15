@@ -282,6 +282,29 @@ sleep 2
     await expect(
       executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
     ).rejects.toThrow(/^Headless pi session exited mid-step \(code 1\)$/);
+    await expect(
+      executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
+    ).rejects.toThrow(/^Headless pi session exited \(code 1, signal null\)$/);
+    await executor.close();
+  });
+
+  it("ends the startup window at Pi's first stdout event when the marker is missing", async () => {
+    // Pi writes RPC events on stdout only after its session started, so stderr before and
+    // after the first event is not startup output, even when the bridge's marker is lost.
+    const { fakePi } = await makeFakePi(
+      `printf 'startup note\\n' >&2\nsleep 0.2\nprintf '{"type":"response"}\\n'\nsleep 0.2\nprintf 'later noise\\n' >&2\nexit 1\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(/^Headless pi session exited mid-step \(code 1\)$/);
+    await expect(
+      executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
+    ).rejects.toThrow(/^Headless pi session exited \(code 1, signal null\)$/);
     await executor.close();
   });
 

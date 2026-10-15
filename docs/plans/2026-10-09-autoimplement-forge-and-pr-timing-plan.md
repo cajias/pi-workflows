@@ -1889,6 +1889,11 @@ These are out of scope for this plan.
   `exited mid-step (code 1)`. _(done)_
   - Done on `followups/f38-no-model-reason`: a step whose pi exits before the bridge reports the
     session started now adds the stderr that Pi wrote before then, such as `No models available`.
+  - Review fix: the startup window also ends at Pi's first stdout, so a lost session-started
+    line cannot keep stderr for the whole run; a test covers the bridge's real fd 2 writes.
+- F38a: Report Pi's reason on the first step when pi exits during `register(child)`; that step
+  now fails with a bare `Headless pi session is not running` (`src/server/rpc-executor.ts`,
+  `promptForSubmission`) and skips the stderr wait.
 - F38b: Fix the three F38 review P2s.
   - Keep a malformed model-error protocol line out of the `Pi reported` text, and anchor the
     regex of the test "reports the exit when a model error line is malformed".
