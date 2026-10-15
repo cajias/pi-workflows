@@ -59,8 +59,9 @@ function startSession(options: {
   scoped?: Model[];
   argv?: string[];
   projectTrusted?: boolean;
-}): { stops: string[]; tools: Tool[] } {
+}): { stops: string[]; starts: number; tools: Tool[] } {
   const stops: string[] = [];
+  let starts = 0;
   const tools: Tool[] = [];
   let sessionStart: ((event: unknown, ctx: RpcBridgeSessionContext) => void) | undefined;
   const api = {
@@ -78,6 +79,9 @@ function startSession(options: {
     argv: options.argv ?? PI_ARGS,
     agentDir,
     stop: (error) => stops.push(error),
+    started: () => {
+      starts += 1;
+    },
   });
   const models = options.models ?? [FALLBACK];
   const registry = {
@@ -93,7 +97,7 @@ function startSession(options: {
     modelRegistry: registry,
     isProjectTrusted: () => options.projectTrusted ?? false,
   } as unknown as RpcBridgeSessionContext);
-  return { stops, tools };
+  return { stops, starts, tools };
 }
 
 describe("rpc-bridge workflow tool", () => {
@@ -156,6 +160,12 @@ describe("rpc-bridge default model check", () => {
     ]) {
       expect(startSession({ settings, argv }).stops).toEqual([]);
     }
+  });
+
+  it("reports that the session started only when the model check passes", () => {
+    expect(startSession({ settings: {} }).starts).toBe(1);
+    const settings = { defaultProvider: "custom", defaultModel: "custom-model" };
+    expect(startSession({ settings }).starts).toBe(0);
   });
 
   it("lets Pi choose its first available model when no default is set", () => {

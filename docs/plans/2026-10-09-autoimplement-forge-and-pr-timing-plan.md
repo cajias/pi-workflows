@@ -1886,9 +1886,9 @@ These are out of scope for this plan.
   - Live E2E: waived. The human's rule for F35-F41 allows no live or billable model calls, as with
     the F11-F14 waiver in the Validation section.
 - F38: Report Pi's own reason when no model exists at all; headless steps now show only
-  `exited mid-step (code 1)`.
-  - Accepted on `followups/f38-no-model-reason` (`543b89c`); not in this bundle. Live E2E: waived
-    under the human's no-live/no-billable rule for F35-F41.
+  `exited mid-step (code 1)`. _(done)_
+  - Done on `followups/f38-no-model-reason`: a step whose pi exits before the bridge reports the
+    session started now adds the stderr that Pi wrote before then, such as `No models available`.
 - F38b: Fix the three F38 review P2s.
   - Keep a malformed model-error protocol line out of the `Pi reported` text, and anchor the
     regex of the test "reports the exit when a model error line is malformed".

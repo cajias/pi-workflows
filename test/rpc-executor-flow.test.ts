@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ServerProcessRegistry } from "../src/server/processes.js";
 import { RpcStepExecutor } from "../src/server/rpc-executor.js";
-import { encodeRpcModelError } from "../src/server/rpc-protocol.js";
+import { encodeRpcModelError, encodeRpcSessionStarted } from "../src/server/rpc-protocol.js";
 import type { AgentStepRequest } from "../src/workflows/types.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -237,6 +237,51 @@ sleep 2
     await expect(
       executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
     ).rejects.toThrow(/^no model$/);
+    await executor.close();
+  });
+
+  it("reports Pi's own reason when Pi exits before its session starts", async () => {
+    // Pi 1.1.0 prints this, in red, and exits 1 when no model is available at all.
+    const { fakePi } = await makeFakePi(
+      `printf '\\033[31mNo models available. Use /login to log into a provider via OAuth or API key. See:\\n  /docs/providers.md\\n  /docs/models.md\\033[39m\\n' >&2\nexit 1\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    const reason = [
+      "No models available. Use /login to log into a provider via OAuth or API key. See:",
+      "  /docs/providers.md",
+      "  /docs/models.md",
+    ].join("\n");
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(
+      `Headless pi session exited mid-step (code 1) before its session started. Pi reported:\n${reason}`,
+    );
+    // A later step on the dead child reports the same reason.
+    await expect(
+      executor.runAgentStep(requestFor("work", "a2"), new AbortController().signal),
+    ).rejects.toThrow(
+      `Headless pi session exited (code 1, signal null) before its session started. Pi reported:\n${reason}`,
+    );
+    await executor.close();
+  });
+
+  it("reports only the exit for stderr that Pi writes after its session started", async () => {
+    const started = encodeRpcSessionStarted().replaceAll("\n", "\\n");
+    const { fakePi } = await makeFakePi(
+      `printf 'startup note\\n' >&2\nprintf '${started}' >&2\nprintf 'later noise\\n' >&2\nexit 1\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      pi: { kind: "executable", executable: fakePi },
+    });
+    await expect(
+      executor.runAgentStep(requestFor("work", "a1"), new AbortController().signal),
+    ).rejects.toThrow(/^Headless pi session exited mid-step \(code 1\)$/);
     await executor.close();
   });
 
