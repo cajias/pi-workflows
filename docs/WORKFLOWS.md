@@ -51,15 +51,20 @@ the server cannot load the real decision channels and credentials; see
 Queuing a follow-up (`queue-follow-up`) and changing settings
 (`change-settings`) follow the same rules. Each needs the session's current
 coordinator authority, which the server checks before it looks up an earlier
-receipt. The extension waits up to 15 seconds for a ready session, and after a
-lost connection or a replaced epoch it sends the command again with fresh
-authority and the same idempotency key, in at most three attempts. The durable
+receipt. When the command names a `runId`, the extension waits up to 15 seconds
+for a ready session. Without a `runId`, the extension first takes the run from
+the session view, so a stale or unloaded view fails at once with `No workflow
+run is active in this session`. After a lost connection or a replaced epoch,
+the extension sends the command again with fresh authority and the same
+idempotency key, in at most three attempts. The durable
 request fingerprint leaves out `coordinatorEpoch`, so the server adopts a
 follow-up or settings change it already committed. A retry does not queue a
 second follow-up or apply the patch twice. When the extension cannot confirm
 the command, its error says that the follow-up may have been queued or the
 settings change may have been applied; check `/workflow status` before you
-repeat it. the run's original source and graph, including ordinary workflows
+repeat it.
+
+Resume uses the run's original source and graph, including ordinary workflows
 without included workflows. Source and graph checks run before any durable
 mutation. `WorkflowEngine.resumeRun` has no `force` option. Restore the original
 source to resume its accepted work, or explicitly start a new run for changed

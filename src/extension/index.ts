@@ -66,9 +66,10 @@ const INTERACTION_POLL_MS = 1_000;
 const SESSION_PROJECTION_BASE_RETRY_MS = 1_000;
 const SESSION_PROJECTION_MAX_RETRY_MS = 30_000;
 /**
- * How long an interactive start waits for this session's coordinator. The first
- * start can arrive while the session still connects to a workflow server that is
- * starting or still reports its branch.
+ * How long a session command (a start, a follow-up, or a settings change) waits
+ * for this session's coordinator. The command can arrive while the session still
+ * connects to a workflow server that is starting, reconnects, or still reports
+ * its branch.
  */
 const SESSION_COORDINATOR_READY_MS = 15_000;
 const SESSION_COORDINATOR_POLL_MS = 25;
@@ -78,7 +79,7 @@ const SESSION_COORDINATOR_POLL_MS = 25;
  * the same readiness deadline.
  */
 const MAX_SESSION_COMMAND_ATTEMPTS = 3;
-/** Server rejections of a start whose coordinator authority is no longer current. */
+/** Server rejections of a session command whose coordinator authority is no longer current. */
 const STALE_AUTHORITY_ERRORS = new Set([
   SESSION_COORDINATOR_REPLACED_ERROR,
   SESSION_BRANCH_UNREPORTED_ERROR,

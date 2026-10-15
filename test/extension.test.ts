@@ -2148,6 +2148,114 @@ export default defineResourceManager({
     60_000,
   );
 
+  it.each([
+    {
+      action: "start",
+      operation: "run.start",
+      startFirst: false,
+      input: {},
+      error:
+        /^Workflow run \S+-server-settings-\S+ may have been created, but it could not be confirmed: Workflow session coordinator was replaced\. Check \/workflow status before you start it again\.$/u,
+      applied: (_runs: WorkflowRunStore, runIds: string[]) => runIds.length,
+      once: 1,
+    },
+    {
+      action: "queue-follow-up",
+      operation: "followUp.queue",
+      startFirst: true,
+      input: { prompt: "Queue this follow-up at most once." },
+      error:
+        /^The follow-up for workflow run \S+-server-settings-\S+ may have been queued, but it could not be confirmed: Workflow session coordinator was replaced\. Check \/workflow status before you queue it again\.$/u,
+      applied: (runs: WorkflowRunStore, runIds: string[]) =>
+        runs.readFollowUpQueue(runIds[0] ?? "")?.followUps.map((item) => item.state),
+      once: ["queued"],
+    },
+    {
+      action: "change-settings",
+      operation: "run.changeSettings",
+      startFirst: true,
+      input: { patch: [{ op: "add", path: "/items/-", value: "once" }] },
+      error:
+        /^The settings change for workflow run \S+-server-settings-\S+ may have been applied, but it could not be confirmed: Workflow session coordinator was replaced\. Check \/workflow status before you change the settings again\.$/u,
+      applied: (runs: WorkflowRunStore, runIds: string[]) => {
+        const scope = runs.findSettingsScope(runIds[0] ?? "", "", 1);
+        return [scope?.changeNumber, scope?.settings];
+      },
+      once: [1, { items: ["once"] }],
+    },
+  ] as const)(
+    "reports $action as unconfirmed when every resend is refused as stale",
+    async ({ action, operation, startFirst, input, error, applied, once }) => {
+      const { cwd } = await setupProject();
+      const workflowPath = await writeSettingsWorkflow(cwd);
+      const fake = makePi({ cwd });
+      await fake.emit("session_start");
+      try {
+        if (startFirst) {
+          await fake.runCommand(workflowPath);
+          await waitUntil(() => fake.sent.length === 1, 30_000);
+        }
+        const request = WorkflowClient.prototype.request;
+        vi.spyOn(WorkflowClient.prototype, "request").mockImplementation(async function (
+          this: WorkflowClient,
+          options: Parameters<WorkflowClient["request"]>[0],
+        ) {
+          const response = await request.call(this, options);
+          if (
+            options.operation === operation &&
+            (response.outcome === "accepted" || response.outcome === "adopted")
+          ) {
+            // Every confirmation is lost with its connection, so the client's own
+            // resend carries the replaced epoch and is refused.
+            throw new Error("Workflow server connection closed");
+          }
+          return response;
+        });
+        const durableRequests = vi.spyOn(WorkflowClient.prototype, "requestDurable");
+        await expect(
+          fake.runTool(`${action}-unconfirmed`, {
+            action,
+            ...(action === "start" ? { workflow: workflowPath } : {}),
+            ...input,
+          }),
+        ).rejects.toThrow(error);
+        const sends = durableRequests.mock.calls.filter(
+          ([options]) => options.operation === operation,
+        );
+        // Each of the three attempts carries fresh authority and the same durable key.
+        expect(sends).toHaveLength(3);
+        expect(new Set(sends.map(([options]) => options.idempotencyKey)).size).toBe(1);
+        expect(
+          new Set(
+            sends.map(
+              ([options]) => (options.payload as { coordinatorEpoch?: unknown }).coordinatorEpoch,
+            ),
+          ).size,
+        ).toBe(3);
+        const runs = new WorkflowRunStore(workflowStatePath(), { readOnly: true });
+        try {
+          expect(applied(runs, workflowRunIds())).toEqual(once);
+        } finally {
+          runs.close();
+        }
+        const state = new ServerStateStore(workflowStatePath(), { readOnly: true });
+        try {
+          expect(
+            state.state.connection
+              .prepare("SELECT count(*) AS count FROM server_commands WHERE operation = ?")
+              .get(operation),
+          ).toEqual({ count: 1 });
+        } finally {
+          state.close();
+        }
+      } finally {
+        // A session left open would keep writing the shared snapshot map.
+        await fake.emit("session_shutdown");
+      }
+    },
+    90_000,
+  );
+
   it("re-arms the session subscription after a failure during the first publish", async () => {
     const { cwd } = await setupProject();
     if (testHome === undefined) throw new Error("the test home directory is not configured");
