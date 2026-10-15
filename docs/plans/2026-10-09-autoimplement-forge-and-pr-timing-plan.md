@@ -1492,6 +1492,11 @@ model.
 The livee2e and livee2e2 agent results record the details. No real-model live E2E has verified
 this branch.
 
+**Code review of the F11-F14 branch.** The code-review skill (deep-review) ran on
+`059fb1a..aecaa8b`. Its verdict is `NEEDS_ATTENTION` (request changes): 1 medium and 5 low open
+findings, with no coverage gaps, reviewer errors, or timeouts. The findings are tracked as F43-F45
+and F48-F50. The run directory is `/tmp/pi-code-review.97D9xm`.
+
 ## Risks and open issues
 
 ### Owner decisions (2026-10-11)
@@ -1864,11 +1869,15 @@ These are out of scope for this plan.
     because the run is terminal.
   - Fix: reword the docs and the comment, for example "the field is absent when every started
     attempt has a step record".
+  - Note: the `src/workflows/types.ts` comment is already accurate, so only the
+    `docs/WORKFLOWS.md` wording needs a fix (code-review credibility judge).
 - F45: Add the missing `unrecordedAttempts` resume tests (review2 P2 3).
   - `test/park-resume.test.ts:61-141` covers one restart and no restart. Add cases for:
     - two successive restarts, which give two entries in start order;
     - a resume that keeps the interrupted attempt, where the field must not grow;
     - the server-backed `WorkflowRunnerStore` path (`src/server/workflow-runner-store.ts:64-70`).
+  - Note: the server-backed `WorkflowRunnerStore` reuses `readRunState` over RPC, so it is not a
+    separate derivation (code-review credibility judge).
 - F46: Check the negative-refspec exclusion against real Git (review1 P2 1).
   - The gap: when a `^` refspec excludes the branch, `fetchRefspecTracks` returns false, so
     `pushTrackingHead` is undefined and `assertNotPushedBeforeGate` skips the check
@@ -1885,3 +1894,24 @@ These are out of scope for this plan.
     before F11.
   - Consider returning the mapped target ref, for example `refs/remotes/origin/feat-alias/<name>`,
     as the tracking ref, so the reflog and value checks keep working. This is a scope decision.
+- F48: Excuse a lost `verifyP2` push in the no-reflog fallback (code-review, low).
+  - The gap: the no-reflog fallback of `assertNotPushedBeforeGate`
+    (`src/builtins/autoimplement.workflow.ts` ~1733) never consults `unrecordedAttempts`. A lost
+    `verifyP2` push in a repository with `core.logAllRefUpdates=false` is therefore still
+    rejected.
+  - The credibility judge found this is an existing limitation of the fallback, not a regression.
+- F49: Remove the real-time sleep from the F13 restart graph test (code-review, low).
+  - The gap: the test at `test/builtin-autoimplement-pr-timing.test.ts` ~2156 sleeps about 2 s of
+    real time to cross a one-second boundary.
+  - Fix: inject or control the attempt timestamps instead.
+- F50: End an unrecorded `verifyP2` attempt's excuse window at its last proven-live time
+  (code-review completeness critic and re-review, medium).
+  - The gap: the window runs until the resume retires the attempt (`src/workflows/store.ts:1747`),
+    so it covers all runner downtime, and any push from this clone in that window is excused
+    whatever the head is.
+  - Fix: end the window at the last proven-live time: `MAX(COALESCE(ended_at, observed_at))` from
+    `attempt_active_intervals` for the attempt, or the interrupt write's `updated_at`
+    (`src/workflows/store.ts:1507`). Fall back to the resume time only when neither exists.
+  - Trade-off: a push between the last sample and a crash is then rejected (fail closed),
+    consistent with `src/state/attempt-time.ts:71`.
+  - When this is fixed, update the `docs/WORKFLOWS.md` sentence that excuses downtime pushes.
