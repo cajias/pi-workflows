@@ -3390,6 +3390,7 @@ export class WorkflowRunStore {
     }
   }
 
+  // Invariant: session_entries rows are never deleted while their run exists, so run_seq only grows.
   private lastSessionEntrySeq(runId: string): number {
     const row = this.statement(
       "SELECT COALESCE(MAX(run_seq), 0) AS count FROM session_entries WHERE run_id = ?",
