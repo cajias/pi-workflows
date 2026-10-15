@@ -196,6 +196,31 @@ Pause stops the runner and parks at the last durable boundary. Resume takes a
 new generation. Cancellation can stop a live runner or atomically claim and
 cancel an expired running row. Resume refuses changed workflow source.
 
+### Unrecorded attempts
+
+`state.steps` lists only attempts that finished with a step record. A resume
+that starts a new attempt retires the interrupted one without a step record,
+so its work would otherwise leave no trace in the run state. The run state
+therefore lists such attempts in `unrecordedAttempts`, in start order:
+
+```typescript
+type WorkflowUnrecordedAttempt = {
+  attemptId: string;
+  nodeId: string;
+  startedAt: string; // when the attempt started
+  finishedAt?: string; // when it was retired, when recorded
+};
+```
+
+The list holds every started attempt of the run that is not active and has no
+step record. It is derived from the stored attempt rows and is never stored
+separately. The field is absent when there is no such attempt, so a run without
+a restart has the same state as before. After a resume, the engine reads the
+list from the store, so node callbacks see it in `context.state`. A retired
+attempt's window ends when the resume retired it, so it also covers the time the
+runner was down. Use the list to account for side effects that a lost attempt
+may have made. It is not proof that the attempt made any.
+
 ## Node types
 
 ### agent
@@ -845,7 +870,7 @@ Nothing may be pushed before the review gate passes. `commitLocal` and `verifyP2
 
 - that commit passed the review gate, as described below. Pushing it exposes no unreviewed work, whichever step pushed it. This covers a reviewed `publish` that pushed the reviewed head and then failed or timed out, and one whose attempt a runner restart discarded: a resume records no step for the interrupted attempt, so its time window is lost;
 - an accepted `publish` or `verifyP2` recorded that commit as its head; or
-- it was written during a `verifyP2` attempt, including one that failed after it pushed. P2 work is pushed without another review, so its attempt window is what identifies it. Reflog times have one-second resolution, so a push in the same second as such an attempt counts as part of it.
+- it was written during a `verifyP2` attempt, including one that failed after it pushed. P2 work is pushed without another review, so its attempt window is what identifies it. Reflog times have one-second resolution, so a push in the same second as such an attempt counts as part of it. A `verifyP2` attempt that a runner restart interrupted has no step record. Its window comes from the run state's [unrecorded attempts](#unrecorded-attempts), from its start until the resume retired it. A push from this clone while the runner was down is therefore excused too.
 
 A `publish` attempt's window excuses nothing by itself, because a reviewed publication must push only the reviewed head. An unreviewed commit that a failing `publish` attempt pushed therefore still fails the next local commit.
 

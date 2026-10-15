@@ -1636,7 +1636,9 @@ These are out of scope for this plan.
   - Scenario: a `verifyP2` attempt pushes P2 commit P, then the runner restarts. The replacement
     `verifyP2` fails, the controller picks `repair`, and every later `commitLocal` is rejected.
   - Fix idea: also consult the windows of interrupted `node_attempts`, or record each attempt's
-    start.
+    start. _(done)_
+  - The run state now derives `unrecordedAttempts` from `node_attempts`, and `publicationPush` excuses
+    a push inside an unrecorded `verifyP2` attempt's window.
 - F14: Use the reviewed-head excuse in the no-reflog fallback (review R2). Group it with F12.
   - The gap: when Git keeps no reflog for the ref, `assertNotPushedBeforeGate` compares the ref
     value with the last published head only and does not call `revisionPassesGate`.
