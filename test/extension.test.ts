@@ -199,6 +199,29 @@ export default defineWorkflow({
   return { cwd, workflowPath };
 }
 
+/** A waiting interactive workflow with one session-editable settings list. */
+async function writeSettingsWorkflow(cwd: string): Promise<string> {
+  const workflowPath = path.join(cwd, "settings.workflow.ts");
+  await fs.writeFile(
+    workflowPath,
+    `import { agent, allowSettingsPath, defineWorkflow, workflowSettings } from ${JSON.stringify(
+      path.resolve("src/workflows/index.ts"),
+    )};
+export default defineWorkflow({
+  name: "server-settings",
+  startAt: "ask",
+  settings: workflowSettings({
+    initial: { items: [] },
+    parse: (value) => value,
+    paths: [allowSettingsPath("/items", { read: ["session"], add: ["session", "resource_manager"] })],
+  }),
+  nodes: { ask: agent({ prompt: () => "Return a result." }) },
+  edges: [],
+});\n`,
+  );
+  return workflowPath;
+}
+
 /** Shortcut configuration lives in the stubbed temp config directory, never the real one. */
 function shortcutsConfigDir(): string {
   if (testHome === undefined) throw new Error("the test home directory is not configured");
@@ -2029,6 +2052,101 @@ export default defineResourceManager({
       await fake.emit("session_shutdown");
     }
   }, 60_000);
+
+  it.each([
+    {
+      action: "queue-follow-up",
+      operation: "followUp.queue",
+      input: { prompt: "Queue this follow-up exactly once." },
+      message: "Queued the workflow follow-up.",
+      applied: (runs: WorkflowRunStore, runId: string) =>
+        runs.readFollowUpQueue(runId)?.followUps.map((item) => item.state),
+      once: ["queued"],
+    },
+    {
+      action: "change-settings",
+      operation: "run.changeSettings",
+      input: { patch: [{ op: "add", path: "/items/-", value: "once" }] },
+      message: "Changed workflow settings for ",
+      applied: (runs: WorkflowRunStore, runId: string) => {
+        const scope = runs.findSettingsScope(runId, "", 1);
+        return [scope?.changeNumber, scope?.settings];
+      },
+      once: [1, { items: ["once"] }],
+    },
+  ] as const)(
+    "applies $action once when its response was lost with its connection",
+    async ({ action, operation, input, message, applied, once }) => {
+      const { cwd } = await setupProject();
+      const workflowPath = await writeSettingsWorkflow(cwd);
+      const fake = makePi({ cwd });
+      await fake.emit("session_start");
+      try {
+        await fake.runCommand(workflowPath);
+        await waitUntil(() => fake.sent.length === 1, 30_000);
+        const [runId] = workflowRunIds();
+        if (runId === undefined) throw new Error("the workflow run was not created");
+        const request = WorkflowClient.prototype.request;
+        let lost = false;
+        vi.spyOn(WorkflowClient.prototype, "request").mockImplementation(async function (
+          this: WorkflowClient,
+          options: Parameters<WorkflowClient["request"]>[0],
+        ) {
+          const response = await request.call(this, options);
+          if (options.operation === operation && !lost) {
+            lost = true;
+            // The server committed the command. Its response is lost with the connection.
+            throw new Error("Workflow server connection closed");
+          }
+          return response;
+        });
+        const durableRequests = vi.spyOn(WorkflowClient.prototype, "requestDurable");
+        const result = await fake.runTool(`${action}-lost`, { action, ...input });
+        expect(JSON.stringify(result)).toContain(message);
+        const sends = durableRequests.mock.calls.flatMap(([options], index) =>
+          options.operation === operation ? [{ options, index }] : [],
+        );
+        expect(sends).toHaveLength(2);
+        const [first, second] = sends.map((send) => send.options);
+        // The resend keeps the durable identity and carries the reconnected epoch.
+        expect(second?.idempotencyKey).toBe(first?.idempotencyKey);
+        expect(second?.requestId).not.toBe(first?.requestId);
+        const epoch = (options: typeof first) =>
+          (options?.payload as { coordinatorEpoch?: unknown } | undefined)?.coordinatorEpoch;
+        expect(epoch(second)).toEqual(expect.any(String));
+        expect(epoch(second)).not.toBe(epoch(first));
+        const outcomes = await Promise.all(
+          sends.map(async ({ index }) => {
+            const sent = durableRequests.mock.results[index];
+            if (sent === undefined) throw new Error(`${operation} send ${index} has no result`);
+            return ((await sent.value) as ClientResponse).outcome;
+          }),
+        );
+        // The stale epoch is refused, and fresh authority adopts the committed command.
+        expect(outcomes).toEqual(["rejected", "adopted"]);
+        const runs = new WorkflowRunStore(workflowStatePath(), { readOnly: true });
+        try {
+          expect(applied(runs, runId)).toEqual(once);
+        } finally {
+          runs.close();
+        }
+        const state = new ServerStateStore(workflowStatePath(), { readOnly: true });
+        try {
+          expect(
+            state.state.connection
+              .prepare("SELECT count(*) AS count FROM server_commands WHERE operation = ?")
+              .get(operation),
+          ).toEqual({ count: 1 });
+        } finally {
+          state.close();
+        }
+      } finally {
+        // A session left open would keep writing the shared snapshot map.
+        await fake.emit("session_shutdown");
+      }
+    },
+    60_000,
+  );
 
   it("re-arms the session subscription after a failure during the first publish", async () => {
     const { cwd } = await setupProject();

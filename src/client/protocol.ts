@@ -195,6 +195,8 @@ export function clientRequestFingerprint(request: ClientRequest): Buffer {
     "decision.answer",
     "run.restart",
     "run.start",
+    "followUp.queue",
+    "run.changeSettings",
   ].includes(request.operation);
   const payload =
     sessionResponse &&

@@ -993,6 +993,7 @@ export class WorkflowServer {
           this.requireInteractiveStartSession(connection, request);
           return this.handleRequest(request, connection);
         case "run.restart":
+        case "followUp.queue":
         case "interaction.update":
         case "checkpoint.answer":
         case "decision.answer":

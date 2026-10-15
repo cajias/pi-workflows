@@ -1845,7 +1845,7 @@ These are out of scope for this plan.
   - Deferred by the human. It needs explicit approval before any run against the live state, and
     it follows the procedure in `docs/SQLITE_STATE.md` ("Removing undeliverable terminal
     messages").
-- F35: Refresh session authority on retry for `followUp.queue` and `run.changeSettings`.
+- F35: Refresh session authority on retry for `followUp.queue` and `run.changeSettings`. _(done)_
   - Found during F33: both commands build their session authority once, so a retry after a lost
     connection carries the stale coordinator epoch and is rejected as replaced. A user retry can
     then queue a second follow-up or apply a settings patch twice.

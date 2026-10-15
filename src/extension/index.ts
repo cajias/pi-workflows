@@ -73,10 +73,11 @@ const SESSION_PROJECTION_MAX_RETRY_MS = 30_000;
 const SESSION_COORDINATOR_READY_MS = 15_000;
 const SESSION_COORDINATOR_POLL_MS = 25;
 /**
- * Sends of one interactive start. A lost connection or a replaced coordinator gets
- * a resend with fresh authority, within the same readiness deadline.
+ * Sends of one session command whose side effect must happen once. A lost
+ * connection or a replaced coordinator gets a resend with fresh authority, within
+ * the same readiness deadline.
  */
-const MAX_INTERACTIVE_START_ATTEMPTS = 3;
+const MAX_SESSION_COMMAND_ATTEMPTS = 3;
 /** Server rejections of a start whose coordinator authority is no longer current. */
 const STALE_AUTHORITY_ERRORS = new Set([
   SESSION_COORDINATOR_REPLACED_ERROR,
@@ -994,9 +995,13 @@ async function executeCommand(
       const resolved = await client.resolveWorkflow({ cwd: ctx.cwd, workflowRef: command.ref });
       const runId = createRunId(resolved.workflowName);
       // The server accepts an interactive start only from this live session.
-      const response = await requestSessionStart(client, ctx, sessionWait, {
+      const response = await requestSessionCommand(client, ctx, sessionWait, {
+        operation: "run.start",
+        requestPrefix: "start",
         idempotencyKey,
         runId,
+        subject: "Workflow start",
+        unconfirmed: unconfirmedCommand(`Workflow run ${runId} may have been created`, "start it"),
         payload: {
           projectPath: ctx.cwd,
           workflowName: resolved.workflowName,
@@ -1072,13 +1077,17 @@ async function executeCommand(
     case "change-settings": {
       const runId = command.runId ?? activeSessionRun(ctx)?.runId;
       if (runId === undefined) throw new Error("No workflow run is active in this session");
-      const response = await requestAccepted(client, {
+      const response = await requestSessionCommand(client, ctx, sessionWait, {
         operation: "run.changeSettings",
-        requestId: `settings-${idempotencyKey}`,
+        requestPrefix: "settings",
         idempotencyKey,
         runId,
+        subject: "Workflow settings change",
+        unconfirmed: unconfirmedCommand(
+          `The settings change for workflow run ${runId} may have been applied`,
+          "change the settings",
+        ),
         payload: {
-          ...sessionCommandPayload(ctx),
           patch: jsonValue(command.patch),
           ...(command.scopeId === undefined ? {} : { scopeId: command.scopeId }),
           ...(command.expectedChangeNumber === undefined
@@ -1094,12 +1103,17 @@ async function executeCommand(
     case "queue-follow-up": {
       const runId = command.runId ?? activeSessionRun(ctx)?.runId;
       if (runId === undefined) throw new Error("No workflow run is active in this session");
-      const response = await requestAccepted(client, {
+      const response = await requestSessionCommand(client, ctx, sessionWait, {
         operation: "followUp.queue",
-        requestId: `follow-up-${idempotencyKey}`,
+        requestPrefix: "follow-up",
         idempotencyKey,
         runId,
-        payload: { ...sessionCommandPayload(ctx), prompt: command.prompt },
+        subject: "Workflow follow-up",
+        unconfirmed: unconfirmedCommand(
+          `The follow-up for workflow run ${runId} may have been queued`,
+          "queue it",
+        ),
+        payload: { prompt: command.prompt },
       });
       return {
         message: "Queued the workflow follow-up.",
@@ -1398,9 +1412,9 @@ function sessionCommandPayload(ctx: ExtensionContext, staleEpoch?: string): Sess
   return { targetSessionId, coordinatorEpoch };
 }
 
-function throwIfStartCancelled(signal: AbortSignal | undefined): void {
+function throwIfCommandCancelled(signal: AbortSignal | undefined, subject: string): void {
   if (signal?.aborted === true) {
-    throw new Error("Workflow start was cancelled while it waited for the Pi session coordinator");
+    throw new Error(`${subject} was cancelled while it waited for the Pi session coordinator`);
   }
 }
 
@@ -1417,18 +1431,26 @@ async function sessionPoll(signal: AbortSignal | undefined): Promise<void> {
   });
 }
 
+type SessionAttemptWait = SessionWait & {
+  deadline: number;
+  staleEpoch?: string | undefined;
+  /** Names the command in a cancellation error. */
+  subject: string;
+};
+
 /**
- * Return this session's command authority once its coordinator is ready. A start
- * can arrive before the first session connection or branch report finishes, so it
- * asks for that connection and waits until `deadline` instead of failing at once.
- * The final error names the last reason the session was not ready.
+ * Return this session's command authority once its coordinator is ready. A command
+ * can arrive before the first session connection or branch report finishes, or
+ * while the session reconnects, so it asks for that connection and waits until
+ * `deadline` instead of failing at once. The final error names the last reason
+ * the session was not ready.
  */
 async function readySessionCommandPayload(
   ctx: ExtensionContext,
-  wait: SessionWait & { deadline: number; staleEpoch?: string | undefined },
+  wait: SessionAttemptWait,
 ): Promise<SessionCommandPayload> {
   for (;;) {
-    throwIfStartCancelled(wait.signal);
+    throwIfCommandCancelled(wait.signal, wait.subject);
     if (sessionNotReadyReason(ctx, wait.staleEpoch) === undefined || Date.now() >= wait.deadline) {
       return sessionCommandPayload(ctx, wait.staleEpoch);
     }
@@ -1437,105 +1459,126 @@ async function readySessionCommandPayload(
   }
 }
 
-type InteractiveStart = { idempotencyKey: string; runId: string; payload: JsonObject };
+/**
+ * A session command whose side effect must happen once. Every send carries the
+ * same idempotency key and run ID, so the server adopts a committed command.
+ */
+type RetriedSessionCommand = {
+  operation: "run.start" | "followUp.queue" | "run.changeSettings";
+  /** Prefix of each send's request ID. */
+  requestPrefix: string;
+  idempotencyKey: string;
+  runId: string;
+  /** The payload without session authority, which each send adds afresh. */
+  payload: JsonObject;
+  /** Names the command in a cancellation error. */
+  subject: string;
+  /** The error when the command may have committed but no send confirmed it. */
+  unconfirmed: (error: Error) => Error;
+};
 
-type StartSend = { response: ClientResponse } | { error: Error; uncertain: boolean };
+type SessionCommandSend = { response: ClientResponse } | { error: Error; uncertain: boolean };
 
-/** A failed attempt names the epoch it sent when the start may have committed. */
-type StartAttempt = { response: ClientResponse } | { error: Error; staleEpoch?: string };
+/** A failed attempt names the epoch it sent when the command may have committed. */
+type SessionCommandAttempt = { response: ClientResponse } | { error: Error; staleEpoch?: string };
 
 /**
- * Send one interactive start with this session's current authority. A lost
+ * Send one session command with this session's current authority. A lost
  * connection or a replaced coordinator makes the carried epoch stale, and the
- * server may already have committed the start. The start therefore waits for the
- * session's next epoch and resends the same idempotency key and run ID, so the
- * server adopts a committed start instead of creating a second run.
+ * server may already have committed the command. The command therefore waits for
+ * the session's next epoch and resends the same idempotency key and run ID, so
+ * the server adopts a committed command instead of applying it a second time.
  */
-async function requestSessionStart(
+async function requestSessionCommand(
   client: WorkflowClient,
   ctx: ExtensionContext,
   wait: SessionWait,
-  start: InteractiveStart,
+  command: RetriedSessionCommand,
 ): Promise<ClientResponse> {
   const deadline = Date.now() + SESSION_COORDINATOR_READY_MS;
   let staleEpoch: string | undefined;
   for (let attempt = 1; ; attempt += 1) {
-    const sent = await attemptInteractiveStart(
+    const sent = await attemptSessionCommand(
       client,
       ctx,
-      { ...wait, deadline, staleEpoch },
-      start,
+      { ...wait, deadline, staleEpoch, subject: command.subject },
+      command,
       attempt,
     );
     if ("response" in sent) return sent.response;
-    // After one uncertain send, every later failure leaves the start unconfirmed.
+    // After one uncertain send, every later failure leaves the command unconfirmed.
     const uncertain = staleEpoch !== undefined || sent.staleEpoch !== undefined;
-    if (sent.staleEpoch === undefined || attempt >= MAX_INTERACTIVE_START_ATTEMPTS) {
-      throw uncertain ? unconfirmedStart(start.runId, sent.error) : sent.error;
+    if (sent.staleEpoch === undefined || attempt >= MAX_SESSION_COMMAND_ATTEMPTS) {
+      throw uncertain ? command.unconfirmed(sent.error) : sent.error;
     }
     staleEpoch = sent.staleEpoch;
   }
 }
 
-async function attemptInteractiveStart(
+async function attemptSessionCommand(
   client: WorkflowClient,
   ctx: ExtensionContext,
-  wait: SessionWait & { deadline: number; staleEpoch?: string | undefined },
-  start: InteractiveStart,
+  wait: SessionAttemptWait,
+  command: RetriedSessionCommand,
   attempt: number,
-): Promise<StartAttempt> {
+): Promise<SessionCommandAttempt> {
   let session: SessionCommandPayload;
   try {
     session = await readySessionCommandPayload(ctx, wait);
   } catch (error) {
     return { error: toError(error) };
   }
-  const sent = await sendInteractiveStart(client, start, session, attempt);
+  const sent = await sendSessionCommand(client, command, session, attempt);
   if ("response" in sent) return sent;
   return sent.uncertain
     ? { error: sent.error, staleEpoch: session.coordinatorEpoch }
     : { error: sent.error };
 }
 
-async function sendInteractiveStart(
+async function sendSessionCommand(
   client: WorkflowClient,
-  start: InteractiveStart,
+  command: RetriedSessionCommand,
   session: SessionCommandPayload,
   attempt: number,
-): Promise<StartSend> {
+): Promise<SessionCommandSend> {
   try {
     await client.ensureAvailable();
   } catch (error) {
-    // Nothing was sent, so this attempt cannot have committed a start.
+    // Nothing was sent, so this attempt cannot have committed the command.
     return { error: toError(error), uncertain: false };
   }
   let response: ClientResponse;
   try {
     response = await client.requestDurable({
-      operation: "run.start",
+      operation: command.operation,
       requestId:
         attempt === 1
-          ? `start-${start.idempotencyKey}`
-          : `start-${start.idempotencyKey}-${attempt}`,
-      idempotencyKey: start.idempotencyKey,
-      runId: start.runId,
-      payload: { ...session, ...start.payload },
+          ? `${command.requestPrefix}-${command.idempotencyKey}`
+          : `${command.requestPrefix}-${command.idempotencyKey}-${attempt}`,
+      idempotencyKey: command.idempotencyKey,
+      runId: command.runId,
+      payload: { ...session, ...command.payload },
     });
   } catch (error) {
-    // A transport failure can follow a committed start. A version mismatch cannot.
+    // A transport failure can follow a committed command. A version mismatch cannot.
     return { error: toError(error), uncertain: !(error instanceof WorkflowClientVersionError) };
   }
   if (response.outcome === "accepted" || response.outcome === "adopted") return { response };
   return {
-    error: new Error(response.error ?? "Workflow server rejected run.start"),
+    error: new Error(response.error ?? `Workflow server rejected ${command.operation}`),
     uncertain: response.outcome === "rejected" && STALE_AUTHORITY_ERRORS.has(response.error ?? ""),
   };
 }
 
-function unconfirmedStart(runId: string, error: unknown): Error {
-  return new Error(
-    `Workflow run ${runId} may have been created, but its start could not be confirmed: ${errorMessage(error)}. Check /workflow status before you start it again.`,
-  );
+/**
+ * The error of a command that may have committed: `effect` names what may have
+ * happened, and `repeat` the action to check before the user repeats it.
+ */
+function unconfirmedCommand(effect: string, repeat: string) {
+  return (error: Error): Error =>
+    new Error(
+      `${effect}, but it could not be confirmed: ${errorMessage(error)}. Check /workflow status before you ${repeat} again.`,
+    );
 }
 
 function toError(error: unknown): Error {
