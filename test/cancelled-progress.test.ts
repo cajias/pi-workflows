@@ -12,7 +12,7 @@ import { WorkflowEngine } from "../src/workflows/engine.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import {
   createDefinitionSnapshot,
-  settleCancelledRunProgress,
+  settleEndedRunProgress,
   WorkflowRunStore,
 } from "../src/workflows/store.js";
 import type { WorkflowDefinition, WorkflowUpdateRecord } from "../src/workflows/types.js";
@@ -138,17 +138,21 @@ function attemptRow(state: StateDatabase, attemptId: string | undefined) {
 
 const open = ["agents/review", "agents/review/a", "agents/review/b"];
 
-function expectSettled(updates: readonly WorkflowUpdateRecord[] | undefined, attemptId: string) {
+function expectSettled(
+  updates: readonly WorkflowUpdateRecord[] | undefined,
+  attemptId: string,
+  status = "cancelled",
+) {
   const current = byKey(updates);
   expect(current.get("progress:agents/review")).toMatchObject({
     attemptId,
-    data: progress("cancelled", { phase: "cancelled", completed: 1, total: 3, unit: "s" }),
+    data: progress(status, { phase: status, completed: 1, total: 3, unit: "s" }),
   });
   expect(current.get("progress:agents/review/a")?.data).toEqual(
-    progress("cancelled", { label: "Reviewer A", phase: "cancelled" }),
+    progress(status, { label: "Reviewer A", phase: status }),
   );
   expect(current.get("progress:agents/review/b")?.data).toEqual(
-    progress("cancelled", { phase: "cancelled" }),
+    progress(status, { phase: status }),
   );
   expect(current.get("progress:agents/review/c")?.data).toEqual(
     progress("completed", { phase: "completed" }),
@@ -225,6 +229,50 @@ describe("progress of a cancelled run", () => {
     run.state.close();
   }, 60_000);
 
+  it("settles open tracks as failed when the server fails an active run", async () => {
+    const run = await startRun("active-fail");
+    const before = run.runs.runRevision(run.runId);
+    const attemptId = run.runs.readRunState(run.runId)?.currentAttemptId;
+    if (attemptId === undefined) throw new Error("active attempt missing");
+
+    expect(
+      run.queue.failWorkflowRun({
+        runId: run.runId,
+        claimToken: run.claimToken,
+        errorCode: "missingSubmission",
+        errorMessage: "Workflow step ended without its required result",
+      }),
+    ).toBe(true);
+
+    const after = run.runs.runRevision(run.runId);
+    expect(after).toBe(before + open.length + 1);
+    const loaded = run.runs.readRun(run.runId, { includeTrace: true });
+    expect(loaded?.state.status).toBe("failed");
+    expectSettled(loaded?.state.updates, attemptId, "failed");
+    const tail = loaded?.traceEvents?.slice(-(open.length + 1)) ?? [];
+    expect(tail.map((event) => [event.seq, event.type])).toEqual([
+      [before + 1, "update_published"],
+      [before + 2, "update_published"],
+      [before + 3, "update_published"],
+      [before + 4, "run.queue_failed"],
+    ]);
+    expect(tail.slice(0, open.length).map((event) => event.payload.key)).toEqual(open);
+    expect(
+      run.state.connection
+        .prepare("SELECT status FROM node_attempts WHERE attempt_id = ?")
+        .get(attemptId),
+    ).toEqual({ status: "failed" });
+    expectSettled(run.views.run(run.runId)?.updates as WorkflowUpdateRecord[], attemptId, "failed");
+    run.state.integrityCheck();
+    expect(workflowStateViolations(run.state)).toEqual([]);
+
+    run.engine.cancel();
+    await expect(run.running).rejects.toThrow(/claim lost/);
+    expect(run.runs.runRevision(run.runId)).toBe(after);
+    expectSettled(run.runs.readRunState(run.runId)?.updates, attemptId, "failed");
+    run.state.close();
+  }, 60_000);
+
   it("settles open tracks when a paused run without a live claim is cancelled", async () => {
     const run = await startRun("paused-cancel");
     const attemptId = run.runs.readRunState(run.runId)?.currentAttemptId;
@@ -256,8 +304,8 @@ describe("progress of a cancelled run", () => {
 
   it("settles progress only inside the cancellation transaction", async () => {
     const run = await startRun("outside-transaction");
-    expect(() => settleCancelledRunProgress(run.state, run.runId, Date.now())).toThrow(
-      /inside the cancellation transaction/,
+    expect(() => settleEndedRunProgress(run.state, run.runId, "cancelled", Date.now())).toThrow(
+      /inside the terminal transaction/,
     );
     run.engine.cancel();
     await run.running;

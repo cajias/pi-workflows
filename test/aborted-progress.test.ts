@@ -12,6 +12,7 @@ import { abortedAttemptProgress } from "../src/workflows/progress.js";
 import { WorkflowRunStore, readWorkflowRun } from "../src/workflows/store.js";
 import type {
   WorkflowActionContext,
+  WorkflowRunState,
   WorkflowTraceEvent,
   WorkflowUpdateInput,
   WorkflowUpdateRecord,
@@ -597,6 +598,119 @@ describe("progress of aborted attempts", () => {
       replacementAttemptId,
       replacementAttemptId,
     ]);
+  });
+
+  it("settles the tracks of an attempt that a resume discards", async () => {
+    const databasePath = await makeStateDatabasePath("discarded-tracks");
+    let attempts = 0;
+    let published = 0;
+    const workflow = defineWorkflow({
+      name: "discarded-tracks",
+      startAt: "work",
+      nodes: {
+        work: action({
+          effect: idempotentEffect("test.discarded-tracks"),
+          run: async ({ publishUpdate }) => {
+            attempts += 1;
+            if (attempts === 1) {
+              await publishUpdate(
+                track("overall", "running", { completed: 1, total: 2, unit: "agents" }),
+              );
+              await publishUpdate(track("agents/a", "running", { label: "A" }));
+              await publishUpdate(track("agents/done", "completed"));
+            } else {
+              await publishUpdate(track("overall", "running", { phase: "second" }));
+              await publishUpdate(track("agents/b", "running"));
+            }
+            published = attempts;
+            return await hang();
+          },
+        }),
+      },
+      edges: [],
+    });
+    const first = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
+    const running = first.run(workflow, {});
+    await waitUntil(() => published === 1);
+    first.park();
+    const parked = await running;
+    const discarded = durableUpdates(databasePath, parked.runId).updates.get("agents/a")?.attemptId;
+    if (discarded === undefined) throw new Error("first attempt track missing");
+
+    const recovery = new WorkflowRunStore(databasePath);
+    expect(await recovery.recoverApplyingEffects(parked.runId)).toBe("safe");
+    recovery.close();
+    let engineState: WorkflowRunState | undefined;
+    const second = new WorkflowEngine({
+      databasePath,
+      executor: new ScriptedExecutor(),
+      onEvent: (_event, state) => {
+        engineState = state;
+      },
+    });
+    const resumed = second.resumeRun(workflow, parked.runId);
+    await waitUntil(() => published === 2);
+
+    // The resume settles each open track of the discarded attempt once, right after run_resumed.
+    const afterResume = durableUpdates(databasePath, parked.runId);
+    const resumedAt = afterResume.trace.findIndex((event) => event.type === "run_resumed");
+    const settlement = afterResume.trace.slice(resumedAt + 1, resumedAt + 3);
+    expect(settlement.map((event) => [event.type, event.attemptId, event.payload.key])).toEqual([
+      ["update_published", discarded, "overall"],
+      ["update_published", discarded, "agents/a"],
+    ]);
+    expect(settlement.map((event) => event.seq)).toEqual([
+      afterResume.trace[resumedAt]!.seq + 1,
+      afterResume.trace[resumedAt]!.seq + 2,
+    ]);
+    const settledA = afterResume.updates.get("agents/a");
+    expect(settledA).toMatchObject({
+      attemptId: discarded,
+      data: progress("cancelled", { label: "A", phase: "interrupted" }),
+    });
+    expect(afterResume.updates.get("agents/done")?.data).toEqual(progress("completed"));
+
+    // The retired attempt keeps its window and has no step record.
+    const store = new WorkflowRunStore(databasePath);
+    const connection = store.state.connection;
+    expect(
+      connection
+        .prepare(
+          `SELECT status, started_at IS NOT NULL AS started, finished_at IS NOT NULL AS finished
+           FROM node_attempts WHERE attempt_id = ?`,
+        )
+        .get(discarded),
+    ).toEqual({ status: "cancelled", started: 1, finished: 1 });
+    expect(
+      connection.prepare("SELECT 1 FROM run_steps WHERE attempt_id = ?").get(discarded),
+    ).toBeUndefined();
+
+    // The engine still holds the discarded attempt's open record, which does not
+    // change how it settles its own attempt.
+    expect(engineState?.updates?.find((update) => update.key === "agents/a")).toMatchObject({
+      attemptId: discarded,
+      data: progress("running", { label: "A" }),
+    });
+    second.cancel();
+    const cancelled = await resumed;
+    expect(cancelled.state.status).toBe("cancelled");
+    const final = durableUpdates(databasePath, parked.runId);
+    const current = cancelled.state.currentAttemptId ?? cancelled.state.results.work?.attemptId;
+    expect(current).not.toBe(discarded);
+    expect(final.updates.get("agents/a")).toEqual(settledA);
+    expect(final.updates.get("agents/b")).toMatchObject({
+      attemptId: current,
+      data: progress("cancelled", { phase: "cancelled" }),
+    });
+    expect(final.updates.get("overall")).toMatchObject({
+      attemptId: current,
+      data: progress("cancelled", { phase: "cancelled" }),
+    });
+    const later = final.trace.slice(resumedAt + 3);
+    expect(
+      later.filter((event) => event.type === "update_published" && event.attemptId === discarded),
+    ).toEqual([]);
+    store.close();
   });
 
   it("writes no settlement when a run is cancelled at a pause boundary", async () => {

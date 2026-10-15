@@ -1652,6 +1652,7 @@ export class WorkflowRunStore {
         const snapshot = this.readDefinition(run.definitionHash);
         const current = this.materializeRunState(run, snapshot);
         const state = applyExecutionTransition(current, snapshot, transition, at);
+        let retiredAttempts: { attemptId: string; nodeId: string }[] = [];
         if (
           transition.kind === "finishAttempt" &&
           transition.step.nodeType === "checkpoint" &&
@@ -1717,10 +1718,13 @@ export class WorkflowRunStore {
           const retired = this.state.connection
             .prepare(
               `UPDATE node_attempts SET status = 'cancelled', finished_at = ?, updated_at = ?
-             WHERE attempt_id = ? AND run_id = ? AND status = 'interrupted'`,
+             WHERE attempt_id = ? AND run_id = ? AND status = 'interrupted'
+             RETURNING attempt_id AS attemptId, node_id AS nodeId`,
             )
-            .run(now, now, current.currentAttemptId, runId);
-          if (retired.changes !== 1) throw new Error("Only an interrupted attempt can be replaced");
+            .all(now, now, current.currentAttemptId, runId)
+            .filter(isAttemptIdentityRow);
+          if (retired.length !== 1) throw new Error("Only an interrupted attempt can be replaced");
+          retiredAttempts = retired;
         }
         const event = transition.event;
         this.assertSettingsRouteCurrent(event, snapshot);
@@ -1749,6 +1753,19 @@ export class WorkflowRunStore {
           now,
         });
         context.revision = revision;
+        // The replaced attempt has ended, so its open tracks settle after run_resumed.
+        for (const settled of settleAttemptProgress(
+          this.state,
+          runId,
+          retiredAttempts,
+          "interrupted",
+          now,
+        )) {
+          state.updates = updateProjection(state.updates, settled.record);
+          state.traceSeq = settled.event.seq;
+          recordViewerDeltas(this.state, runId, runViewerTargets(state, settled.event), now);
+          context.revision = settled.event.seq;
+        }
         accepted = traceEvent;
       });
       if (accepted === undefined) throw new Error("Workflow snapshot transaction did not commit");
@@ -4464,28 +4481,28 @@ function readCurrentUpdateRecords(
   }));
 }
 
+/** Why an attempt ended outside the engine, as the final progress records state it. */
+type EndedAttemptOutcome = "failed" | "cancelled" | "interrupted";
+
 /**
- * Give the open progress tracks of the attempts that a run cancellation ends a
- * terminal `cancelled` record. A workflow server cancellation commits outside
- * the engine and stops the runner, so the aborted attempt cannot settle its own
- * tracks. Call this inside the cancellation transaction, before the attempts
- * are marked cancelled. Each settled track is one ordinary update row and
- * `update_published` event, and every event needs its own run revision
- * (`UNIQUE(resource_id, resource_revision)`), so the run revision advances once
- * per settled track. See docs/SQLITE_STATE.md.
+ * Give the open progress tracks of the attempts that a workflow server run
+ * failure or cancellation ends a terminal `failed` or `cancelled` record. Both
+ * commit outside the engine and stop the runner, so the aborted attempt cannot
+ * settle its own tracks. Call this inside the terminal transaction, before the
+ * attempts are marked failed or cancelled. Each settled track is one ordinary
+ * update row and `update_published` event, and every event needs its own run
+ * revision (`UNIQUE(resource_id, resource_revision)`), so the run revision
+ * advances once per settled track. See docs/SQLITE_STATE.md.
  */
-export function settleCancelledRunProgress(state: StateDatabase, runId: string, now: number): void {
+export function settleEndedRunProgress(
+  state: StateDatabase,
+  runId: string,
+  outcome: "failed" | "cancelled",
+  now: number,
+): void {
   if (!state.connection.inTransaction) {
-    throw new Error("Cancelled progress must settle inside the cancellation transaction");
+    throw new Error("Ended progress must settle inside the terminal transaction");
   }
-  const run = state.connection
-    .prepare("SELECT resource_id AS resourceId FROM runs WHERE run_id = ?")
-    .get(runId);
-  /* istanbul ignore if -- the caller selected this run in the same transaction */
-  if (!isRecord(run) || typeof run.resourceId !== "string") {
-    throw new Error(`Workflow run is missing: ${runId}`);
-  }
-  const resourceId = run.resourceId;
   const attempts = state.connection
     .prepare(
       `SELECT attempt_id AS attemptId, node_id AS nodeId FROM node_attempts
@@ -4494,11 +4511,34 @@ export function settleCancelledRunProgress(state: StateDatabase, runId: string, 
     )
     .all(runId)
     .filter(isAttemptIdentityRow);
-  if (attempts.length === 0) return;
+  settleAttemptProgress(state, runId, attempts, outcome, now);
+}
+
+/**
+ * Write the terminal progress records of the given attempts' open tracks inside
+ * the caller's transaction, advancing the run revision once per record.
+ */
+function settleAttemptProgress(
+  state: StateDatabase,
+  runId: string,
+  attempts: readonly { attemptId: string; nodeId: string }[],
+  outcome: EndedAttemptOutcome,
+  now: number,
+): { event: WorkflowTraceEvent; record: WorkflowUpdateRecord }[] {
+  if (attempts.length === 0) return [];
+  const run = state.connection
+    .prepare("SELECT resource_id AS resourceId FROM runs WHERE run_id = ?")
+    .get(runId);
+  /* istanbul ignore if -- the caller selected this run in the same transaction */
+  if (!isRecord(run) || typeof run.resourceId !== "string") {
+    throw new Error(`Workflow run is missing: ${runId}`);
+  }
+  const resourceId = run.resourceId;
   const current = readCurrentUpdateRecords(state, runId);
   const at = new Date(now).toISOString();
+  const settled: { event: WorkflowTraceEvent; record: WorkflowUpdateRecord }[] = [];
   for (const attempt of attempts) {
-    for (const update of abortedAttemptProgress(current, attempt.attemptId, "cancelled")) {
+    for (const update of abortedAttemptProgress(current, attempt.attemptId, outcome)) {
       const revision = state.connection
         .prepare(
           `UPDATE resources SET revision = revision + 1, updated_at = ?
@@ -4507,7 +4547,7 @@ export function settleCancelledRunProgress(state: StateDatabase, runId: string, 
         .get(now, resourceId);
       /* istanbul ignore if -- exact schema and internal query shape */
       if (!isRevisionRow(revision)) throw new Error(`Resource is missing: ${resourceId}`);
-      insertWorkflowUpdate(state, resourceId, {
+      const record: WorkflowUpdateRecord = {
         updateId: createUpdateId(),
         seq: revision.revision,
         at,
@@ -4515,9 +4555,11 @@ export function settleCancelledRunProgress(state: StateDatabase, runId: string, 
         nodeId: attempt.nodeId,
         attemptId: attempt.attemptId,
         ...update,
-      });
+      };
+      settled.push({ event: insertWorkflowUpdate(state, resourceId, record), record });
     }
   }
+  return settled;
 }
 
 function isAttemptIdentityRow(value: unknown): value is { attemptId: string; nodeId: string } {

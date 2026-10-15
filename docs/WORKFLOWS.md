@@ -1295,15 +1295,18 @@ engine rejects every update from that attempt, so an action that ignores the
 signal and keeps reporting never changes durable state. The runtime settles
 those tracks instead.
 
-When an attempt ends with the outcome `timed_out` or `cancelled`, every
+When an attempt ends with the outcome `timed_out` or `cancelled`, when the
+workflow server fails or cancels its run, or when a resume replaces it, every
 `progress` track whose current record belongs to that attempt and whose status
 is not `completed`, `failed`, or `cancelled` receives one more record for the
 same attempt:
 
-| Attempt outcome | `status`    | `phase`     |
-| --------------- | ----------- | ----------- |
-| `timed_out`     | `failed`    | `timed out` |
-| `cancelled`     | `cancelled` | `cancelled` |
+| How the attempt ended                  | `status`    | `phase`       |
+| -------------------------------------- | ----------- | ------------- |
+| Outcome `timed_out`                    | `failed`    | `timed out`   |
+| Outcome `cancelled` or run cancelled   | `cancelled` | `cancelled`   |
+| Run failed by the workflow server      | `failed`    | `failed`      |
+| Interrupted attempt replaced on resume | `cancelled` | `interrupted` |
 
 The progress profile has no timed-out status. `failed` keeps a timed-out track
 with the failed tracks that the Pi widget lists first, and the phase says why
@@ -1333,32 +1336,41 @@ estimate no longer applies.
   attempts, and the cancelled run commit together, or none of them do. Each
   record advances the run revision once, as
   [SQLite state](SQLITE_STATE.md#write-contract) describes.
+- A run that the workflow server fails without the engine, through
+  `WorkflowRunQueueStore.failWorkflowRun` when the missing-submission reminders
+  run out or a runner cannot load its workflow source, is settled the same way.
+  The failure transaction writes the `failed` records for every attempt it
+  fails, before its `run.queue_failed` event. The records, the failed attempts,
+  and the failed run commit together.
 - A parked attempt is abandoned for resume, not ended, so its tracks stay open.
   This includes a runner that the workflow server stops for a pause, a
-  handoff, or a server shutdown. If the run is cancelled while it is parked,
-  the cancellation settles them.
-- Settlement goes only through the active attempt, so a retired attempt in
-  [`unrecordedAttempts`](#unrecorded-attempts) is never reactivated:
-  `WorkflowRunStore.publishUpdate` rejects every update whose attempt is not
-  the run's current attempt ("Workflow update does not match the active
-  attempt"), and the queue settles only attempts that are still pending,
-  running, waiting, or interrupted.
+  handoff, or a server shutdown. If the run is cancelled or failed while it is
+  parked, that transaction settles them.
+- A resume either keeps the interrupted attempt (a checkpoint, an
+  assistant-message node, or a submitted interaction) or replaces it with a new
+  attempt. A replaced attempt has ended: the resume transaction marks it
+  `cancelled`, records its `finished_at`, and settles its open tracks with the
+  phase `interrupted`, right after the `run_resumed` event. The attempt keeps
+  its `started_at` and has no step record. The new attempt publishes its own
+  tracks; a key that it publishes again replaces the settled record. A kept
+  attempt's tracks stay open.
+- The resumed engine's in-memory update list still holds the replaced
+  attempt's last open records. The engine settles only the tracks of the
+  attempt that it is running, so these stale records never change engine
+  behavior, and durable reads show the settled records.
+- Settlement never reactivates a retired attempt in
+  [`unrecordedAttempts`](#unrecorded-attempts). `WorkflowRunStore.publishUpdate`
+  rejects every update whose attempt is not the run's current attempt
+  ("Workflow update does not match the active attempt"), the queue settles only
+  attempts that are still pending, running, waiting, or interrupted, and a
+  resume writes the replaced attempt's records directly after retiring it.
+  Those writes neither change its `node_attempts` row nor add a `run_steps`
+  row.
 
-Known limitations:
-
-- When a parked run resumes and the node runs again under a new attempt, the
-  discarded attempt's open tracks are not settled. A track is replaced only
-  when the new attempt publishes the same key again. A key that the new
-  attempt never publishes keeps its last open state, also after the run later
-  completes or is cancelled.
-- A run that the workflow server fails without the engine keeps the open
-  tracks of its last attempt. The server does this with
-  `WorkflowRunQueueStore.failWorkflowRun` when the missing-submission
-  reminders run out or a runner cannot load its workflow source. Those tracks
-  keep the last state that their attempt published, while the run and node
-  status show the failure. `WorkflowRunStore.markRunInterrupted`, which fails
-  an abandoned run as interrupted, behaves the same way, but nothing in
-  production calls it at present.
+Known limitation: `WorkflowRunStore.markRunInterrupted`, which fails an
+abandoned run as interrupted, does not settle its last attempt's open tracks.
+Those tracks keep the last state that their attempt published, while the run
+status shows the failure. Nothing in production calls it at present.
 
 ## Wake recovery
 

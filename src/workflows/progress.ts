@@ -42,14 +42,17 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const ABORTED_PROGRESS = {
   timed_out: { status: "failed", phase: "timed out" },
   cancelled: { status: "cancelled", phase: "cancelled" },
+  failed: { status: "failed", phase: "failed" },
+  interrupted: { status: "cancelled", phase: "interrupted" },
 } as const;
 
 /**
  * Terminal snapshots for the progress tracks that one attempt left open when a
- * timeout or cancellation ended it. Only tracks whose current record belongs
- * to that attempt change, so terminal states and other attempts' tracks stay as
- * published. Each snapshot keeps the label and counts, records why the attempt
- * ended, and drops a finish estimate that no longer applies.
+ * timeout, cancellation, run failure, or resume replacement ended it. Only
+ * tracks whose current record belongs to that attempt change, so terminal
+ * states and other attempts' tracks stay as published. Each snapshot keeps the
+ * label and counts, records why the attempt ended, and drops a finish estimate
+ * that no longer applies.
  */
 export function abortedAttemptProgress(
   updates: readonly WorkflowUpdateRecord[] | undefined,

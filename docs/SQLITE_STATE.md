@@ -358,20 +358,33 @@ Any failed check rolls back the complete command.
 A command that combines several domain writes in one transaction advances the run resource
 revision once for each event it writes. For example, an `interaction.update` claims the waiting
 run for control, publishes the update, and parks the run again, which is +3. Failing a run whose
-missing-submission reminders ran out claims the run and then fails it, which is +2.
+missing-submission reminders ran out claims the run and then fails it, which is +2 plus one for
+each progress track that the failure settles.
 
-The queue's run cancellation (`WorkflowRunQueueStore.cancelWorkflowRun`, through `terminalRun` or
-`cancelStaleWorkflowRun`, and their shared `cancelWorkflowRunDependents`) advances the run
-revision by N + 1, where N is the number of progress tracks it settles. A workflow server
-cancellation commits outside the engine and stops the runner, so the cancelled attempt cannot
-settle its own progress tracks. The transaction settles them itself: every open progress track
-of an attempt it cancels gets a terminal `cancelled` record. Each record is an ordinary
-`workflow_updates` row with its own `update_published` event, so the run view, the trace, and
-every renderer read it like any other update. `events` stores one event per resource revision
-(`UNIQUE(resource_id, resource_revision)`), so N settled records need N run revisions before the
-`run.queue_cancelled` event. A cancellation that settles N tracks therefore advances the run
-revision by N + 1. Every settled record, the cancelled attempts, and the cancelled run commit
-in one transaction, or none of them do. Every run revision still has exactly one event.
+Three writes outside the engine settle the progress tracks of the attempts they end, and each
+advances the run revision once per settled track:
+
+- The queue's run cancellation (`WorkflowRunQueueStore.cancelWorkflowRun`, through `terminalRun`
+  or `cancelStaleWorkflowRun`, and their shared `cancelWorkflowRunDependents`) gives every open
+  progress track of an attempt it cancels a terminal `cancelled` record.
+- The queue's server-side run failure (`WorkflowRunQueueStore.failWorkflowRun`, through
+  `terminalRun`) gives every open progress track of an attempt it fails a terminal `failed`
+  record with the phase `failed`.
+- A resume that replaces an interrupted attempt (`WorkflowRunStore.commitTransition`, for a
+  `resume` transition without an attempt ID) marks that attempt `cancelled`, sets its
+  `finished_at`, and gives each of its open progress tracks a terminal `cancelled` record with
+  the phase `interrupted`. The attempt row keeps its `started_at` and gets no `run_steps` row.
+
+A workflow server cancellation or failure commits outside the engine and stops the runner, and a
+replaced attempt never runs again, so none of these attempts can settle its own progress tracks.
+Each record is an ordinary `workflow_updates` row with its own `update_published` event, so the
+run view, the trace, and every renderer read it like any other update. `events` stores one event
+per resource revision (`UNIQUE(resource_id, resource_revision)`), so N settled records need N run
+revisions. The cancellation and failure write them before their `run.queue_cancelled` or
+`run.queue_failed` event and advance the run revision by N + 1. The resume writes them after its
+`run_resumed` event, which is +1 + N. Every settled record, the ended attempts, and the run
+change commit in one transaction, or none of them do. Every run revision still has exactly one
+event.
 
 No reader assumes a +1 step. Runner messages, restarts, and child-run starts compare an expected
 run revision for equality, and the runner adopts the revision that the server returns. A run
