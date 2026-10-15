@@ -1083,10 +1083,64 @@ describe.each(["github", "gitlab"] as const)(
       await expect(commitLocal(localCommit(published), onForge(fixtureContext()))).rejects.toThrow(
         `local commit repositories[0]: refs/remotes/origin/feat/demo moved to ${published}, a commit this run did not publish (pushed by this run or by someone else). Git keeps no reflog for that ref, so the workflow cannot tell who moved it. ${PUSH_GUIDANCE}`,
       );
+      const p2 = await commitAt(fixture.repository, "p2", DURING_RUN);
+      await pushAt(fixture.repository, DURING_RUN);
+      const movedToP2 = `refs/remotes/origin/feat/demo moved to ${p2}, a commit this run did not publish`;
+      await expect(commitLocal(localCommit(p2), afterPublish)).rejects.toThrow(movedToP2);
+      // An accepted verifyP2 is the newest published head.
+      const p2Pushed = onForge(
+        fixtureContext([
+          publishAttempt(published),
+          attemptAt(
+            "verifyP2",
+            {
+              passed: true,
+              pushed: true,
+              repositories: [fixtureCandidate(p2, { pr: prFor(forge) })],
+            },
+            "2026-06-02T00:00:00.000Z",
+            "2026-06-02T00:01:00.000Z",
+          ),
+        ]),
+      );
+      await expect(commitLocal(localCommit(p2), p2Pushed)).resolves.toBeDefined();
+      // A failed publish does not count as a published head.
+      const failedPublish = onForge(
+        fixtureContext([publishAttempt(published), publishAttempt(p2, "failed")]),
+      );
+      await expect(commitLocal(localCommit(p2), failedPublish)).rejects.toThrow(movedToP2);
       const suggestion = await commitElsewhere(remote);
       await git(fixture.repository, ["fetch", "-q", "origin"]);
-      await expect(commitLocal(localCommit(published), afterPublish)).rejects.toThrow(
+      await expect(commitLocal(localCommit(p2), afterPublish)).rejects.toThrow(
         `refs/remotes/origin/feat/demo moved to ${suggestion}, a commit this run did not publish (pushed by this run or by someone else)`,
+      );
+    });
+
+    it("excuses a reviewed head without a reflog after its publication failed", async () => {
+      await addBareOrigin(fixture.repository);
+      await git(fixture.repository, ["config", "core.logAllRefUpdates", "false"]);
+      const reviewed = await commitAt(fixture.repository, "reviewed", DURING_RUN);
+      await pushAt(fixture.repository, PUBLISHED_AT);
+      const fix = await commitAt(fixture.repository, "repair", DURING_RUN);
+      await expect(
+        commitLocal(
+          localCommit(fix),
+          onForge(fixtureContext([...cleanReview(reviewed), publishAttempt(reviewed, "failed")])),
+        ),
+      ).resolves.toBeDefined();
+      // Without a passed review, the same failed publication excuses nothing.
+      await expect(
+        commitLocal(
+          localCommit(fix),
+          onForge(
+            fixtureContext([
+              ...cleanReview(reviewed, { p1: ["race"] }),
+              publishAttempt(reviewed, "failed"),
+            ]),
+          ),
+        ),
+      ).rejects.toThrow(
+        `local commit repositories[0]: refs/remotes/origin/feat/demo moved to ${reviewed}, a commit this run did not publish (pushed by this run or by someone else). Git keeps no reflog for that ref, so the workflow cannot tell who moved it. ${PUSH_GUIDANCE}`,
       );
     });
   },
