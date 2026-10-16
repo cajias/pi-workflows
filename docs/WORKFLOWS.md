@@ -1557,7 +1557,7 @@ The [Sanity Check](#built-in-sanity-check) agent group host loads the agent grou
 
 ## Host-provided Pi packages
 
-Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox` only to code that Pi loads itself. `pi install` installs this package with npm's legacy peer handling, so those packages are absent from an installed package tree. They resolve only through Pi's extension module mapping.
+Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox` only to code that Pi loads itself. `pi install` installs this package with npm's legacy peer handling, so the four `@earendil-works` packages are absent from an installed package tree, and they resolve only through Pi's extension module mapping. `typebox` is installed anyway, because `@earendil-works/pi-protocol`, a regular dependency of `@earendil-works/pi-server`, depends on it. This package declares `typebox` only as a peer and a development dependency, so that copy belongs to `pi-protocol`, and the rule below applies to `typebox` as well.
 
 The workflow server, workflow runner, resource-manager runner, decision-channel adapter, source resolver, and `piw` CLI are plain Node processes without that mapping. Every module that one of them can load must not value-import a host-provided package. This includes the public `@osolmaz/pi-workflows`, `/builtins`, `/resource-managers`, and `/client` entry points that workflow files load in those processes. Use a declaration-level `import type` for types. An inline `import { type Name }` still loads the module.
 
@@ -1598,12 +1598,16 @@ package: production dependencies only, with `--legacy-peer-deps`. Pi installs an
 npm package with `npm install <spec> --prefix <root> --legacy-peer-deps`. The test
 also passes `--omit=dev`, the flag that Pi adds for a git package's dependencies,
 as a safety margin. That changes nothing, because the generated consumer
-`package.json` declares no dependencies. Without peer installation, the packages
-that Pi supplies to extensions are absent, as they are for a user, and
-the test fails if Node could resolve any of them from the installed package. Pi
-provides them at run time only to code that it loads itself, so a plain Node
-workflow process that imports one fails in this test. The test then starts the
-repository-pinned base Pi with only that Pi Workflows installation. It checks
+`package.json` declares no dependencies. Without peer installation, the four
+`@earendil-works` packages that Pi supplies to extensions are absent, as they are
+for a user, and `assertHostPackagesAbsent` fails the test if Node could resolve any
+of them from the installed package. Pi provides them at run time only to code that
+it loads itself, so a plain Node workflow process that imports one fails in this
+test. `typebox` is present, installed through `@earendil-works/pi-server` and
+`@earendil-works/pi-protocol`, so that check does not cover it. The
+`test/plain-node-entries.test.ts` graph guard, which allows only this package's
+`dependencies`, still fails when a plain Node module imports `typebox`. The test
+then starts the repository-pinned base Pi with only that Pi Workflows installation. It checks
 command isolation, server startup, widget and status changes, pause, resume,
 completion, and `piw <runId> --once` output.
 

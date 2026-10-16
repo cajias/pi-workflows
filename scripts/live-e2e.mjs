@@ -21,8 +21,9 @@ const MODEL_TIMEOUT_MS = 10 * 60 * 1_000;
 const DIAGNOSTIC_CHARS = 12_000;
 /**
  * Packages that Pi supplies to the extensions it loads. A Pi-style install leaves them out of
- * the package tree. `typebox` is not listed: `@earendil-works/pi-server` installs it as a
- * regular dependency.
+ * the package tree. `typebox` is not listed: `@earendil-works/pi-protocol`, a regular dependency
+ * of `@earendil-works/pi-server`, installs it. `test/plain-node-entries.test.ts` still keeps plain
+ * Node modules from importing it.
  */
 const HOST_PI_PACKAGES = [
   "@earendil-works/pi-agent-core",

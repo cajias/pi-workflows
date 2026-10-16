@@ -11,7 +11,9 @@ import { canonicalJson, digest } from "./human-decision.js";
  *
  * Projection never replaces the durable record. The complete step result stays in run state. The
  * projection only builds the bounded copy that a prompt shows, and every value it removes leaves a
- * digest and a size behind.
+ * digest and a size behind. The one exception is {@link shedFields}: it drops a field without a
+ * digest, but only a field whose owner already states its size and its durable location, such as a
+ * failed check's `stderr` beside `stderrChars` and `outputRef`.
  *
  * Two rules keep the walk finite and predictable. A registered view runs once per schema on a path,
  * and the generic rules bound whatever the view returns. A view result also opens a fresh depth

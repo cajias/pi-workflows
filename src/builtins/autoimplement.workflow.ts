@@ -779,10 +779,16 @@ const RECENT_ATTEMPTS_LABEL = "Recent attempts: ";
  * Build the decide prompt inside one prompt ceiling.
  *
  * Every step result is projected first, so one large result cannot fill the request. When the
- * projected evidence still does not fit, the oldest ledger entries collapse to digests, and then the
- * largest observation field collapses to a digest. The order is fixed, so the workflow keeps the
- * newest evidence and the small decisive fields for as long as it can. The complete results stay in
- * run state, so nothing is lost, only shortened.
+ * projected evidence still does not fit, three steps follow, in this fixed order:
+ *
+ * 1. The stderr of failed checks gives way, largest first. Each check keeps `stderrChars` and the
+ *    `outputRef` that names its complete logs.
+ * 2. The oldest ledger entries collapse to digests.
+ * 3. The largest observation field collapses to a digest.
+ *
+ * Each step runs only while the prompt still does not fit, so the workflow keeps the newest evidence
+ * and the small decisive fields for as long as it can. The complete results stay in run state, so
+ * nothing is lost, only shortened.
  */
 function decidePrompt(context: WorkflowNodeContext): string {
   const request = context.input as AutoimplementInput;
