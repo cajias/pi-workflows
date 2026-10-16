@@ -1849,6 +1849,10 @@ These are out of scope for this plan.
   - Found during F33: both commands build their session authority once, so a retry after a lost
     connection carries the stale coordinator epoch and is rejected as replaced. A user retry can
     then queue a second follow-up or apply a settings patch twice.
+  - Done in `e1fb70d` and `25f9909`, cherry-picked from `followups/f35-retry-session-authority`
+    (`598a496`, `ba19f8c`): each retry of either command rebuilds its session authority, so it
+    carries the current coordinator epoch. Live E2E: waived under the human's
+    no-live/no-billable rule for F35-F41.
 - F36: Isolate HOME, the Pi agent dir, and user config for every test process. _(done)_
   - Done in `fff8c27`, `b953cf2`, and `c834e44`: the global test setup points HOME,
     `PI_CODING_AGENT_DIR`, the XDG directories, git's global config, and npm's cache and user
@@ -1887,14 +1891,18 @@ These are out of scope for this plan.
     the F11-F14 waiver in the Validation section.
 - F38: Report Pi's own reason when no model exists at all; headless steps now show only
   `exited mid-step (code 1)`. _(done)_
-  - Done on `followups/f38-no-model-reason`: a step whose pi exits before the bridge reports the
+  - Done in `dbf2fe3` and `a7d7696`, cherry-picked from `followups/f38-no-model-reason`
+    (`5100d97`, `543b89c`): a step whose pi exits before the bridge reports the
     session started now adds the stderr that Pi wrote before then, such as `No models available`.
   - Review fix: the startup window also ends at Pi's first stdout, so a lost session-started
     line cannot keep stderr for the whole run; a test covers the bridge's real fd 2 writes.
+  - Live E2E: waived under the human's no-live/no-billable rule for F35-F41. F38a and F38b
+    stay open.
 - F38a: Report Pi's reason on the first step when pi exits during `register(child)`; that step
   now fails with a bare `Headless pi session is not running` (`src/server/rpc-executor.ts`,
   `promptForSubmission`) and skips the stderr wait.
-- F38b: Fix the three F38 review P2s.
+- F38b: Fix the three F38 review P2s. Still open: `a7d7696` does not cover them, and the test
+  "reports the exit when a model error line is malformed" still matches an unanchored regex.
   - Keep a malformed model-error protocol line out of the `Pi reported` text, and anchor the
     regex of the test "reports the exit when a model error line is malformed".
   - The test uses the global model registry instead of a `mkdtemp` registry under the test temp
@@ -1907,7 +1915,8 @@ These are out of scope for this plan.
     the `@osolmaz/pi-workflows/builtins` aliases, so a user workflow that reuses Sanity Check
     nodes loads a fresh copy of the builtins and cannot reach the agent group launcher that the
     runner installs.
-  - Done: the launcher lives in one `Symbol.for` slot on `globalThis`, so the fresh built-in
+  - Done in `5bad5ec`, cherry-picked from `followups/f39-sanity-group-launcher` (`3c273d3`): the
+    launcher lives in one `Symbol.for` slot on `globalThis`, so the fresh built-in
     module copy that the workflow loader evaluates for a user file sees the runner's launcher.
 - F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
   builtin-autoimplement-forge. _(done)_
@@ -1915,6 +1924,9 @@ These are out of scope for this plan.
     recorded attempt. Now each transition syncs only new attempts and attempts that newer
     session entries relink, and it reuses prepared statements. A row-equivalence test and a
     per-transition statement-count guard cover this. The suites pass 10/10 under 36-core load.
+  - Done in `f6e4c6b`, `2d3573f`, `bc1ef34`, and `0b2fb1d`, cherry-picked from
+    `followups/f40-load-sensitive-tests` (`e6a5c6b`, `6df3902`, `289025f`, `1f52c8f`). Live E2E:
+    waived under the human's no-live/no-billable rule for F35-F41.
   - Review P2s left unfixed: the sync-position map never shrinks, consistent with the existing
     contexts map; the full-sync baseline test runs the new code; and the Buffer helper's failure
     message is less detailed.
@@ -2063,3 +2075,13 @@ These are out of scope for this plan.
 - F68: Move `npm_config_logs_dir` in the test global setup.
   - `test/global-setup.ts` moves npm's cache and user config but not its logs dir, so a gate that
     exports a logs dir receives the tests' npm logs.
+- F69: Make `runNode` in `test/plain-node-entries.test.ts` wait for the child's `close` event.
+  - `runNode` (`test/plain-node-entries.test.ts:133`) resolves on the child's `exit` event, which
+    can fire before the stdout pipe drains, so the test can lose child stdout. This flake predates
+    this branch; it was seen once on `main` during the PR #3 gates.
+- F70: Check that the loader's bare `pi-workflows` alias does not send `pi-workflows/builtins` to
+  the wrong file.
+  - `loadWorkflowFile` (`src/workflows/loader.ts:88-92`) aliases `@osolmaz/pi-workflows/builtins`
+    to the built-ins entry, but the bare `pi-workflows` alias (line 91) has no `/builtins`
+    sibling. A prefix match may therefore resolve `pi-workflows/builtins` under the workflow API
+    entry instead of the built-ins. The F39 reviewer flagged this.
