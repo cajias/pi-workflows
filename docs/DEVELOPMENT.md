@@ -124,11 +124,24 @@ which both Vitest configurations load, points these at the run's temporary root:
 It also unsets `PI_CODING_AGENT_SESSION_DIR`, `PI_WORKFLOWS_HEADLESS_EXTENSIONS`,
 `HERDR_ENV`, and `GITLAB_HOST`, so a parent Pi or Herdr session cannot change
 what the suite runs. It keeps `PI_WORKFLOWS_E2E_PI_ENTRY`, an explicit opt-in that
-selects which Pi CLI the E2E suite runs. Children that inherit the
-environment, such as workflow servers, resolvers, runners, and `npm pack`, see
-the same values. `test/test-isolation.test.ts` fails when any of these paths
-resolves outside the temporary root. No global Git identity exists, so a test
-that commits sets `user.name` and `user.email` in its own repository.
+selects which Pi CLI the E2E suite runs.
+
+For Git, it unsets the variables that select a repository or add configuration,
+so a Git hook or wrapper that runs the suite cannot point a test's Git commands
+at a real repository. These are the names that `git rev-parse --local-env-vars`
+prints: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_CONFIG`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_GRAFT_FILE`,
+`GIT_NO_REPLACE_OBJECTS`, `GIT_REPLACE_REF_BASE`, `GIT_PREFIX`, and
+`GIT_SHALLOW_FILE`. It also unsets every `GIT_CONFIG_KEY_<n>` and
+`GIT_CONFIG_VALUE_<n>` pair. Each Git child then finds its repository from its
+own working directory.
+
+Children that inherit the environment, such as workflow servers, resolvers,
+runners, and `npm pack`, see the same values. `test/test-isolation.test.ts`
+fails when any of these paths resolves outside the temporary root, or when any
+of these variables is still set. No global Git identity exists, so a test that
+commits sets `user.name` and `user.email` in its own repository.
 
 The gate commands themselves are tooling, not tests. `npm ci` and `npx` still use
 npm's own cache under the developer's home.

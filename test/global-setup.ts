@@ -15,6 +15,42 @@ const TEST_HOME_DIRECTORY = "h";
 const TEST_GIT_CONFIG_FILE = "gitconfig";
 
 /**
+ * Git variables that select a repository, its index or objects, or extra configuration. This is the
+ * list that `git rev-parse --local-env-vars` prints, which Git itself clears when it switches to
+ * another repository. A Git hook or wrapper that runs the suite can export them, and a test's Git
+ * child would then read or write that repository instead of its temporary one.
+ */
+const GIT_REPOSITORY_ENVIRONMENT = [
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_CONFIG",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_DIR",
+  "GIT_GRAFT_FILE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_PREFIX",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE",
+  "GIT_WORK_TREE",
+];
+
+/** The numbered pairs that `GIT_CONFIG_COUNT` turns into configuration. */
+const GIT_CONFIG_PAIR = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u;
+
+/** Every inherited Git repository variable, mapped to `undefined` so the setup unsets it. */
+function gitRepositoryEnvironment(env: NodeJS.ProcessEnv): Record<string, undefined> {
+  const names = [
+    ...GIT_REPOSITORY_ENVIRONMENT,
+    ...Object.keys(env).filter((name) => GIT_CONFIG_PAIR.test(name)),
+  ];
+  return Object.fromEntries(names.map((name) => [name, undefined]));
+}
+
+/**
  * The user environment the suite isolates. Every test process and every child that inherits its
  * environment sees these values, so no default path resolves to the developer's directories.
  *
@@ -27,7 +63,10 @@ const TEST_GIT_CONFIG_FILE = "gitconfig";
  * - `PI_WORKFLOWS_CONFIG_DIR` is a temporary configuration directory.
  * - Git reads no system configuration and an empty global configuration, so the developer's
  *   identity, hooks, and signing settings never apply. Tests that commit set their own identity in
- *   each repository.
+ *   each repository. Inherited variables that select a repository or add configuration, such as
+ *   `GIT_DIR`, `GIT_INDEX_FILE`, and `GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_<n>` and
+ *   `GIT_CONFIG_VALUE_<n>` pairs, are unset, so each Git child finds the repository from its own
+ *   working directory.
  * - npm uses a temporary cache, logs, and user configuration. `npm run` exports the developer's
  *   `npm_config_cache` and `npm_config_userconfig` to the suite, so `HOME` alone would not move
  *   them. The update notifier is off because it queries the registry from a fresh cache.
@@ -52,6 +91,7 @@ function isolatedTestEnvironment(root: string): Record<string, string | undefine
     PI_WORKFLOWS_CONFIG_DIR: path.join(root, "config"),
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: path.join(root, TEST_GIT_CONFIG_FILE),
+    ...gitRepositoryEnvironment(process.env),
     npm_config_cache: path.join(home, ".npm"),
     npm_config_userconfig: path.join(home, ".npmrc"),
     npm_config_update_notifier: "false",

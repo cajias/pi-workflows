@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +11,7 @@ import { workflowsConfigDir } from "../src/state/config-dir.js";
 import { workflowStatePath } from "../src/state/database.js";
 import { workflowSearchDirs } from "../src/workflows/loader.js";
 import { TEST_TEMP_ROOT_ENV } from "./global-setup.js";
+import { makeTempDir } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +28,26 @@ const PARENT_SESSION_ENVIRONMENT = [
   "HERDR_ENV",
   "GITLAB_HOST",
 ];
+
+/**
+ * Git variables that select a repository, its index or objects, or extra configuration. A Git hook
+ * or wrapper that runs the suite can export them. A test's Git child would then read or write that
+ * repository instead of its temporary one. `git rev-parse --local-env-vars` adds any further names
+ * that the installed Git clears when it switches repositories.
+ */
+const GIT_REPOSITORY_ENVIRONMENT = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+];
+
+/** The numbered pairs that `GIT_CONFIG_COUNT` turns into configuration. */
+const GIT_CONFIG_PAIR = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u;
 
 function testTempRoot(): string {
   const root = process.env[TEST_TEMP_ROOT_ENV];
@@ -106,6 +128,26 @@ describe("test process isolation", () => {
     const child = JSON.parse(stdout) as { home: string; agentDir?: string; tempRoot?: string };
     expect(child.tempRoot).toBe(testTempRoot());
     expectInsideTestRoot({ "child HOME": child.home, "child agent dir": child.agentDir });
+  });
+
+  it("does not inherit Git variables that select a repository or configuration", async () => {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--local-env-vars"], {
+      cwd: testTempRoot(),
+    });
+    const names = new Set([...GIT_REPOSITORY_ENVIRONMENT, ...stdout.split("\n").filter(Boolean)]);
+    const inherited = Object.keys(process.env)
+      .filter((name) => names.has(name) || GIT_CONFIG_PAIR.test(name))
+      .sort();
+    expect(inherited).toEqual([]);
+  });
+
+  it("lets a Git child resolve its repository from its working directory", async () => {
+    const repository = await makeTempDir("isolation-git");
+    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd: repository });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--absolute-git-dir"], {
+      cwd: repository,
+    });
+    expect(await fs.realpath(stdout.trim())).toBe(await fs.realpath(path.join(repository, ".git")));
   });
 
   it("gives Git child processes no system or user configuration", async () => {
