@@ -70,7 +70,12 @@ import type {
   WorkflowUpdateInput,
   WorkflowUpdateRecord,
 } from "./types.js";
-import { MAX_CURRENT_UPDATES, createUpdateId, updateProjection } from "./updates.js";
+import {
+  MAX_CURRENT_UPDATES,
+  createUpdateId,
+  updateProjection,
+  updatePublishedEvent,
+} from "./updates.js";
 import { followUpWorkflowMessageContent } from "./workflow-message-content.js";
 
 export const RUN_STATE_SCHEMA = "pi-workflows.run-state.v1" as const;
@@ -4402,16 +4407,7 @@ function insertWorkflowUpdate(
   resourceId: string,
   record: WorkflowUpdateRecord,
 ): WorkflowTraceEvent {
-  const event: WorkflowTraceEvent = {
-    seq: record.seq,
-    at: record.at,
-    runId: record.runId,
-    scope: "node",
-    type: "update_published",
-    nodeId: record.nodeId,
-    attemptId: record.attemptId,
-    payload: { updateId: record.updateId, type: record.type, key: record.key, data: record.data },
-  };
+  const event = updatePublishedEvent(record);
   const sequence = state.connection
     .prepare(
       `SELECT COALESCE(MAX(update_seq), 0) + 1 AS updateSeq

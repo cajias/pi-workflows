@@ -1354,10 +1354,11 @@ estimate no longer applies.
   its `started_at` and has no step record. The new attempt publishes its own
   tracks; a key that it publishes again replaces the settled record. A kept
   attempt's tracks stay open.
-- The resumed engine's in-memory update list still holds the replaced
-  attempt's last open records. The engine settles only the tracks of the
-  attempt that it is running, so these stale records never change engine
-  behavior, and durable reads show the settled records.
+- After that transaction, the resumed engine reads the settlement records back
+  and applies them to its own run state, with their revision. Node callbacks,
+  the `onRunStarted` hook, the final run result, and `onEvent` observers, which
+  receive one `update_published` event per record, therefore see the same
+  settled tracks as durable reads.
 - Settlement never reactivates a retired attempt in
   [`unrecordedAttempts`](#unrecorded-attempts). `WorkflowRunStore.publishUpdate`
   rejects every update whose attempt is not the run's current attempt

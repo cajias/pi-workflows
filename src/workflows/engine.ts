@@ -69,6 +69,7 @@ import type {
 import {
   UpdateRateLimiter,
   updateProjection,
+  updatePublishedEvent,
   updateReceipt,
   validateWorkflowUpdate,
 } from "./updates.js";
@@ -427,6 +428,7 @@ export class WorkflowEngine {
     // interaction and an assistant-message node keep their exact attempt id
     // so durable origin-session work is never detached from its contract.
     delete state.paused;
+    const replacedAttemptId = resumedAttempt === undefined ? state.currentAttemptId : undefined;
     if (resumedAttempt === undefined) {
       delete state.currentNode;
       delete state.currentAttemptId;
@@ -447,7 +449,9 @@ export class WorkflowEngine {
         replayedSteps: state.steps.length,
       },
     });
-    if (resumedAttempt === undefined) await this.refreshUnrecordedAttempts(runId, state);
+    if (resumedAttempt === undefined) {
+      await this.refreshAfterReplacingResume(runId, state, replacedAttemptId);
+    }
     await this.onRunStarted?.(runId, state);
 
     if (point.nodeId === null) {
@@ -1537,14 +1541,35 @@ export class WorkflowEngine {
   }
 
   /**
-   * A resume that does not keep the interrupted attempt retires it in the store, which then derives
-   * it as an unrecorded attempt. Node callbacks read this engine state, so it takes the same list.
+   * A resume that does not keep the interrupted attempt retires it in the store. The same
+   * transaction settles the retired attempt's open tracks after `run_resumed`, and the store then
+   * derives the attempt as unrecorded. Node callbacks and observers read this engine state, so it
+   * takes the same unrecorded attempts and applies each settlement record, with its revision and
+   * event, the way the engine applies its own publications. This reads the stored run state, so it
+   * works through any execution store.
    */
-  private async refreshUnrecordedAttempts(runId: string, state: WorkflowRunState): Promise<void> {
+  private async refreshAfterReplacingResume(
+    runId: string,
+    state: WorkflowRunState,
+    replacedAttemptId: string | undefined,
+  ): Promise<void> {
+    const resumedSeq = state.traceSeq;
     const stored = await this.store.readRunState(runId);
     if (stored === null) throw new Error(`Workflow run became unreadable: ${runId}`);
     if (stored.unrecordedAttempts === undefined) delete state.unrecordedAttempts;
     else state.unrecordedAttempts = stored.unrecordedAttempts;
+    if (replacedAttemptId === undefined) return;
+    // The retired attempt can no longer publish, so its records after run_resumed are exactly
+    // the resume's settlement records.
+    const settled = (stored.updates ?? [])
+      .filter((record) => record.attemptId === replacedAttemptId && record.seq > resumedSeq)
+      .sort((a, b) => a.seq - b.seq);
+    for (const record of settled) {
+      state.updates = updateProjection(state.updates, record);
+      state.traceSeq = record.seq;
+      state.updatedAt = record.at;
+      this.observe(updatePublishedEvent(record), state);
+    }
   }
 
   private async persist(

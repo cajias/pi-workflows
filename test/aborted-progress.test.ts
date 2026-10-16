@@ -13,6 +13,7 @@ import { WorkflowRunStore, readWorkflowRun } from "../src/workflows/store.js";
 import type {
   AgentStepExecutor,
   WorkflowActionContext,
+  WorkflowEngineOptions,
   WorkflowRunState,
   WorkflowTraceEvent,
   WorkflowUpdateInput,
@@ -78,6 +79,7 @@ async function parkThenResume(
   started: () => boolean,
   databasePath: string,
   whileResuming: () => Promise<void> = async () => undefined,
+  resumeOptions: Pick<WorkflowEngineOptions, "onEvent" | "onRunStarted"> = {},
 ) {
   const first = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
   const running = first.run(workflow, {});
@@ -89,7 +91,11 @@ async function parkThenResume(
   expect(await recovery.recoverApplyingEffects(parked.runId)).toBe("safe");
   const retiredAttemptId = recovery.readRunState(parked.runId)?.currentAttemptId;
   recovery.close();
-  const second = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
+  const second = new WorkflowEngine({
+    databasePath,
+    executor: new ScriptedExecutor(),
+    ...resumeOptions,
+  });
   const resuming = second.resumeRun(workflow, parked.runId);
   await whileResuming();
   return { parked, retiredAttemptId, resumed: await resuming };
@@ -508,10 +514,29 @@ describe("progress of aborted attempts", () => {
       },
       edges: [],
     });
+    // What the resumed engine shows its observers right after the resume transaction.
+    const observed: WorkflowTraceEvent[] = [];
+    let atRunStarted: { traceSeq: number; durableRevision: number; updates: unknown } | undefined;
     const { parked, retiredAttemptId, resumed } = await parkThenResume(
       workflow,
       () => started,
       databasePath,
+      async () => undefined,
+      {
+        onEvent: (event) => observed.push(event),
+        onRunStarted: (runId, state) => {
+          const store = new WorkflowRunStore(databasePath, { readOnly: true });
+          try {
+            atRunStarted = {
+              traceSeq: state.traceSeq,
+              durableRevision: store.runRevision(runId),
+              updates: structuredClone(state.updates),
+            };
+          } finally {
+            store.close();
+          }
+        },
+      },
     );
 
     expect(parked.state.status).toBe("running");
@@ -531,6 +556,32 @@ describe("progress of aborted attempts", () => {
       expect.objectContaining({ attemptId: retiredAttemptId, nodeId: "work" }),
     ]);
     expect(attemptRow(databasePath, retiredAttemptId)).toMatchObject({ status: "cancelled" });
+
+    // The resumed engine's own projection matches durable state: its observers receive the
+    // settlement events right after run_resumed, and its state carries the settled tracks and
+    // the revision of the last settlement record.
+    const durableTrace = durableUpdates(databasePath, parked.runId).trace;
+    const resumedAt = durableTrace.findIndex((event) => event.type === "run_resumed");
+    const durableSettlement = durableTrace.slice(resumedAt + 1, resumedAt + 3);
+    expect(
+      durableSettlement.map((event) => [event.type, event.attemptId, event.payload.key]),
+    ).toEqual([
+      ["update_published", retiredAttemptId, "overall"],
+      ["update_published", retiredAttemptId, "retired-only"],
+    ]);
+    const observedResumedAt = observed.findIndex((event) => event.type === "run_resumed");
+    expect(observed.slice(observedResumedAt, observedResumedAt + 3)).toEqual(
+      durableTrace.slice(resumedAt, resumedAt + 3),
+    );
+    expect(atRunStarted?.traceSeq).toBe(atRunStarted?.durableRevision);
+    expect(atRunStarted?.traceSeq).toBe(durableSettlement.at(-1)?.seq);
+    expect(
+      byKey(atRunStarted?.updates as WorkflowUpdateRecord[] | undefined).get("retired-only"),
+    ).toEqual(updates.get("retired-only"));
+    expect(byKey(resumed.state.updates).get("retired-only")).toEqual(updates.get("retired-only"));
+    expect(resumed.state.updates).toEqual(
+      readWorkflowRun(parked.runId, { databasePath })?.state.updates,
+    );
   });
 
   it("settles only a timed-out replacement's tracks and never reactivates the retired attempt", async () => {
@@ -741,12 +792,8 @@ describe("progress of aborted attempts", () => {
       connection.prepare("SELECT 1 FROM run_steps WHERE attempt_id = ?").get(discarded),
     ).toBeUndefined();
 
-    // The engine still holds the discarded attempt's open record, which does not
-    // change how it settles its own attempt.
-    expect(engineState?.updates?.find((update) => update.key === "agents/a")).toMatchObject({
-      attemptId: discarded,
-      data: progress("running", { label: "A" }),
-    });
+    // The resumed engine's projection takes the settled record, as durable reads do.
+    expect(engineState?.updates?.find((update) => update.key === "agents/a")).toEqual(settledA);
     second.cancel();
     const cancelled = await resumed;
     expect(cancelled.state.status).toBe("cancelled");

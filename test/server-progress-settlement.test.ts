@@ -143,10 +143,12 @@ export default defineWorkflow({
   nodes: {
     review: action({
       effect: idempotentEffect("test.server-resume-progress"),
-      run: async ({ publishUpdate }) => {
+      run: async ({ publishUpdate, state }) => {
         if (fs.existsSync(marker)) {
+          // Report the runner engine's own projection that this attempt started from.
+          const seen = Object.fromEntries((state.updates ?? []).map((update) => [update.key, [update.data.status, update.data.phase]]));
           await publishUpdate({ type: "progress", key: "agents/resumed", data: progress("completed", { phase: "completed" }) });
-          return { resumed: true };
+          return { resumed: true, seen };
         }
         await publishUpdate({ type: "progress", key: "agents/review", data: progress("running", { phase: "review" }) });
         await publishUpdate({ type: "progress", key: "agents/review/a", data: progress("running", { phase: "thinking" }) });
@@ -456,6 +458,16 @@ describe("workflow server progress settlement", () => {
         const record = updates.find((update) => update.key === event.payload.key);
         expect(record).toMatchObject({ seq: event.seq, data: event.payload.data });
       }
+      // The runner engine's in-memory projection took the settled records too, so the
+      // resumed attempt started from the same tracks that durable reads show.
+      expect(state?.outputs.review).toEqual({
+        resumed: true,
+        seen: {
+          "agents/review": ["cancelled", "interrupted"],
+          "agents/review/a": ["cancelled", "interrupted"],
+          "agents/review/c": ["completed", "completed"],
+        },
+      });
       const view = await client.getRun(runId);
       expect(view?.runRevision).toBe(after.revision);
       const verified = await client.request({ operation: "state.verify" });
