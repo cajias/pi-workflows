@@ -6,7 +6,7 @@ import { ServerViewStore } from "../src/server/view.js";
 import { StateDatabase } from "../src/state/database.js";
 import { canonicalJson } from "../src/state/json.js";
 import { compileWorkflowDefinition } from "../src/workflows/composition.js";
-import { action, defineWorkflow, idempotentEffect } from "../src/workflows/definition.js";
+import { action, agent, defineWorkflow, idempotentEffect } from "../src/workflows/definition.js";
 import { workflowStateViolations } from "../src/workflows/diagnostics.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
@@ -15,7 +15,7 @@ import {
   settleCancelledRunProgress,
   WorkflowRunStore,
 } from "../src/workflows/store.js";
-import type { WorkflowUpdateRecord } from "../src/workflows/types.js";
+import type { WorkflowDefinition, WorkflowUpdateRecord } from "../src/workflows/types.js";
 import { makeTempDir, ScriptedExecutor, waitUntil } from "./helpers.js";
 import { claimTestRun } from "./queue-helpers.js";
 
@@ -27,6 +27,41 @@ function byKey(updates: readonly WorkflowUpdateRecord[] | undefined) {
   return new Map((updates ?? []).map((update) => [`${update.type}:${update.key}`, update]));
 }
 
+/** A claimed queue run in a private database, without the production scheduler. */
+function claimedRun(
+  name: string,
+  projectPath: string,
+  databasePath: string,
+  workflow: WorkflowDefinition,
+) {
+  const state = new StateDatabase({ filePath: databasePath });
+  const queue = new WorkflowRunQueueStore(databasePath, { state, projectPath });
+  const runId = `run-${name}`;
+  const claimToken = `claim-${name}`;
+  const sessionId = `session-${name}`;
+  const snapshot = createDefinitionSnapshot(workflow);
+  claimTestRun(queue, {
+    runId,
+    workflowName: workflow.name,
+    workflowSourceRef: `builtin:${name}`,
+    workflowSource: { root: { kind: "builtin", id: name, revision: "test" }, mounted: [] },
+    definitionDigest: createHash("sha256").update(canonicalJson(snapshot)).digest("hex"),
+    definitionSnapshot: snapshot,
+    input: {},
+    runnerId: name,
+    claimToken,
+    leaseMs: 60_000,
+    originSessionId: sessionId,
+  });
+  /** A run store whose writes carry one runner's claim, as a supervised runner's do. */
+  const storeFor = (token: string) =>
+    new WorkflowRunStore(databasePath, {
+      state,
+      authorityProvider: () => queue.workflowRunAuthority(runId, token),
+    });
+  return { state, queue, runId, claimToken, sessionId, storeFor };
+}
+
 /**
  * One claimed run whose action publishes open, terminal, and non-progress
  * updates and then ignores its abort signal, like a runner that the workflow
@@ -35,12 +70,6 @@ function byKey(updates: readonly WorkflowUpdateRecord[] | undefined) {
 async function startRun(name: string) {
   const projectPath = await makeTempDir(`${name}-project`);
   const databasePath = path.join(await makeTempDir(`${name}-state`), "state.sqlite");
-  const state = new StateDatabase({ filePath: databasePath });
-  const queue = new WorkflowRunQueueStore(databasePath, { state, projectPath });
-  const serverState = new ServerStateStore(databasePath, { state });
-  const runId = `run-${name}`;
-  const claimToken = `claim-${name}`;
-  const sessionId = `session-${name}`;
   let started = false;
   const workflow = compileWorkflowDefinition(
     defineWorkflow({
@@ -79,24 +108,10 @@ async function startRun(name: string) {
       edges: [],
     }),
   );
-  const snapshot = createDefinitionSnapshot(workflow);
-  claimTestRun(queue, {
-    runId,
-    workflowName: workflow.name,
-    workflowSourceRef: `builtin:${name}`,
-    workflowSource: { root: { kind: "builtin", id: name, revision: "test" }, mounted: [] },
-    definitionDigest: createHash("sha256").update(canonicalJson(snapshot)).digest("hex"),
-    definitionSnapshot: snapshot,
-    input: {},
-    runnerId: name,
-    claimToken,
-    leaseMs: 60_000,
-    originSessionId: sessionId,
-  });
-  const runs = new WorkflowRunStore(databasePath, {
-    state,
-    authorityProvider: () => queue.workflowRunAuthority(runId, claimToken),
-  });
+  const claimed = claimedRun(name, projectPath, databasePath, workflow);
+  const { state, queue, runId, claimToken, sessionId } = claimed;
+  const serverState = new ServerStateStore(databasePath, { state });
+  const runs = claimed.storeFor(claimToken);
   const engine = new WorkflowEngine({ store: runs, executor: new ScriptedExecutor() });
   const running = engine.run(workflow, {}, { runId });
   await waitUntil(() => started);
@@ -109,6 +124,16 @@ async function startRun(name: string) {
     () => false,
   );
   return { state, queue, runs, views, engine, running, runId, claimToken, sessionId };
+}
+
+/** The stored `node_attempts` facts behind an `unrecordedAttempts` entry. */
+function attemptRow(state: StateDatabase, attemptId: string | undefined) {
+  return state.connection
+    .prepare(
+      `SELECT status, started_at AS startedAt, finished_at AS finishedAt, updated_at AS updatedAt
+       FROM node_attempts WHERE attempt_id = ?`,
+    )
+    .get(attemptId);
 }
 
 const open = ["agents/review", "agents/review/a", "agents/review/b"];
@@ -174,11 +199,29 @@ describe("progress of a cancelled run", () => {
     run.state.integrityCheck();
     expect(workflowStateViolations(run.state)).toEqual([]);
 
-    // The stopped runner has lost its claim, so it cannot overwrite the settlement.
+    // The cancelled attempt has no step record, so the run lists it as unrecorded.
+    const runFinishedAt = run.state.connection
+      .prepare("SELECT finished_at AS finishedAt FROM runs WHERE run_id = ?")
+      .get(run.runId);
+    const cancelledRow = attemptRow(run.state, attemptId);
+    const unrecorded = run.runs.readRunState(run.runId)?.unrecordedAttempts;
+    expect(unrecorded).toEqual([expect.objectContaining({ attemptId, nodeId: "review" })]);
+
+    // The stopped runner has lost its claim, so it cannot overwrite the settlement or bring
+    // its attempt back.
     run.engine.cancel();
     await expect(run.running).rejects.toThrow(/claim lost/);
     expect(run.runs.runRevision(run.runId)).toBe(after);
-    expectSettled(run.runs.readRunState(run.runId)?.updates, attemptId);
+    const final = run.runs.readRunState(run.runId);
+    expect(final?.status).toBe("cancelled");
+    expectSettled(final?.updates, attemptId);
+    expect(final?.unrecordedAttempts).toEqual(unrecorded);
+    expect(attemptRow(run.state, attemptId)).toEqual(cancelledRow);
+    expect(
+      run.state.connection
+        .prepare("SELECT finished_at AS finishedAt FROM runs WHERE run_id = ?")
+        .get(run.runId),
+    ).toEqual(runFinishedAt);
     run.state.close();
   }, 60_000);
 
@@ -243,6 +286,180 @@ describe("progress of a cancelled run", () => {
     run.state.connection.exec("DROP TRIGGER reject_cancel");
     run.engine.cancel();
     await run.running;
+    run.state.close();
+  }, 60_000);
+});
+
+/**
+ * A claimed `verifyP2` agent run that publishes progress, parks in its first
+ * attempt, and resumes in a second runner whose replacement attempt publishes
+ * its own tracks and then waits. The resume retires the parked attempt
+ * without a step record.
+ */
+async function resumedVerifyP2(name: string) {
+  const projectPath = await makeTempDir(`${name}-project`);
+  const databasePath = path.join(await makeTempDir(`${name}-state`), "state.sqlite");
+  const workflow = compileWorkflowDefinition(
+    defineWorkflow({
+      name,
+      startAt: "verifyP2",
+      nodes: { verifyP2: agent({ prompt: () => "Verify and push the P2 changes." }) },
+      edges: [],
+    }),
+  );
+  const run = claimedRun(name, projectPath, databasePath, workflow);
+  let firstStarted = false;
+  const first = new WorkflowEngine({
+    store: run.storeFor(run.claimToken),
+    executor: new ScriptedExecutor().respond("verifyP2", async (request) => {
+      await request.publishUpdate?.(
+        { type: "progress", key: "agents/verifyP2", data: progress("running", { phase: "first" }) },
+        "first-overall",
+      );
+      await request.publishUpdate?.(
+        { type: "progress", key: "agents/verifyP2/lost", data: progress("running") },
+        "first-lost",
+      );
+      firstStarted = true;
+      return await new Promise<never>(() => undefined);
+    }),
+  });
+  const parking = first.run(workflow, {}, { runId: run.runId });
+  await waitUntil(() => firstStarted);
+  const retiredAttemptId = run.storeFor(run.claimToken).readRunState(run.runId)?.currentAttemptId;
+  first.park();
+  expect((await parking).state.status).toBe("running");
+  expect(run.queue.parkWorkflowRun({ runId: run.runId, claimToken: run.claimToken })).toBe(true);
+
+  // A later runner claims the parked run and resumes it under a new attempt.
+  const resumeToken = `${run.claimToken}-resume`;
+  expect(
+    run.queue.claimWorkflowRun({
+      runId: run.runId,
+      runnerId: `${name}-resume`,
+      claimToken: resumeToken,
+      leaseMs: 60_000,
+    }),
+  ).toBeDefined();
+  const runs = run.storeFor(resumeToken);
+  let replacementStarted = false;
+  const second = new WorkflowEngine({
+    store: runs,
+    executor: new ScriptedExecutor().respond("verifyP2", async (request) => {
+      await request.publishUpdate?.(
+        {
+          type: "progress",
+          key: "agents/verifyP2",
+          data: progress("running", { phase: "replacement" }),
+        },
+        "replacement-overall",
+      );
+      await request.publishUpdate?.(
+        { type: "progress", key: "agents/verifyP2/replacement", data: progress("pending") },
+        "replacement-own",
+      );
+      replacementStarted = true;
+      return await new Promise<never>(() => undefined);
+    }),
+  });
+  const resuming = second.resumeRun(workflow, run.runId);
+  await waitUntil(() => replacementStarted);
+  const resumed = runs.readRunState(run.runId);
+  const replacementAttemptId = resumed?.currentAttemptId;
+  expect(replacementAttemptId).toBeDefined();
+  expect(replacementAttemptId).not.toBe(retiredAttemptId);
+  return {
+    ...run,
+    runs,
+    second,
+    resuming,
+    resumeToken,
+    retiredAttemptId,
+    replacementAttemptId,
+    retiredUnrecorded: resumed?.unrecordedAttempts,
+    retiredRow: attemptRow(run.state, retiredAttemptId),
+  };
+}
+
+describe("progress settlement and retired attempts", () => {
+  it("lists a retired and a cancelled verifyP2 attempt and settles only the active one's tracks", async () => {
+    const run = await resumedVerifyP2("verify-p2-cancel");
+    expect(run.retiredUnrecorded).toEqual([
+      expect.objectContaining({ attemptId: run.retiredAttemptId, nodeId: "verifyP2" }),
+    ]);
+    expect(run.retiredRow).toMatchObject({ status: "cancelled" });
+
+    expect(run.queue.cancelWorkflowRun({ runId: run.runId, claimToken: run.resumeToken })).toBe(
+      true,
+    );
+    run.second.cancel();
+    await expect(run.resuming).rejects.toThrow(/claim lost/);
+
+    const state = run.runs.readRunState(run.runId);
+    expect(state?.status).toBe("cancelled");
+    // Both attempts ended without a step record and appear in start order. The retired
+    // attempt keeps the window and row that the resume gave it.
+    const unrecorded = state?.unrecordedAttempts ?? [];
+    expect(unrecorded.map((attempt) => [attempt.attemptId, attempt.nodeId])).toEqual([
+      [run.retiredAttemptId, "verifyP2"],
+      [run.replacementAttemptId, "verifyP2"],
+    ]);
+    expect(unrecorded[0]).toEqual(run.retiredUnrecorded?.[0]);
+    expect(Date.parse(unrecorded[0]?.finishedAt ?? "")).toBeLessThanOrEqual(
+      Date.parse(unrecorded[1]?.startedAt ?? ""),
+    );
+    expect(attemptRow(run.state, run.retiredAttemptId)).toEqual(run.retiredRow);
+    expect(attemptRow(run.state, run.replacementAttemptId)).toMatchObject({ status: "cancelled" });
+    // The cancellation settled the active attempt's tracks. The track that only the retired
+    // attempt published was never settled.
+    const updates = byKey(state?.updates);
+    expect(updates.get("progress:agents/verifyP2/lost")).toMatchObject({
+      attemptId: run.retiredAttemptId,
+      data: progress("running"),
+    });
+    expect(updates.get("progress:agents/verifyP2")).toMatchObject({
+      attemptId: run.replacementAttemptId,
+      data: progress("cancelled", { phase: "cancelled" }),
+    });
+    expect(updates.get("progress:agents/verifyP2/replacement")).toMatchObject({
+      attemptId: run.replacementAttemptId,
+      data: progress("cancelled", { phase: "cancelled" }),
+    });
+    expect(workflowStateViolations(run.state)).toEqual([]);
+    run.state.close();
+  }, 60_000);
+
+  it("rejects an update for a retired attempt and leaves its row unchanged", async () => {
+    const run = await resumedVerifyP2("verify-p2-guard");
+    const before = run.runs.runRevision(run.runId);
+    const update = {
+      type: "progress",
+      key: "agents/verifyP2/lost",
+      data: progress("completed"),
+    };
+
+    // A late write from the retired attempt is rejected while the replacement is active.
+    await expect(
+      run.runs.publishUpdate(run.runId, "verifyP2", run.retiredAttemptId ?? "", update),
+    ).rejects.toThrow(/does not match the active attempt/);
+    expect(attemptRow(run.state, run.retiredAttemptId)).toEqual(run.retiredRow);
+    expect(run.runs.runRevision(run.runId)).toBe(before);
+
+    // It is still rejected once the run is terminal.
+    expect(run.queue.cancelWorkflowRun({ runId: run.runId, claimToken: run.resumeToken })).toBe(
+      true,
+    );
+    run.second.cancel();
+    await expect(run.resuming).rejects.toThrow(/claim lost/);
+    const cancelled = run.runs.runRevision(run.runId);
+    await expect(
+      run.runs.publishUpdate(run.runId, "verifyP2", run.retiredAttemptId ?? "", update),
+    ).rejects.toThrow(/does not match the active attempt/);
+    expect(attemptRow(run.state, run.retiredAttemptId)).toEqual(run.retiredRow);
+    expect(run.runs.runRevision(run.runId)).toBe(cancelled);
+    expect(
+      byKey(run.runs.readRunState(run.runId)?.updates).get("progress:agents/verifyP2/lost"),
+    ).toMatchObject({ attemptId: run.retiredAttemptId, data: progress("running") });
     run.state.close();
   }, 60_000);
 });

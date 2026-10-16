@@ -45,6 +45,48 @@ function durableUpdates(databasePath: string, runId: string) {
   };
 }
 
+/** The stored `node_attempts` facts that a retired attempt's `unrecordedAttempts` entry derives from. */
+type AttemptRow = {
+  status: string;
+  startedAt: number | null;
+  finishedAt: number | null;
+  updatedAt: number;
+};
+
+function attemptRow(databasePath: string, attemptId: string | undefined) {
+  const store = new WorkflowRunStore(databasePath, { readOnly: true });
+  try {
+    return store.state.connection
+      .prepare(
+        `SELECT status, started_at AS startedAt, finished_at AS finishedAt, updated_at AS updatedAt
+         FROM node_attempts WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as AttemptRow | undefined;
+  } finally {
+    store.close();
+  }
+}
+
+/** Park a run in the middle of its first `work` attempt and resume it in a second engine. */
+async function parkThenResume(
+  workflow: ReturnType<typeof defineWorkflow>,
+  started: () => boolean,
+  databasePath: string,
+) {
+  const first = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
+  const running = first.run(workflow, {});
+  await waitUntil(started);
+  first.park();
+  const parked = await running;
+  // The workflow server returns an interrupted idempotent effect to pending before resume.
+  const recovery = new WorkflowRunStore(databasePath);
+  expect(await recovery.recoverApplyingEffects(parked.runId)).toBe("safe");
+  const retiredAttemptId = recovery.readRunState(parked.runId)?.currentAttemptId;
+  recovery.close();
+  const second = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
+  return { parked, retiredAttemptId, resumed: await second.resumeRun(workflow, parked.runId) };
+}
+
 async function makeEngine(options: { executor?: ScriptedExecutor; store?: WorkflowRunStore } = {}) {
   const databasePath = options.store?.databasePath ?? (await makeStateDatabasePath("aborted"));
   const events: WorkflowTraceEvent[] = [];
@@ -403,6 +445,7 @@ describe("progress of aborted attempts", () => {
           run: async ({ publishUpdate }) => {
             if (!started) {
               await publishUpdate(track("overall", "running"));
+              await publishUpdate(track("retired-only", "running"));
               started = true;
               return await hang();
             }
@@ -413,28 +456,127 @@ describe("progress of aborted attempts", () => {
       },
       edges: [],
     });
-    const first = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
-    const running = first.run(workflow, {});
-    await waitUntil(() => started);
-    first.park();
-    const parked = await running;
-
-    expect(parked.state.status).toBe("running");
-    expect(durableUpdates(databasePath, parked.runId).updates.get("overall")?.data).toEqual(
-      progress("running"),
+    const { parked, retiredAttemptId, resumed } = await parkThenResume(
+      workflow,
+      () => started,
+      databasePath,
     );
 
-    // The workflow server returns an interrupted idempotent effect to pending before resume.
-    const recovery = new WorkflowRunStore(databasePath);
-    expect(await recovery.recoverApplyingEffects(parked.runId)).toBe("safe");
-    recovery.close();
-    const second = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
-    const resumed = await second.resumeRun(workflow, parked.runId);
-
+    expect(parked.state.status).toBe("running");
     expect(resumed.state.status).toBe("completed");
-    const overall = durableUpdates(databasePath, parked.runId).updates.get("overall");
+    const updates = durableUpdates(databasePath, parked.runId).updates;
+    const overall = updates.get("overall");
     expect(overall?.data).toEqual(progress("completed"));
     expect(overall?.attemptId).toBe(resumed.state.results.work?.attemptId);
+    // The resume retired the parked attempt without a step. Nothing settled it, so the track
+    // that only it published stays open, and its attempt stays retired.
+    expect(updates.get("retired-only")).toMatchObject({
+      attemptId: retiredAttemptId,
+      data: progress("running"),
+    });
+    const stored = readWorkflowRun(parked.runId, { databasePath })?.state;
+    expect(stored?.unrecordedAttempts).toEqual([
+      expect.objectContaining({ attemptId: retiredAttemptId, nodeId: "work" }),
+    ]);
+    expect(attemptRow(databasePath, retiredAttemptId)).toMatchObject({ status: "cancelled" });
+  });
+
+  it("settles only a timed-out replacement's tracks and never reactivates the retired attempt", async () => {
+    const databasePath = await makeStateDatabasePath("retired-and-timed-out");
+    let started = false;
+    let duringReplacement:
+      | {
+          unrecorded: unknown;
+          retiredRow: AttemptRow | undefined;
+          replacementAttemptId: string | undefined;
+        }
+      | undefined;
+    const workflow = defineWorkflow({
+      name: "retired-and-timed-out",
+      startAt: "work",
+      nodes: {
+        work: action({
+          effect: idempotentEffect("test.retired-and-timed-out"),
+          // Only the replacement, which runs after a resume retired the parked attempt, has a
+          // limit. It is long enough for the replacement to publish and record what it saw first.
+          timeoutMs: ({ state }) => (state.unrecordedAttempts === undefined ? null : 1_000),
+          run: async ({ publishUpdate, state }) => {
+            if (!started) {
+              await publishUpdate(track("shared", "running", { phase: "first" }));
+              await publishUpdate(track("retired-only", "running"));
+              started = true;
+              return await hang();
+            }
+            await publishUpdate(track("shared", "running", { phase: "replacement" }));
+            await publishUpdate(track("replacement-only", "pending"));
+            const retired = state.unrecordedAttempts?.[0]?.attemptId;
+            duringReplacement = {
+              unrecorded: structuredClone(state.unrecordedAttempts),
+              retiredRow: attemptRow(databasePath, retired),
+              replacementAttemptId: state.currentAttemptId,
+            };
+            return await hang();
+          },
+        }),
+      },
+      edges: [],
+    });
+
+    const { parked, retiredAttemptId, resumed } = await parkThenResume(
+      workflow,
+      () => started,
+      databasePath,
+    );
+
+    expect(resumed.state.status).toBe("timed_out");
+    const replacementAttemptId = duringReplacement?.replacementAttemptId;
+    expect(replacementAttemptId).toBeDefined();
+    expect(replacementAttemptId).not.toBe(retiredAttemptId);
+    // The retired attempt is listed once, with the window and row it had before the settlement.
+    const stored = readWorkflowRun(parked.runId, { databasePath, includeTrace: true });
+    const unrecorded = stored?.state.unrecordedAttempts;
+    expect(unrecorded).toHaveLength(1);
+    expect(unrecorded?.[0]).toMatchObject({ attemptId: retiredAttemptId, nodeId: "work" });
+    expect(unrecorded).toEqual(duringReplacement?.unrecorded);
+    expect(resumed.state.unrecordedAttempts).toEqual(unrecorded);
+    expect(attemptRow(databasePath, retiredAttemptId)).toEqual(duringReplacement?.retiredRow);
+    expect(duringReplacement?.retiredRow).toMatchObject({ status: "cancelled" });
+    expect(Date.parse(unrecorded?.[0]?.startedAt ?? "")).toBe(
+      duringReplacement?.retiredRow?.startedAt,
+    );
+    expect(Date.parse(unrecorded?.[0]?.finishedAt ?? "")).toBe(
+      duringReplacement?.retiredRow?.finishedAt,
+    );
+    // The replacement is recorded as a timed-out step, not as an unrecorded attempt.
+    expect(
+      stored?.state.steps.filter((entry) => entry.nodeId === "work").map((entry) => entry.outcome),
+    ).toEqual(["timed_out"]);
+    expect(stored?.state.steps.at(-1)?.attemptId).toBe(replacementAttemptId);
+    expect(attemptRow(databasePath, replacementAttemptId)).toMatchObject({ status: "timed_out" });
+    // Only the replacement's open tracks settle; the retired attempt's own track stays open.
+    const updates = byKey(stored?.state.updates);
+    expect(updates.get("retired-only")).toMatchObject({
+      attemptId: retiredAttemptId,
+      data: progress("running"),
+    });
+    expect(updates.get("shared")).toMatchObject({
+      attemptId: replacementAttemptId,
+      data: progress("failed", { phase: "timed out" }),
+    });
+    expect(updates.get("replacement-only")).toMatchObject({
+      attemptId: replacementAttemptId,
+      data: progress("failed", { phase: "timed out" }),
+    });
+    const settlement = (stored?.traceEvents ?? []).filter(
+      (event) =>
+        event.type === "update_published" &&
+        event.payload.data !== undefined &&
+        (event.payload.data as { phase?: unknown }).phase === "timed out",
+    );
+    expect(settlement.map((event) => event.attemptId)).toEqual([
+      replacementAttemptId,
+      replacementAttemptId,
+    ]);
   });
 
   it("writes no settlement when a run is cancelled at a pause boundary", async () => {

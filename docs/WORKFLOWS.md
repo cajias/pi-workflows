@@ -1328,6 +1328,12 @@ estimate no longer applies.
   This includes a runner that the workflow server stops for a pause, a
   handoff, or a server shutdown. If the run is cancelled while it is parked,
   the cancellation settles them.
+- Settlement goes only through the active attempt, so a retired attempt in
+  [`unrecordedAttempts`](#unrecorded-attempts) is never reactivated:
+  `WorkflowRunStore.publishUpdate` rejects every update whose attempt is not
+  the run's current attempt ("Workflow update does not match the active
+  attempt"), and the queue settles only attempts that are still pending,
+  running, waiting, or interrupted.
 
 Known limitations:
 
