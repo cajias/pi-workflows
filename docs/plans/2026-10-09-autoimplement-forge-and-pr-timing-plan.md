@@ -1704,10 +1704,14 @@ These are out of scope for this plan.
     open track of the ended attempt a final `failed` (`timed out`) or `cancelled` record.
   - Review fixes in `a4bb10f` and `0e4872d`: the docs state the actual revision steps and the
     remaining limitations, and a real server test covers settlement after an action times out.
-  - Lock-in tests in `3900826`: settlement goes only through the active attempt, so it never
-    reactivates a retired attempt that F13's `unrecordedAttempts` lists. They cover a timed-out
-    replacement after a resume, active and parked cancellations, a retired and a cancelled
-    `verifyP2` attempt, and the Autoimplement P2-push restart on both forges.
+  - Lock-in tests in `3900826`: settlement never reactivates a retired attempt that F13's
+    `unrecordedAttempts` lists. They cover a timed-out replacement after a resume, active and
+    parked cancellations, a retired and a cancelled `verifyP2` attempt, and the Autoimplement
+    P2-push restart on both forges. `0e81ea7` updates them for F37, which settles a replaced
+    attempt's own tracks as `cancelled` with the phase `interrupted`.
+  - Race fix in `8124d9d`: a `holdTimers` helper holds back the replacement attempt's timeout in
+    the retired-attempt tests until the test fires it, so the timeout cannot race the test's own
+    setup under load.
 - F21: Revisit the 2,000-character agent error cap as a product decision. _(done)_
   - `MAX_ERROR_CHARS` (`src/builtins/pi-agent-launch.ts:59`, moved from
     `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
@@ -1723,6 +1727,10 @@ These are out of scope for this plan.
   - Decide-prompt fix in `4873e95`: the Autoimplement decide prompt again receives a failed
     check's stderr, bounded by the existing prompt evidence projection, with an `outputRef` to the
     complete output in the durable verification result. Only stderr is forwarded (F56).
+  - Prompt-fit fix in `ec7ab18`: when the decide prompt does not fit, it first sheds failed
+    checks' stderr, largest first, keeping each check's `stderrChars` and `outputRef`, and only
+    then collapses whole fields. The route, reason, findings, and per-command metadata stay
+    visible even with the most failing checks a batch allows.
 - F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
@@ -1852,11 +1860,33 @@ These are out of scope for this plan.
     exceed the socket path limit; and npm's own cache from the gates' `npm ci` and `npx` is
     tooling, not test state.
 - F37: Settle progress tracks left open when the server fails a run without the engine
-  (`failWorkflowRun`) or discards an attempt on resume.
+  (`failWorkflowRun`) or discards an attempt on resume. _(done)_
+  - Done in `7ec8c03`, `cf0bb86`, `fe462e8`, and `cdbc8a2`, with test assertions updated in
+    `0e81ea7`.
+  - Server fail: `terminalRun`'s failed branch calls `settleEndedRunProgress` (generalized from
+    `settleCancelledRunProgress`), so each open track of a failed attempt gets `failed` with the
+    phase `failed` before `run.queue_failed`, in the same transaction.
+  - Resume discard: `commitTransition`'s resume-retire block settles the retired attempt's open
+    tracks as `cancelled` with the phase `interrupted`, after `run_resumed`, in the same
+    transaction. The retired `node_attempts` row keeps `started_at` and `finished_at` and has no
+    `run_steps` row, as the F13 `unrecordedAttempts` derivation needs.
+  - Tests: the server-mode resume settlement test and the server-fail rollback test are done in
+    `fe462e8`, so neither is a follow-up.
+  - Residual: `WorkflowRunStore.markRunInterrupted` still leaves its last attempt's tracks open;
+    nothing in production calls it (F51).
   - Live E2E: waived. The human's rule for F35-F41 allows no live or billable model calls, as with
     the F11-F14 waiver in the Validation section.
 - F38: Report Pi's own reason when no model exists at all; headless steps now show only
   `exited mid-step (code 1)`.
+  - Accepted on `followups/f38-no-model-reason` (`543b89c`); not in this bundle. Live E2E: waived
+    under the human's no-live/no-billable rule for F35-F41.
+- F38b: Fix the three F38 review P2s.
+  - Keep a malformed model-error protocol line out of the `Pi reported` text, and anchor the
+    regex of the test "reports the exit when a model error line is malformed".
+  - The test uses the global model registry instead of a `mkdtemp` registry under the test temp
+    directory.
+  - The test relies on `PI_CODING_AGENT_DIR` implicitly; comment that, or set it explicitly in
+    the test environment.
 - F39: Let user workflows that reuse built-in Sanity Check nodes reach the runner's agent group
   launcher.
   - Cause: `src/workflows/loader.ts:85-93` builds the jiti loader with `moduleCache: false` and
@@ -1866,6 +1896,15 @@ These are out of scope for this plan.
   - In progress on `followups/f39-sanity-group-launcher` (`3c273d3`); not integrated.
 - F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
   builtin-autoimplement-forge.
+  - Accepted on `followups/f40-load-sensitive-tests` (`1f52c8f`); not in this bundle. Live E2E:
+    waived under the human's no-live/no-billable rule for F35-F41.
+  - Review P2s left unfixed: the sync-position map never shrinks, consistent with the existing
+    contexts map; the full-sync baseline test runs the new code; and the Buffer helper's failure
+    message is less detailed.
+- F58: Make the file-wide 30 s `GRAPH_RUN_TIMEOUT_MS`
+  (`test/builtin-autoimplement-pr-timing.test.ts:1424`) robust under heavy load.
+  - It times out under heavy artificial load. This predates the bundle: the untouched sibling
+    test fails the same way. Found during the fix pass.
 - F41: Switch the agent-group OAuth re-read to a locked public Pi API once Pi exports
   `AuthStorage` or a locked credential read. _(blocked on a Pi release)_
   - Pi 1.1.0 exports no `AuthStorage` and no locked credential read. Its only public read is
@@ -1906,7 +1945,7 @@ These are out of scope for this plan.
   - The gap: `docs/WORKFLOWS.md` ("Unrecorded attempts"), the `WorkflowUnrecordedAttempt` comment
     in `src/workflows/types.ts:603-606`, and `docs/SQLITE_STATE.md:167` say "a run without a
     restart has the same state as before". Runs that are cancelled or fail while an attempt is in
-    flight also get `unrecordedAttempts` (`src/workflows/queue.ts:1995`, `:2046`). This is harmless,
+    flight also get `unrecordedAttempts` (`src/workflows/queue.ts:1996`, `:2050`). This is harmless,
     because the run is terminal.
   - Fix: reword the docs and the comment, for example "the field is absent when every started
     attempt has a step record".
@@ -1944,6 +1983,8 @@ These are out of scope for this plan.
 - F49: Remove the real-time sleep from the F13 restart graph test (code-review, low).
   - The gap: the test at `test/builtin-autoimplement-pr-timing.test.ts` ~2156 sleeps about 2 s of
     real time to cross a one-second boundary.
+  - The timeout variant that `3900826` adds (the test at ~2264, its sleep at line 2359) waits for
+    the same second boundary in real time.
   - Fix: inject or control the attempt timestamps instead.
 - F50: End an unrecorded `verifyP2` attempt's excuse window at its last proven-live time
   (code-review completeness critic and re-review, medium).
@@ -1962,12 +2003,23 @@ These are out of scope for this plan.
     calls it today.
 - F52: Replace the direct-SQL setup in the F37 tests.
   - The F37 missing-submission test sets up its waiting state with direct SQL.
-- F53: Revisit the wording of the `docs/WORKFLOWS.md:1280` heading, "Progress of timed-out and
+- F53: Revisit the wording of the `docs/WORKFLOWS.md:1289` heading, "Progress of timed-out and
   cancelled attempts".
   - The heading is deliberately kept as it is, so its link anchor stays stable. It was at line
-    1248 before the rebase onto `origin/main`.
+    1248 before the rebase onto `origin/main`, and at 1280 before F37.
 - F54: Resolve the old pi-lens SQL flags in `src/workflows/store.ts`, and add the missing SAFETY
-  comment for the `as unknown as HumanDecisionRequest` cast at `src/workflows/store.ts:1676`.
+  comment for the `as unknown as HumanDecisionRequest` cast at `src/workflows/store.ts:1677`.
 - F56: Forward failed checks' stdout to the Autoimplement decide prompt.
   - Some tools, such as `tsc`, print their failures to stdout. `4873e95` forwards only stderr,
     as before F21, so this is not a regression. Found during the fix pass.
+- F57: Speed up run-state reads. `materializeRunState` (`src/workflows/store.ts:3537`) re-reads
+  every step on each commit, and `readBlob` (`src/state/database.ts:176`) prepares its statement
+  again on every call.
+  - The slowest server-view tests take 17-23 s against their 60 s limit.
+- F59: Remove `overrides.tinypool` once oxfmt moves past tinypool 2.1.0 (PR #2 follow-up).
+  - `package.json` overrides tinypool to 2.1.2 because oxfmt 0.59.0 depends on tinypool 2.1.0.
+- F60: Replace the exact tinypool 2.1.2 pin in that override with a range (PR #2 follow-up).
+- F61: Review the browserslist refresh (PR #2 follow-up). It moved to the latest in-range version,
+  past the patched minimum.
+- F62: Keep the `npm ci` log for the deps PR (PR #2 follow-up). _(closed)_
+  - No `npm ci` log was saved for PR #2. Closed: a later clean reinstall confirmed it.
