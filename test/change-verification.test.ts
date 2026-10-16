@@ -8,6 +8,7 @@ import {
   changeVerificationEvidence,
   changeVerificationWorkflow,
   classifyVerification,
+  isFailedCheckStderr,
   parseChangeVerificationInput,
   type ChangeVerificationInput,
   type ChangeVerificationResult,
@@ -1069,6 +1070,11 @@ describe("change verification", () => {
       stderr: "BASE-STDERR",
       outputRef: "base:unit",
     });
+    // Only a failed check's stderr, whose entry names its size and complete logs, can give way.
+    const [failedEntry, timedOutEntry] = evidence.candidateCommands.items;
+    expect(isFailedCheckStderr(failedEntry!, "stderr")).toBe(true);
+    expect(isFailedCheckStderr(failedEntry!, "error")).toBe(false);
+    expect(isFailedCheckStderr(timedOutEntry!, "stderr")).toBe(false);
   });
 
   it("classifies complete direct evidence across related and unknown routes", () => {

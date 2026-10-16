@@ -25,6 +25,7 @@ import {
   ledgerChars,
   projectEvidence,
   projectLedger,
+  shedFields,
   type EvidenceLedgerEntry,
   type EvidenceViews,
 } from "../workflows/prompt-evidence.js";
@@ -86,6 +87,7 @@ import {
 import changeVerificationWorkflow, {
   CHANGE_VERIFICATION_SCHEMA,
   changeVerificationEvidence,
+  isFailedCheckStderr,
   type ChangeVerificationInput,
   type ChangeVerificationResult,
   type VerificationCheck,
@@ -806,10 +808,19 @@ function decidePrompt(context: WorkflowNodeContext): string {
       `autoimplement decide prompt lines are ${prefix.length} characters and leave no room for evidence under the ${PROMPT_CEILING_CHARS} character ceiling; largest line: ${largestLine(lines)}`,
     );
   }
-  const collapsedLedger = boundLedger(ledger, 0);
+  // Failed-check stderr gives way first, largest first, so the decisive fields beside it stay
+  // readable. Each failed check keeps its stderr size and the outputRef of its complete logs.
+  const shed = shedFields(
+    { observation, ledger },
+    isFailedCheckStderr,
+    complete.length - PROMPT_CEILING_CHARS,
+  );
+  const lighter = decidePromptText(prefix, shed.observation, shed.ledger);
+  if (lighter.length <= PROMPT_CEILING_CHARS) return lighter;
+  const collapsedLedger = boundLedger(shed.ledger, 0);
   const ledgerFloor = ledgerChars(collapsedLedger);
-  const shortenedObservation = boundEvidence(observation, budget - ledgerFloor);
-  const shortenedLedger = boundLedger(ledger, budget - evidenceChars(shortenedObservation));
+  const shortenedObservation = boundEvidence(shed.observation, budget - ledgerFloor);
+  const shortenedLedger = boundLedger(shed.ledger, budget - evidenceChars(shortenedObservation));
   const shortened = decidePromptText(prefix, shortenedObservation, shortenedLedger);
   if (shortened.length <= PROMPT_CEILING_CHARS) return shortened;
   throw new Error(

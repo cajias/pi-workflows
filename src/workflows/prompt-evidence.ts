@@ -139,6 +139,71 @@ export function boundEvidence(value: unknown, budgetChars: number): unknown {
   return bounded;
 }
 
+/**
+ * Remove fields that a prompt can lose, largest first, until at least `excessChars` characters are
+ * saved or none is left.
+ *
+ * A prompt that does not fit sheds bulk text, such as the stderr of failed commands, before
+ * {@link boundEvidence} and {@link boundLedger} collapse whole fields, so the small decisive fields
+ * beside that text stay readable. `removable` names the fields a prompt can lose. It must accept a
+ * field only when its owner already states the field's size and where its complete value is, as a
+ * view's command entry does with `stderrChars` and `outputRef`, so removing it hides nothing that
+ * the durable result does not keep. The value is copied; the input is not changed.
+ */
+export function shedFields<T>(
+  value: T,
+  removable: (owner: Readonly<Record<string, unknown>>, key: string) => boolean,
+  excessChars: number,
+): T {
+  const copy = copyProjected(value) as T;
+  if (excessChars <= 0) return copy;
+  const sites: ShedSite[] = [];
+  collectShedSites(copy, removable, sites);
+  sites.sort((left, right) => right.saving - left.saving);
+  let saved = 0;
+  for (const site of sites) {
+    if (saved >= excessChars) break;
+    delete site.owner[site.key];
+    saved += site.saving;
+  }
+  return copy;
+}
+
+type ShedSite = { owner: Record<string, unknown>; key: string; saving: number };
+
+function collectShedSites(
+  value: unknown,
+  removable: (owner: Readonly<Record<string, unknown>>, key: string) => boolean,
+  sites: ShedSite[],
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectShedSites(item, removable, sites);
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (removable(value, key)) {
+      // The key, its colon, the value, and one separating comma leave the serialized owner.
+      sites.push({
+        owner: value,
+        key,
+        saving: JSON.stringify(key).length + evidenceChars(entry) + 2,
+      });
+    } else {
+      collectShedSites(entry, removable, sites);
+    }
+  }
+}
+
+/** A copy of a projected value. Objects keep a null prototype, as the projection builds them. */
+function copyProjected(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(copyProjected);
+  if (!isPlainObject(value)) return value;
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const [key, entry] of Object.entries(value)) copy[key] = copyProjected(entry);
+  return copy;
+}
+
 /** Project every entry of a ledger. */
 export function projectLedger(
   entries: readonly EvidenceLedgerEntry[],

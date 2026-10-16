@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { repositoryId } from "../src/builtins/autoimplement-command-batches.js";
 import autoimplementWorkflow from "../src/builtins/autoimplement.workflow.js";
 import { CHANGE_VERIFICATION_SCHEMA } from "../src/builtins/change-verification.workflow.js";
+import { MAX_COMMAND_BATCH_ITEMS } from "../src/workflows/command-batch.js";
 import { compileWorkflowDefinition } from "../src/workflows/composition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
 import { digest } from "../src/workflows/human-decision.js";
@@ -1399,6 +1400,157 @@ describe("built-in autoimplement", () => {
       stderr: "BASE-STDERR-MARKER: the same test fails on main",
       outputRef: "base:unit",
     });
+  });
+
+  it("keeps the decisive verification fields when many failed checks fill the decide prompt with stderr", async () => {
+    const decide = autoimplementWorkflow.nodes.decide;
+    const observe = autoimplementWorkflow.nodes.observe;
+    if (decide?.nodeType !== "agent" || observe?.nodeType !== "compute") {
+      throw new Error("decide must be an agent node and observe must be a compute node");
+    }
+    // As many failing checks as a batch allows, failing on the base too, each with long stderr.
+    // Autodoc's output carries the verification result twice, so every stderr reaches the
+    // observation twice.
+    const ids = Array.from({ length: MAX_COMMAND_BATCH_ITEMS }, (_, index) => `check-${index}`);
+    const failedItem = (id: string, side: string) => ({
+      id,
+      command: "npm",
+      args: ["run", id],
+      cwd: "/repo",
+      stdout: "",
+      stderr: `${side}-${id}-STDERR ${"e".repeat(10_000)} ${side}-${id}-END`,
+      exitCode: 1,
+      signal: null,
+      durationMs: 5,
+      outcome: "failed",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      error: "Command failed: exit 1; its output is in the item's stdout and stderr",
+    });
+    const commands = (side: string) => ({
+      schema: "pi-workflows.command-batch-result.v1",
+      completed: ids.length,
+      total: ids.length,
+      items: ids.map((id) => failedItem(id, side)),
+    });
+    const reason = "Current-change failures have a bounded repair path.";
+    const verification = {
+      schema: CHANGE_VERIFICATION_SCHEMA,
+      route: "repairable",
+      originatingWorkflow: "autodoc",
+      qualifiedNode: "documentation/verify",
+      workspace: {
+        mode: "pullRequest",
+        repository: "/repo",
+        branch: "feat/broken-build",
+        baseBranch: "main",
+        cwd: "/repo",
+      },
+      changedFiles: ["src/a.ts"],
+      candidateCommands: commands("candidate"),
+      baseCommands: commands("base"),
+      relatedFailures: [
+        {
+          checkId: "check-0",
+          kind: "related",
+          summary: "RELATED-FINDING-MARKER: check-0 fails only on the change.",
+          fingerprint: "fingerprint-related",
+          candidateOutputRef: "candidate:check-0",
+        },
+      ],
+      unrelatedFailures: [],
+      fixedBaselineFailures: [],
+      unknownFailures: [],
+      untestedChecks: [],
+      repairAttempts: [],
+      failureFingerprint: "fingerprint-broken-build",
+      outputReferences: [...ids.map((id) => `candidate:${id}`), ...ids.map((id) => `base:${id}`)],
+      reason,
+      evidence: [reason],
+    };
+    const documented = {
+      exit: "ready",
+      output: {
+        status: "ready",
+        task: "Ship the fix",
+        plan: { summary: "Fix the broken build" },
+        planDigest: `sha256:${"c".repeat(64)}`,
+        documentation: { state: "current", files: [], digests: {}, evidence: verification },
+        verification,
+      },
+    };
+    const context = {
+      input: { task: "Ship the fix", repository: "/repo", scope: "Only /repo" },
+      outputs: { documentation: documented },
+      results: {},
+      state: {
+        steps: [
+          {
+            attemptId: "attempt-documentation",
+            nodeId: "documentation",
+            outcome: "ok",
+            output: documented,
+          },
+        ],
+      },
+      settings: { merge: false, addedInstructions: [], forge: "auto", prTiming: "early" },
+      signal: new AbortController().signal,
+    };
+    const observation = observe.run(context as never);
+    const prompt = await decide.prompt({
+      ...context,
+      outputs: { ...context.outputs, observe: observation },
+    } as never);
+
+    expect(prompt.length).toBeLessThanOrEqual(PROMPT_CEILING_CHARS);
+    const shownLine = /Observation: (.+)\nRecent attempts: /.exec(prompt);
+    if (shownLine?.[1] === undefined) throw new Error("the decide prompt must show an observation");
+    const shown = JSON.parse(shownLine[1]) as Record<string, unknown>;
+    // The latest attempt stays readable instead of collapsing to one reference.
+    const latestAttempt = shown["latestAttempt"] as Record<string, unknown>;
+    expect(latestAttempt["schema"]).not.toBe(EVIDENCE_REF_SCHEMA);
+    const shownPlan = (latestAttempt["output"] as { output: Record<string, unknown> }).output;
+    for (const copy of [
+      shownPlan["verification"],
+      (shownPlan["documentation"] as Record<string, unknown>)["evidence"],
+    ] as Array<Record<string, unknown>>) {
+      expect(copy).toMatchObject({
+        route: "repairable",
+        reason,
+        failureFingerprint: "fingerprint-broken-build",
+        relatedFailures: [
+          {
+            checkId: "check-0",
+            summary: "RELATED-FINDING-MARKER: check-0 fails only on the change.",
+            fingerprint: "fingerprint-related",
+          },
+        ],
+      });
+      for (const side of ["candidate", "base"]) {
+        const shownCommands = copy[`${side}Commands`] as { items: Array<Record<string, unknown>> };
+        expect(shownCommands.items).toHaveLength(ids.length);
+        for (const [index, shownItem] of shownCommands.items.entries()) {
+          const id = ids[index]!;
+          // Per-command metadata stays, and outputRef names the complete logs.
+          expect(shownItem).toMatchObject({
+            id,
+            outcome: "failed",
+            exitCode: 1,
+            stderrChars: failedItem(id, side).stderr.length,
+            outputRef: `${side}:${id}`,
+          });
+          // Any stderr left is the reference with its excerpt; one that gave way is gone, and
+          // stderrChars and outputRef above still give its size and its complete logs.
+          if (shownItem["stderr"] !== undefined) {
+            expect(shownItem["stderr"]).toMatchObject({
+              schema: EVIDENCE_REF_SCHEMA,
+              chars: failedItem(id, side).stderr.length,
+              digest: evidenceRef(failedItem(id, side).stderr).digest,
+            });
+          }
+        }
+      }
+    }
   });
 
   it("shortens the largest observation field instead of failing when evidence is too wide", async () => {

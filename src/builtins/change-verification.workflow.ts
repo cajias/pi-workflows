@@ -278,6 +278,23 @@ export function changeVerificationEvidence(result: ChangeVerificationResult): un
   };
 }
 
+/**
+ * Whether a prompt can lose this field of a projected change-verification command entry: the stderr
+ * of a failed check. The entry keeps `stderrChars`, its size, and `outputRef`, which names its
+ * complete logs in the durable result, so a prompt that does not fit drops this text before it
+ * collapses the route, the reason, the findings, or the per-command metadata.
+ */
+export function isFailedCheckStderr(
+  owner: Readonly<Record<string, unknown>>,
+  key: string,
+): boolean {
+  return (
+    key === "stderr" &&
+    typeof owner["outputRef"] === "string" &&
+    typeof owner["stderrChars"] === "number"
+  );
+}
+
 function findingEvidence(finding: VerificationFinding): unknown {
   return {
     checkId: finding.checkId,

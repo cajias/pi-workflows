@@ -1204,7 +1204,16 @@ timed-out, and cancelled commands keep no log text.
 Projection shapes a prompt only. `state.steps[].output` keeps every complete result and
 `state.steps[].prompt` keeps every complete prompt, so a recorded run stays readable and resumable.
 The autoimplement decide prompt projects its observation and its recent-attempt list, and then
-measures the assembled prompt. When the projected evidence still does not fit, the oldest ledger
+measures the assembled prompt. When the projected evidence still does not fit, failed-check stderr
+gives way first: `shedFields` removes the `stderr` of failed change-verification checks from the
+observation and the recent-attempt list, largest first, until the prompt fits. Each such check keeps
+`stderrChars`, the size of its stderr, and `outputRef`, which names its complete logs in the durable
+result, so nothing becomes unreachable. Many failed checks with long stderr therefore cost the prompt
+their stderr text, not the route, the reason, the findings, the fingerprints, or the per-command
+metadata. An Autodoc result carries its verification twice, in `documentation.evidence` and
+`verification`, and the prompt keeps both copies: once the stderr has given way, a second copy costs
+only its metadata, and a decide prompt for the most failing checks that a batch allows, failing on
+the base too, still fits with both copies. If the evidence still does not fit, the oldest ledger
 entries collapse to references, and then the largest observation field collapses to one. The order is
 fixed, so the prompt keeps the newest results and the small decisive fields, such as the available
 routes, for as long as it can. `boundLedger` and `boundEvidence` do that work. An overflow that
