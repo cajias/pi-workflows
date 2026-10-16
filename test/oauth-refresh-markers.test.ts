@@ -2,6 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  OAUTH_REFRESH_CEILING_MS,
+  OAUTH_REFRESH_START_DEADLINE_MS,
+  OAUTH_REFRESH_WAIT_MS,
   listOAuthRefreshMarkers,
   oauthRefreshMarkerDirectory,
   pruneOAuthRefreshMarkers,
@@ -12,6 +15,18 @@ import { makeTempDir } from "./helpers.js";
 
 const STARTED_AT = "2030-01-01T00:00:00.000Z";
 const STARTED = Date.parse(STARTED_AT);
+
+describe("OAuth refresh process timing", () => {
+  it("waits for the refresh process past its longest normal run, and less than its ceiling", () => {
+    // The start deadline, Pi's two 30-second lock waits, and Pi's 15-second refresh timeout.
+    const longestNormalRunMs = OAUTH_REFRESH_START_DEADLINE_MS + 2 * 30_000 + 15_000;
+    expect(longestNormalRunMs).toBe(135_000);
+    expect(OAUTH_REFRESH_WAIT_MS).toBe(180_000);
+    expect(OAUTH_REFRESH_WAIT_MS - longestNormalRunMs).toBe(45_000);
+    // A stuck process still ends on its own after the group stopped waiting for it.
+    expect(OAUTH_REFRESH_WAIT_MS).toBeLessThan(OAUTH_REFRESH_CEILING_MS);
+  });
+});
 
 describe("OAuth refresh process markers", () => {
   it("lives in the pi-workflows configuration directory", () => {

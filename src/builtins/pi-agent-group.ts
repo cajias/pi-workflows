@@ -21,6 +21,7 @@ import {
   type ResolvedResource,
 } from "@earendil-works/pi-coding-agent";
 import {
+  OAUTH_REFRESH_WAIT_MS,
   oauthRefreshMarkerDirectory,
   pruneOAuthRefreshMarkers,
 } from "../state/oauth-refresh-markers.js";
@@ -79,12 +80,6 @@ const MODELS_LOAD_FAILURE = "Could not load Pi model catalog for isolated agents
  * a timeout, slot scheduling, and timer delays.
  */
 const OAUTH_GROUP_MARGIN_MS = 10 * 60_000;
-/**
- * How long a group waits for its OAuth refresh process. It covers the process's 60-second start
- * deadline, Pi's lock wait of up to 30 seconds, and Pi's 15-second refresh timeout. After this
- * wait the group only stops waiting and fails closed; it never stops the process.
- */
-const OAUTH_REFRESH_WAIT_MS = 2 * 60_000;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 type PiAgentEvent = Record<string, unknown>;

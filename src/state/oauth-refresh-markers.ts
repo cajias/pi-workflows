@@ -30,7 +30,7 @@ export const OAUTH_REFRESH_START_DEADLINE_MS = 60_000;
  * Pi's waits for the `auth.json` lock. Pi can wait for that lock twice, up to 30 seconds each:
  * once to read the credential when `auth.json` changed since the runtime loaded it, and once to
  * update it. It gives the provider's refresh a 15-second abort signal, and the agent group waits
- * two minutes for the process. A refresh still running five minutes after the call is stuck, for
+ * three minutes for the process. A refresh still running five minutes after the call is stuck, for
  * example in a provider refresh that ignores its abort signal, so the process then exits even
  * though the refresh is in flight. Exiting releases Pi's lock.
  */
@@ -42,6 +42,14 @@ export const OAUTH_REFRESH_CEILING_MS = 5 * 60_000;
  * finish, after the provider rotated the refresh token and before Pi saved it.
  */
 export const OAUTH_REFRESH_MIN_CEILING_MS = 90_000;
+/**
+ * How long an agent group waits for its refresh process to exit. The longest normal run of the
+ * process is its 60-second start deadline, Pi's two lock waits of up to 30 seconds each, and Pi's
+ * 15-second refresh timeout: 135 seconds. Three minutes adds a 45-second margin for starting Node
+ * and Pi under load. After this wait the group only stops waiting and fails closed; it never
+ * stops the process, which still ends at its own ceiling.
+ */
+export const OAUTH_REFRESH_WAIT_MS = 3 * 60_000;
 /** No refresh process lives longer than this, so an older marker is stale even if its PID runs. */
 const MARKER_MAX_AGE_MS = OAUTH_REFRESH_START_DEADLINE_MS + OAUTH_REFRESH_CEILING_MS + 60_000;
 
