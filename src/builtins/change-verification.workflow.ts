@@ -246,7 +246,9 @@ function parseCheck(
  * A routing prompt needs the route, the reason, the failure findings, and the fingerprints. It does
  * not need the verification command logs, which can be a megabyte each. The complete result, logs
  * included, stays in run state. This view names every log by command, outcome, size, and truncation
- * flag instead of carrying its text.
+ * flag instead of carrying its text. A failed check also carries its stderr and the output reference
+ * that names its complete logs, because its error states only the exit status. The prompt projection
+ * shows a long stderr as a reference with a head and tail excerpt.
  */
 export function changeVerificationEvidence(result: ChangeVerificationResult): unknown {
   return {
@@ -271,9 +273,26 @@ export function changeVerificationEvidence(result: ChangeVerificationResult): un
       changedFiles: attempt.changedFiles,
       result: attempt.result,
     })),
-    candidateCommands: commandBatchEvidence(result.candidateCommands),
-    baseCommands: commandBatchEvidence(result.baseCommands),
+    candidateCommands: commandBatchEvidence(result.candidateCommands, "candidate"),
+    baseCommands: commandBatchEvidence(result.baseCommands, "base"),
   };
+}
+
+/**
+ * Whether a prompt can lose this field of a projected change-verification command entry: the stderr
+ * of a failed check. The entry keeps `stderrChars`, its size, and `outputRef`, which names its
+ * complete logs in the durable result, so a prompt that does not fit drops this text before it
+ * collapses the route, the reason, the findings, or the per-command metadata.
+ */
+export function isFailedCheckStderr(
+  owner: Readonly<Record<string, unknown>>,
+  key: string,
+): boolean {
+  return (
+    key === "stderr" &&
+    typeof owner["outputRef"] === "string" &&
+    typeof owner["stderrChars"] === "number"
+  );
 }
 
 function findingEvidence(finding: VerificationFinding): unknown {
@@ -287,7 +306,10 @@ function findingEvidence(finding: VerificationFinding): unknown {
   };
 }
 
-function commandBatchEvidence(batch: CommandBatchResult | null): unknown {
+function commandBatchEvidence(
+  batch: CommandBatchResult | null,
+  side: "candidate" | "base",
+): unknown {
   if (batch === null) return null;
   return {
     completed: batch.completed,
@@ -306,6 +328,10 @@ function commandBatchEvidence(batch: CommandBatchResult | null): unknown {
       stdoutTruncated: item.stdoutTruncated,
       stderrTruncated: item.stderrTruncated,
       error: item.error ?? null,
+      // The same output reference that `outputReferences` lists for this command.
+      ...(item.outcome === "failed"
+        ? { stderr: item.stderr, outputRef: `${side}:${item.id}` }
+        : {}),
     })),
   };
 }

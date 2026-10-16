@@ -110,6 +110,42 @@ process whose start identity still matches, and then removes the root. A
 killed run can still leave a server behind, so check `ps` after an interrupted
 run.
 
+Every test process runs with an isolated user environment. `test/global-setup.ts`,
+which both Vitest configurations load, points these at the run's temporary root:
+
+- `HOME` and `PI_CODING_AGENT_DIR`, so the workflow database, global workflows,
+  global resource managers, and Pi settings, auth, and models never resolve to
+  the developer's `~/.pi/agent`;
+- the XDG base directories and `PI_WORKFLOWS_CONFIG_DIR`;
+- Git's global configuration, which is an empty file, with system configuration
+  off;
+- npm's cache and user configuration, with the update notifier off.
+
+It also unsets `PI_CODING_AGENT_SESSION_DIR`, `PI_WORKFLOWS_HEADLESS_EXTENSIONS`,
+`HERDR_ENV`, and `GITLAB_HOST`, so a parent Pi or Herdr session cannot change
+what the suite runs. It keeps `PI_WORKFLOWS_E2E_PI_ENTRY`, an explicit opt-in that
+selects which Pi CLI the E2E suite runs.
+
+For Git, it unsets the variables that select a repository or add configuration,
+so a Git hook or wrapper that runs the suite cannot point a test's Git commands
+at a real repository. These are the names that `git rev-parse --local-env-vars`
+prints: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_CONFIG`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_GRAFT_FILE`,
+`GIT_NO_REPLACE_OBJECTS`, `GIT_REPLACE_REF_BASE`, `GIT_PREFIX`, and
+`GIT_SHALLOW_FILE`. It also unsets every `GIT_CONFIG_KEY_<n>` and
+`GIT_CONFIG_VALUE_<n>` pair. Each Git child then finds its repository from its
+own working directory.
+
+Children that inherit the environment, such as workflow servers, resolvers,
+runners, and `npm pack`, see the same values. `test/test-isolation.test.ts`
+fails when any of these paths resolves outside the temporary root, or when any
+of these variables is still set. No global Git identity exists, so a test that
+commits sets `user.name` and `user.email` in its own repository.
+
+The gate commands themselves are tooling, not tests. `npm ci` and `npx` still use
+npm's own cache under the developer's home.
+
 Slophammer runs in CI (coverage, complexity max 8, DRY max 0 findings,
 dependency boundaries). Run it locally with:
 
@@ -157,6 +193,61 @@ runner recovery, final SQLite state, and viewer output. It also restarts the
 real Pi process while one request is pending and proves that the same request is
 not inserted twice. Nothing outside the temp directories is touched, and no
 real model is called.
+
+## Verification scripts
+
+Tests and ad-hoc verification scripts that drive a workflow server through
+`WorkflowClient` must stay off the live server. `new WorkflowClient()` without a
+`databasePath` uses the live state database,
+`<home>/.pi/agent/workflows/state.sqlite`, where `<home>` is `os.homedir()`:
+`HOME`, or `USERPROFILE` on Windows. Real Pi sessions use that database and its
+server. The server's socket is `server/server.sock` in the database's directory,
+or on Windows a named pipe derived from that directory, so the socket always
+follows the database. Use one of these isolations:
+
+- **A scratch database.** Pass
+  `new WorkflowClient({ databasePath: "/var/tmp/<scratch>/state.sqlite" })` and
+  call `ensureAvailable()`. The client starts a server for that database with
+  its own socket under `<scratch>/server/`. Also set `PI_WORKFLOWS_CONFIG_DIR` to
+  a scratch directory, or to one without `channels.json` and `credentials.json`,
+  in the script's environment or the client's `env` option. The started server
+  inherits that environment, and at start it loads the decision channels and
+  their credentials from `PI_WORKFLOWS_CONFIG_DIR`, or from
+  `~/.config/pi-workflows` when it is unset. With the real configuration, the
+  scratch server would start live Telegram adapters with the real bot
+  credentials.
+- **A scratch HOME.** Run the whole script with `HOME` (`USERPROFILE` on Windows)
+  set to a scratch directory and `PI_WORKFLOWS_CONFIG_DIR` set to a scratch
+  directory. The default database and its socket then move under the scratch
+  HOME. The scratch `PI_WORKFLOWS_CONFIG_DIR` keeps an inherited setting from
+  pointing the server at the real configuration, such as decision channels.
+
+`PI_WORKFLOWS_CONFIG_DIR` moves only configuration, such as `channels.json`,
+`credentials.json`, `shortcuts.json`, `autoimplement.json`, and OAuth refresh
+markers. It does not move the database or the socket, so it never isolates state
+on its own. `PI_CODING_AGENT_DIR` does not move the database either. Keep the
+scratch path short, because the socket path must fit the operating system limit,
+107 bytes on Linux. Send `server.stop` and delete the scratch directories when
+the script is done.
+
+`executionMode: "headless"` is not a substitute for isolation. A headless run
+needs no Pi session and creates no terminal workflow message, so it leaves no
+orphaned terminal message, but on the live server it still writes its run, queue
+row, events, and history to the live state. Use headless runs on an isolated
+server when the check needs no origin session.
+
+Never start an interactive run on the live socket with a made-up
+`originSessionId`. The run's terminal result is addressed to that session, so it
+would stay pending forever and keep the run from retention. The workflow server
+rejects such a start: an interactive `run.start` needs the live coordinator
+authority of its origin session, as described in
+[Starting and resuming runs](WORKFLOWS.md#starting-and-resuming-runs). A script
+that needs interactive behavior uses one of these isolations and owns the
+session there. It subscribes with `view.session.watch` and `coordinator: true`,
+reports the branch with `workflowMessage.reportBranch`, and sends
+`targetSessionId` and `coordinatorEpoch` with the start from that same
+connection. `requestInteractiveStart` in `test/helpers.ts` does this for the
+unit tests.
 
 ## Publishing
 

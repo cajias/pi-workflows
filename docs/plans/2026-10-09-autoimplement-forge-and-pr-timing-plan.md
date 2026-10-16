@@ -1492,6 +1492,11 @@ model.
 The livee2e and livee2e2 agent results record the details. No real-model live E2E has verified
 this branch.
 
+**Code review of the F11-F14 branch.** The code-review skill (deep-review) ran on
+`059fb1a..aecaa8b`. Its verdict is `NEEDS_ATTENTION` (request changes): 1 medium and 5 low open
+findings, with no coverage gaps, reviewer errors, or timeouts. The findings are tracked as F43-F45
+and F48-F50. The run directory is `/tmp/pi-code-review.97D9xm`.
+
 ## Risks and open issues
 
 ### Owner decisions (2026-10-11)
@@ -1689,18 +1694,44 @@ These are out of scope for this plan.
   - If upstream reuses them for different content, mixed fork and upstream installs would silently
     accept each other's runs.
   - Re-check revisions when merging upstream.
-- F20: Settle durable per-agent tracks after an action times out or is cancelled.
+- F20: Settle durable per-agent tracks after an action times out or is cancelled. _(done)_
   - The gap: the `agents/<group>/<id>` tracks stay `running`. This predates the resolver host-peer
     fix: `WorkflowEngine.publishUpdate` rejects updates once the attempt signal aborts
     (`src/workflows/engine.ts:168-177`), and the engine stops waiting for an aborted action
     (`src/workflows/engine.ts:1046`).
   - Fix: the engine finalizes progress for aborted attempts.
-- F21: Revisit the 2,000-character agent error cap as a product decision.
+  - Done in `16e3ac1` and `c2371f1`: the engine and the queue's cancellation transaction give each
+    open track of the ended attempt a final `failed` (`timed out`) or `cancelled` record.
+  - Review fixes in `a4bb10f` and `0e4872d`: the docs state the actual revision steps and the
+    remaining limitations, and a real server test covers settlement after an action times out.
+  - Lock-in tests in `3900826`: settlement never reactivates a retired attempt that F13's
+    `unrecordedAttempts` lists. They cover a timed-out replacement after a resume, active and
+    parked cancellations, a retired and a cancelled `verifyP2` attempt, and the Autoimplement
+    P2-push restart on both forges. `0e81ea7` updates them for F37, which settles a replaced
+    attempt's own tracks as `cancelled` with the phase `interrupted`.
+  - Race fix in `8124d9d`: a `holdTimers` helper holds back the replacement attempt's timeout in
+    the retired-attempt tests until the test fires it, so the timeout cannot race the test's own
+    setup under load.
+- F21: Revisit the 2,000-character agent error cap as a product decision. _(done)_
   - `MAX_ERROR_CHARS` (`src/builtins/pi-agent-launch.ts:59`, moved from
     `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from the Sanity Check privacy contract,
     not from a named external interface.
   - `PiAgentGroupError.detail` keeps the complete cause.
-- F22: Let Sanity Check agent groups use built-in providers and run offline.
+  - Done with option C in `e66d642`, `d6460fa`, `3df2e8f`, `1316c05`, and `c4cad7b`: agent errors
+    carry only codes and Pi Workflows' own facts, plus the full path of a private `0600` cause
+    file, and nothing is truncated. Command-batch errors state only the exit status, and the item
+    keeps its complete stdout and stderr.
+  - Second-round review fixes in `8608a47`, `92fffc4`, and `5c1e321`: pi cleanup and start
+    failures keep the group's outcome, only the group runner's own agent errors keep visible
+    facts, and a rejected complete-label update is retried.
+  - Decide-prompt fix in `4873e95`: the Autoimplement decide prompt again receives a failed
+    check's stderr, bounded by the existing prompt evidence projection, with an `outputRef` to the
+    complete output in the durable verification result. Only stderr is forwarded (F56).
+  - Prompt-fit fix in `ec7ab18`: when the decide prompt does not fit, it first sheds failed
+    checks' stderr, largest first, keeping each check's `stderrChars` and `outputRef`, and only
+    then collapses whole fields. The route, reason, findings, and per-command metadata stay
+    visible even with the most failing checks a batch allows.
+- F22: Let Sanity Check agent groups use built-in providers and run offline. _(done)_
   - The gap: a group accepts only a provider that a user extension registers, and it needs that
     provider's `<agentDir>/models-store.json` entry, which Pi writes only after an online catalog
     refresh. Groups therefore fail with `PI_OFFLINE=1` (set in the user's `~/.zprofile`) and with
@@ -1708,18 +1739,63 @@ These are out of scope for this plan.
   - This predates the fix: `src/builtins/pi-agent-group.ts` at 2cb8ab3, lines 477 (user-scope
     candidates), 521-532 (extension-registered owner check), and 298 and 400-404
     (`models-store.json` snapshot).
-- F23: Prune kept agent group stderr logs.
+  - Done in `be92d3e`: groups also accept providers that Pi defines itself, resolve the model
+    without a cached catalog, and run with `PI_OFFLINE=1`.
+  - Review fixes in `b113707` and `071aa3d`: children receive only the dispatch credential, and a
+    test rejects a virtual dispatch model.
+  - Superseded: an interim gate first refused stored OAuth credentials for providers that Pi
+    defines, including Pi providers that an extension re-registers. Option A and then B′
+    replaced it. Its two commits were dropped from this branch's history when the branch was
+    rebased onto `origin/main`; the parts they added that do not depend on the gate were kept.
+  - OAuth done with the human's option A in `57d065d` and `9fa2870`: before the group starts, Pi
+    refreshes the dispatch provider's OAuth credential at most once, under its `auth.json` file
+    lock, when the credential would not outlive the run bound plus a 10-minute margin. The group
+    fails closed when the refresh fails or the token is still too short. Children never refresh,
+    and legacy extension OAuth is covered. B′ (below) keeps this design and reaches Pi only
+    through its public SDK.
+  - OAuth refresh hardening in `cb1cabf`, `3524ad6`, `8acf8c1`, `e86a9e4`, and `b97c99a`: the
+    refresh runs in its own process, which no pi-workflows stop reaches, and that process exits at
+    the latest 5 minutes after the refresh starts. Private marker files list each refresh in
+    `server status` as `oauthRefreshes`. The group fails closed on a missing or changed entry, a
+    lock or store failure, an unsupported Pi installation, and a marker failure.
+  - Final review fixes in `c90ff45` and `d9a66a2`: the docs say that a cancelled headless group
+    reports after its usual settle wait while the refresh process finishes on its own, and a
+    refresh process that fails before Pi could refresh is named as such instead of asking the
+    user to sign in again.
+  - Public SDK only, in `3d4d84a` and `0f65b1d`: the human rejected importing Pi's internal
+    `AuthStorage` module and chose B′. The refresh goes through the public
+    `ModelRuntime.create({ authPath })` and `getAuth`, and the re-read through the public
+    `readStoredCredential`. The refresh process resolves Pi's public entry from the `exports` of
+    Pi's `package.json`. The re-read is unlocked, a torn read fails closed, and the 5-minute
+    ceiling now also covers Pi's lock wait.
+  - Ceiling floor in `4978980`: a refresh process never accepts a ceiling below 90 seconds, which
+    covers Pi's two `auth.json` lock waits of up to 30 seconds each plus its 15-second refresh
+    timeout.
+  - Fix pass in `62ae9b0` and `a9be008`: the group waits three minutes for the refresh process,
+    past its longest normal run of 135 seconds, and the docs state that a token needs about 30
+    minutes of validity after the single refresh: the 20-minute run bound, Pi's fixed 5-minute
+    threshold, and 5 minutes of slack. A shorter-lived token fails closed with `expire too soon`
+    (F55).
+- F23: Prune kept agent group stderr logs. _(done)_
   - `$TMPDIR/pi-workflows-<runId>-agent-group-*/pi-stderr.log` (`0700` directory, `0600` file)
     stays until the operator deletes it (`src/server/agent-group-diagnostics.ts:24`).
-- F24: Install the live E2E candidate the way Pi does.
+  - Done in `165b277`: before its first agent group, each runner deletes only log directories in
+    the exact logger layout that are unchanged for a fixed seven days.
+- F24: Install the live E2E candidate the way Pi does. _(done)_
   - `scripts/live-e2e.mjs:541-545` runs plain `npm install`, which installs the peer packages, so
     it cannot catch a plain Node entry that value-imports a host-only Pi package. Add
     `--legacy-peer-deps` to match `pi install`.
-- F25: Pin the `pi` and Node that headless Pi uses.
+  - Done in `9b7202a`: the candidate installs with `--omit=dev --legacy-peer-deps`, and the run
+    fails if a host-provided Pi package can be resolved from it.
+- F25: Pin the `pi` and Node that headless Pi uses. _(done)_
   - Agent steps and agent groups spawn `pi` from the server's inherited `PATH`
     (`src/server/headless-pi.ts:85-86`), and npm-installed `pi` starts through
     `#!/usr/bin/env node`. A server started with a mise shim on `PATH` would run that Node.
-- F26: Make the timing-sensitive agent group test robust under load.
+  - Done in `74d7669` and `ab89413`: the server pins pi and Node once at start, and
+    `server status` reports the pin as `headlessPi`.
+  - Review fixes in `911505b` and `63798bc`: a `PATH` shim keeps its own name as `argv0`, and a
+    probe timeout is named, with one retry of an unresolved pin.
+- F26: Make the timing-sensitive agent group test robust under load. _(done)_
   - `test/pi-agent-group.test.ts:1170` ("discovers a legacy provider owner and uses its configured
     authentication") runs a real SDK session with the helper's `timeoutMs: 1_000`
     (`test/pi-agent-group.test.ts:25`). It failed with "Pi agent legacy timed out: after 1000ms" on
@@ -1728,6 +1804,136 @@ These are out of scope for this plan.
     (`/tmp/resolver-peers-int3-check.attempt1-flake.log`).
   - It passed alone (3/3 and 36/36) and on full reruns. It predates the resolver host-peer fix,
     which changed only its imports.
+  - Done in `7fff518`: real SDK sessions in that file use a 30-second hang limit under a 90-second
+    test timeout, so only a real hang fails by timeout.
+- F27: Let headless Pi load a provider that only an extension registers. _(done)_
+  - Done in `de293ec` and `f4390e1`: server piArgs can load an extension-only provider through
+    absolute `-e` paths, documented and validated.
+  - Review fixes in `3d1c087`, `55edba0`, and `564f73d`: piArgs reject `--`, and the opt-in
+    `PI_WORKFLOWS_HEADLESS_EXTENSIONS` loads the listed extensions for every server start path,
+    including the auto-spawned server.
+  - Second-round review fixes in `593efb4`, `81ff3c9`, `26d5e1d`, `fa2d0a6`, and `2244ad3`:
+    entries must be extension files, the server pins each realpath and rechecks it before each
+    launch, the docs say that file contents are not pinned, and an entry that vanishes during its
+    check fails closed with a clear error.
+- F28: Keep the checkout clean after pi-style installs. _(done)_
+  - Done in `952f7d4`: lockfile regenerated so pi-style installs leave the checkout clean.
+- F32: Fail headless steps whose configured default model cannot be resolved instead of silently
+  falling back. _(done)_
+  - Done in `4493478` and `0bdc7fd`: headless pi stops before any model request, and the step
+    fails with an error that names the default and how to fix it.
+  - Second-round review fix in `4dfc8b1`: the error names the server restart that picks up a
+    changed `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or changed extra Pi arguments.
+  - Round-4 fix in `976aa5e`: a `--models` or `enabledModels` scope counts as an explicit choice.
+    The step runs on the first usable model in the scope, fails clearly when nothing in the scope
+    is usable, and never falls back to a model outside the scope. A step with no settings default
+    but a scope that matches nothing usable now fails; before, it ran on Pi's first available
+    model.
+- F33: Require the origin session for interactive run.start and report undelivered terminal
+  messages. _(done)_
+  - Done in `4eb49e6`, `48cf114`, `a56b51d`, `6b7f926`, `e65787d`, `17ab396`, and `b745283`:
+    - an interactive `run.start` requires a live session command for its origin session, and a
+      start whose connection is lost retries with fresh authority and the same idempotency key;
+    - `state status` reports the count and oldest age of undelivered terminal messages, and
+      `state verify` lists them; both only report;
+    - verification scripts must use an isolated workflow server.
+  - Final review fix in `81fe8e3`: a scratch-database verification script also needs a scratch
+    `PI_WORKFLOWS_CONFIG_DIR`, so its server cannot load the real decision channels and
+    credentials.
+- F34: Remove the two stale terminal workflow messages from the live state DB in a maintenance
+  window.
+  - Deferred by the human. It needs explicit approval before any run against the live state, and
+    it follows the procedure in `docs/SQLITE_STATE.md` ("Removing undeliverable terminal
+    messages").
+- F35: Refresh session authority on retry for `followUp.queue` and `run.changeSettings`.
+  - Found during F33: both commands build their session authority once, so a retry after a lost
+    connection carries the stale coordinator epoch and is rejected as replaced. A user retry can
+    then queue a second follow-up or apply a settings patch twice.
+- F36: Isolate HOME, the Pi agent dir, and user config for every test process. _(done)_
+  - Done in `fff8c27`, `b953cf2`, and `c834e44`: the global test setup points HOME,
+    `PI_CODING_AGENT_DIR`, the XDG directories, git's global config, and npm's cache and user
+    config at a temporary root, unsets inherited Pi session, headless-extension, herdr, and GitLab
+    host variables, and keeps `PI_WORKFLOWS_E2E_PI_ENTRY` as an explicit opt-in. A guard test
+    fails when any isolated path points outside the temporary root.
+  - Residual: test servers still read the header of the real `pi` on `PATH` (read-only); the
+    herdr-package e2e `npm pack` builds into the repo's `dist/`; the default macOS TMPDIR may
+    exceed the socket path limit; and npm's own cache from the gates' `npm ci` and `npx` is
+    tooling, not test state.
+  - Git env fix in `9dae37a`: the setup also unsets the Git variables that select a repository or
+    add configuration (the `git rev-parse --local-env-vars` list and every
+    `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pair), so a test's git child resolves its own
+    temporary repository. The guard test checks this.
+- F37: Settle progress tracks left open when the server fails a run without the engine
+  (`failWorkflowRun`) or discards an attempt on resume. _(done)_
+  - Done in `7ec8c03`, `cf0bb86`, `fe462e8`, and `cdbc8a2`, with test assertions updated in
+    `0e81ea7`.
+  - Server fail: `terminalRun`'s failed branch calls `settleEndedRunProgress` (generalized from
+    `settleCancelledRunProgress`), so each open track of a failed attempt gets `failed` with the
+    phase `failed` before `run.queue_failed`, in the same transaction.
+  - Resume discard: `commitTransition`'s resume-retire block settles the retired attempt's open
+    tracks as `cancelled` with the phase `interrupted`, after `run_resumed`, in the same
+    transaction. The retired `node_attempts` row keeps `started_at` and `finished_at` and has no
+    `run_steps` row, as the F13 `unrecordedAttempts` derivation needs.
+  - Tests: the server-mode resume settlement test and the server-fail rollback test are done in
+    `fe462e8`, so neither is a follow-up.
+  - Residual: `WorkflowRunStore.markRunInterrupted` still leaves its last attempt's tracks open;
+    nothing in production calls it (F51).
+  - Engine projection fix in `e572b8d`, with event-driven checks in `3da754d`: after a replacing
+    resume, the engine reads the resume's settlement records back from durable state, so node
+    callbacks, `onRunStarted`, the final result, and `onEvent` see the replaced attempt's tracks
+    as settled, in local and server mode. The in-flight-publication and stopped-runner checks now
+    wait for events instead of fixed sleeps.
+  - Live E2E: waived. The human's rule for F35-F41 allows no live or billable model calls, as with
+    the F11-F14 waiver in the Validation section.
+- F38: Report Pi's own reason when no model exists at all; headless steps now show only
+  `exited mid-step (code 1)`.
+  - Accepted on `followups/f38-no-model-reason` (`543b89c`); not in this bundle. Live E2E: waived
+    under the human's no-live/no-billable rule for F35-F41.
+- F38b: Fix the three F38 review P2s.
+  - Keep a malformed model-error protocol line out of the `Pi reported` text, and anchor the
+    regex of the test "reports the exit when a model error line is malformed".
+  - The test uses the global model registry instead of a `mkdtemp` registry under the test temp
+    directory.
+  - The test relies on `PI_CODING_AGENT_DIR` implicitly; comment that, or set it explicitly in
+    the test environment.
+- F39: Let user workflows that reuse built-in Sanity Check nodes reach the runner's agent group
+  launcher.
+  - Cause: `src/workflows/loader.ts:85-93` builds the jiti loader with `moduleCache: false` and
+    the `@osolmaz/pi-workflows/builtins` aliases, so a user workflow that reuses Sanity Check
+    nodes loads a fresh copy of the builtins and cannot reach the agent group launcher that the
+    runner installs.
+  - In progress on `followups/f39-sanity-group-launcher` (`3c273d3`); not integrated.
+- F40: Make load-sensitive tests robust: server-view ("bounds the node window"), monitor-repair,
+  builtin-autoimplement-forge.
+  - Accepted on `followups/f40-load-sensitive-tests` (`1f52c8f`); not in this bundle. Live E2E:
+    waived under the human's no-live/no-billable rule for F35-F41.
+  - Review P2s left unfixed: the sync-position map never shrinks, consistent with the existing
+    contexts map; the full-sync baseline test runs the new code; and the Buffer helper's failure
+    message is less detailed.
+- F58: Make the file-wide 30 s `GRAPH_RUN_TIMEOUT_MS`
+  (`test/builtin-autoimplement-pr-timing.test.ts:1424`) robust under heavy load.
+  - It times out under heavy artificial load. This predates the bundle: the untouched sibling
+    test fails the same way. Found during the fix pass.
+- F41: Switch the agent-group OAuth re-read to a locked public Pi API once Pi exports
+  `AuthStorage` or a locked credential read. _(blocked on a Pi release)_
+  - Pi 1.1.0 exports no `AuthStorage` and no locked credential read. Its only public read is
+    `readStoredCredential` (Pi `dist/index.d.ts:4`), which takes no lock.
+  - Until then, `readRefreshedCredential` (`src/builtins/pi-agent-group.ts:679-693`) re-reads
+    unlocked and fails closed: a torn, missing, or non-OAuth entry, and any lock or IO error,
+    becomes `could not refresh OAuth credentials`.
+  - A draft upstream issue exists locally; it is not filed.
+- F55: Let agent groups run with OAuth tokens shorter than ~30 min of validity.
+  _(blocked on a Pi release)_
+  - Pi 1.1.0 applies a fixed 5-minute OAuth threshold to every child request. pi-ai
+    `dist/auth/resolve.js:46` defines it, and `:101` takes the larger of it and the per-call
+    `minOAuthValidityMs`, so a per-call override can only raise it. `prepareRequest`
+    (`dist/core/model-runtime.js:447-455`) passes no override.
+  - Sanity Check therefore needs about 30 minutes of validity after the single refresh: the
+    20-minute run bound, Pi's 5 minutes, and 5 minutes of slack. The ~25-minute GitHub Copilot
+    token figure is unverified.
+  - The human chose A+D: document the limit (A, in `a9be008`) and ask Pi for a per-runtime
+    threshold that can go below 5 minutes (D), with no false-expiry shim. A local upstream issue
+    draft exists; it is not filed.
 - F42: Accept the step suffix in the live E2E paused-status check.
   - The gap: `hasWorkflowUiState` (`scripts/live-e2e.mjs:386-403`) accepts only the exact status
     text `live-runtime-e2e [paused]`. Pi printed `live-runtime-e2e [paused] hold`, so the paused
@@ -1748,15 +1954,19 @@ These are out of scope for this plan.
   - The gap: `docs/WORKFLOWS.md` ("Unrecorded attempts"), the `WorkflowUnrecordedAttempt` comment
     in `src/workflows/types.ts:603-606`, and `docs/SQLITE_STATE.md:167` say "a run without a
     restart has the same state as before". Runs that are cancelled or fail while an attempt is in
-    flight also get `unrecordedAttempts` (`src/workflows/queue.ts:1995`, `:2046`). This is harmless,
+    flight also get `unrecordedAttempts` (`src/workflows/queue.ts:1996`, `:2050`). This is harmless,
     because the run is terminal.
   - Fix: reword the docs and the comment, for example "the field is absent when every started
     attempt has a step record".
+  - Note: the `src/workflows/types.ts` comment is already accurate, so only the
+    `docs/WORKFLOWS.md` wording needs a fix (code-review credibility judge).
 - F45: Add the missing `unrecordedAttempts` resume tests (review2 P2 3).
   - `test/park-resume.test.ts:61-141` covers one restart and no restart. Add cases for:
     - two successive restarts, which give two entries in start order;
     - a resume that keeps the interrupted attempt, where the field must not grow;
     - the server-backed `WorkflowRunnerStore` path (`src/server/workflow-runner-store.ts:64-70`).
+  - Note: the server-backed `WorkflowRunnerStore` reuses `readRunState` over RPC, so it is not a
+    separate derivation (code-review credibility judge).
 - F46: Check the negative-refspec exclusion against real Git (review1 P2 1).
   - The gap: when a `^` refspec excludes the branch, `fetchRefspecTracks` returns false, so
     `pushTrackingHead` is undefined and `assertNotPushedBeforeGate` skips the check
@@ -1773,3 +1983,75 @@ These are out of scope for this plan.
     before F11.
   - Consider returning the mapped target ref, for example `refs/remotes/origin/feat-alias/<name>`,
     as the tracking ref, so the reflog and value checks keep working. This is a scope decision.
+- F48: Excuse a lost `verifyP2` push in the no-reflog fallback (code-review, low).
+  - The gap: the no-reflog fallback of `assertNotPushedBeforeGate`
+    (`src/builtins/autoimplement.workflow.ts` ~1733) never consults `unrecordedAttempts`. A lost
+    `verifyP2` push in a repository with `core.logAllRefUpdates=false` is therefore still
+    rejected.
+  - The credibility judge found this is an existing limitation of the fallback, not a regression.
+- F49: Remove the real-time sleep from the F13 restart graph test (code-review, low).
+  - The gap: the test at `test/builtin-autoimplement-pr-timing.test.ts` ~2156 sleeps about 2 s of
+    real time to cross a one-second boundary.
+  - The timeout variant that `3900826` adds (the test at ~2264, its sleep at line 2359) waits for
+    the same second boundary in real time.
+  - Fix: inject or control the attempt timestamps instead.
+- F50: End an unrecorded `verifyP2` attempt's excuse window at its last proven-live time
+  (code-review completeness critic and re-review, medium).
+  - The gap: the window runs until the resume retires the attempt (`src/workflows/store.ts:1723-1730`),
+    so it covers all runner downtime, and any push from this clone in that window is excused
+    whatever the head is.
+  - Fix: end the window at the last proven-live time: `MAX(COALESCE(ended_at, observed_at))` from
+    `attempt_active_intervals` for the attempt, or the interrupt write's `updated_at`
+    (`src/workflows/store.ts:1513`). Fall back to the resume time only when neither exists.
+  - Trade-off: a push between the last sample and a crash is then rejected (fail closed),
+    consistent with `src/state/attempt-time.ts:71`.
+  - When this is fixed, update the `docs/WORKFLOWS.md` sentence that excuses downtime pushes.
+- F51: Settle the progress tracks that `markRunInterrupted` leaves open.
+  - `WorkflowRunStore.markRunInterrupted` (`src/workflows/store.ts:1537`) fails an abandoned run
+    as interrupted without settling the open tracks of its last attempt. Nothing in production
+    calls it today.
+- F52: Replace the direct-SQL setup in the F37 tests.
+  - The F37 missing-submission test sets up its waiting state with direct SQL.
+- F53: Revisit the wording of the `docs/WORKFLOWS.md:1289` heading, "Progress of timed-out and
+  cancelled attempts".
+  - The heading is deliberately kept as it is, so its link anchor stays stable. It was at line
+    1248 before the rebase onto `origin/main`, and at 1280 before F37.
+- F54: Resolve the old pi-lens SQL flags in `src/workflows/store.ts`, and add the missing SAFETY
+  comment for the `as unknown as HumanDecisionRequest` cast at `src/workflows/store.ts:1682`.
+- F56: Forward failed checks' stdout to the Autoimplement decide prompt.
+  - Some tools, such as `tsc`, print their failures to stdout. `4873e95` forwards only stderr,
+    as before F21, so this is not a regression. Found during the fix pass.
+- F57: Speed up run-state reads. `materializeRunState` (`src/workflows/store.ts:3542`) re-reads
+  every step on each commit, and `readBlob` (`src/state/database.ts:176`) prepares its statement
+  again on every call.
+  - The slowest server-view tests take 17-23 s against their 60 s limit.
+- F59: Remove `overrides.tinypool` once oxfmt moves past tinypool 2.1.0 (PR #2 follow-up).
+  - `package.json` overrides tinypool to 2.1.2 because oxfmt 0.59.0 depends on tinypool 2.1.0.
+- F60: Replace the exact tinypool 2.1.2 pin in that override with a range (PR #2 follow-up).
+- F61: Review the browserslist refresh (PR #2 follow-up). It moved to the latest in-range version,
+  past the patched minimum.
+- F62: Keep the `npm ci` log for the deps PR (PR #2 follow-up). _(closed)_
+  - No `npm ci` log was saved for PR #2. Closed: a later clean reinstall confirmed it.
+- F63: Name the refresh-process failure when the credential cannot be read after it.
+  - When the refresh process failed or did not finish and the stored credential cannot be read
+    afterwards, `readRefreshedCredential` (`src/builtins/pi-agent-group.ts:691`) still reports
+    `could not refresh OAuth credentials` and asks the user to sign in again. Only the
+    unchanged-credential branch checks `oauthRefreshProcessFailed`. It fails closed. PR review P3.
+- F64: Check the field types in `decodeOAuthRefreshRequest`
+  (`src/builtins/pi-oauth-refresh-contract.ts:94-102`), which checks only the schema.
+  - A malformed request fails later inside Pi with a generic exit instead of before the marker is
+    written. The parent is trusted, so this is defensive only. PR review P3.
+- F65: Keep a definite stale-authority rejection apart from an uncertain start.
+  - `sendInteractiveStart` (`src/extension/index.ts:1529-1532`) marks a rejected start with a
+    stale-authority error as uncertain, so an exhausted retry says the run "may have been
+    created" although the server committed nothing. A branch-unreported retry waits for a new
+    epoch instead of the same one. PR review P3.
+- F66: Skip relative `PATH` entries when the server pins pi.
+  - `findOnPath` (`src/server/headless-pi-resolution.ts:77-83`) resolves relative entries such as
+    `.` against the cwd of the process that started the shared server. PR review P3.
+- F67: Index the undelivered-message notice's `session_segments` lookup.
+  - The notice query (`src/workflows/diagnostics.ts:142-143`) looks up `session_segments` by
+    `session_id`, which has no index, so each candidate message scans the table. PR review P3.
+- F68: Move `npm_config_logs_dir` in the test global setup.
+  - `test/global-setup.ts` moves npm's cache and user config but not its logs dir, so a gate that
+    exports a logs dir receives the tests' npm logs.

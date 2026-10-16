@@ -15,6 +15,7 @@ import {
   ledgerChars,
   projectEvidence,
   projectLedger,
+  shedFields,
   type EvidenceLedgerEntry,
   type EvidenceViews,
 } from "../src/workflows/prompt-evidence.js";
@@ -229,6 +230,58 @@ describe("boundEvidence", () => {
 
   it("returns a value that is not a plain object unchanged", () => {
     expect(boundEvidence("text", 1)).toBe("text");
+  });
+});
+
+describe("shedFields", () => {
+  // A field is removable when its owner states its size and where its complete value is.
+  const removable = (owner: Readonly<Record<string, unknown>>, key: string) =>
+    key === "stderr" && typeof owner["outputRef"] === "string";
+  const projectedItems = () =>
+    projectEvidence(
+      {
+        route: "repairable",
+        items: [
+          { id: "small", stderr: "x".repeat(500), outputRef: "candidate:small" },
+          { id: "large", stderr: longText(10_000), outputRef: "candidate:large" },
+          { id: "medium", stderr: "y".repeat(3_000), outputRef: "candidate:medium" },
+          { id: "unnamed", stderr: "z".repeat(3_500) },
+        ],
+      },
+      NO_VIEWS,
+    ) as { route: string; items: Array<Record<string, unknown>> };
+
+  it("removes the largest removable fields first and stops once enough is saved", () => {
+    const projected = projectedItems();
+    const before = JSON.stringify(projected);
+    const largeSaving =
+      JSON.stringify("stderr").length + evidenceChars(projected.items[1]?.["stderr"]) + 2;
+    const shed = shedFields(projected, removable, largeSaving + 1);
+    // The largest field and then the next largest go; every other field stays.
+    expect(shed.route).toBe("repairable");
+    expect(shed.items).toEqual([
+      { id: "small", stderr: "x".repeat(500), outputRef: "candidate:small" },
+      { id: "large", outputRef: "candidate:large" },
+      { id: "medium", outputRef: "candidate:medium" },
+      { id: "unnamed", stderr: "z".repeat(3_500) },
+    ]);
+    expect(JSON.stringify(projected).length - JSON.stringify(shed).length).toBeGreaterThan(
+      largeSaving,
+    );
+    // The input stays as it was.
+    expect(JSON.stringify(projected)).toBe(before);
+  });
+
+  it("removes only fields that the predicate accepts and nothing when nothing is due", () => {
+    const projected = projectedItems();
+    const all = shedFields(projected, removable, Number.MAX_SAFE_INTEGER);
+    expect(all.items.map((item) => Object.keys(item))).toEqual([
+      ["id", "outputRef"],
+      ["id", "outputRef"],
+      ["id", "outputRef"],
+      ["id", "stderr"],
+    ]);
+    expect(JSON.stringify(shedFields(projected, removable, 0))).toBe(JSON.stringify(projected));
   });
 });
 

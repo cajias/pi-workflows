@@ -99,6 +99,23 @@ A bounded command-batch action can publish one metadata update when an item sett
 
 These updates do not contain stdout, stderr, command environments, credentials, or private provider data. The accepted action output contains command receipts and controls workflow routing. A command-batch update cannot satisfy review, CI, or verification. If an unaccepted batch runs again after interruption, its earlier updates remain diagnostic records only.
 
+## Sanity Check agent label updates
+
+Sanity Check labels each agent progress track with the agent's role and verified model. When that label exceeds the 200 characters that `pi-workflows.progress.v1` accepts, the track's label ends with `…`, and Sanity Check publishes the complete label once under the same key:
+
+```json
+{
+  "type": "sanity-check.agent-label",
+  "key": "agents/review/review",
+  "data": {
+    "schema": "pi-workflows.sanity-check-agent-label.v1",
+    "label": "Combined review · provider/model"
+  }
+}
+```
+
+After the update is accepted, Sanity Check publishes it again only when the complete label changes. A rejected update, for example one over the update rate limit, is retried with the track's next update. Labels within the limit need no such update.
+
 ## Model-mediated observation
 
 For monitoring, the regular Pi model running the workflow step observes the external target and publishes progress with the existing `workflow` tool. This is the intended adapter boundary. Deterministic runtime code validates, persists, estimates, and renders the submitted data.
@@ -355,7 +372,7 @@ Fields:
 
 `completed` must be finite and at least zero. `total` must be finite, greater than zero, and at least `completed`. `unit` is 1 to 32 printable characters after trimming. Time fields use RFC 3339 with an offset.
 
-A progress object is a full snapshot for its key. Omitted optional fields clear their previous values. Publishers mark finished tracks with a terminal status instead of deleting them.
+A progress object is a full snapshot for its key. Omitted optional fields clear their previous values. Publishers mark finished tracks with a terminal status instead of deleting them. When an attempt times out, is cancelled, is failed by the workflow server, or is replaced on resume before its publisher finishes a track, the runtime writes that terminal record for the attempt's open tracks, as [Progress of timed-out and cancelled attempts](WORKFLOWS.md#progress-of-timed-out-and-cancelled-attempts) describes.
 
 The reserved key `overall` represents an explicit aggregate supplied by the workflow. pi-workflows never combines unrelated tracks automatically. Without `overall`, displays list independent tracks.
 

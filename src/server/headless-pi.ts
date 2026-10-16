@@ -1,9 +1,20 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
+import { availableHeadlessExtensions, type HeadlessExtensions } from "./headless-extensions.js";
 
 const DEFAULT_ABORT_GRACE_MS = 3_000;
+const RESTART_HINT = "Restart the workflow server with `pi-workflows server stop` to pin pi again";
+/** The flags that load an extension in Pi 1.1.0. Each takes the next argument as its source. */
+const EXTENSION_FLAGS = new Set(["-e", "--extension"]);
+/** Sources that Pi does not read as filesystem paths (`isLocalPath` in Pi's `utils/paths`). */
+const NON_PATH_SOURCE = /^(?:npm|git|github|http|https|ssh|builtin):/;
+
+/** The pi that the workflow server pinned at start, or why it could not pin one. */
+export type HeadlessPiLaunch = HeadlessPiCommand | { kind: "unresolved"; error: string };
 
 export interface SupervisedProcessRegistry {
   register(pid: number): unknown | Promise<unknown>;
@@ -18,8 +29,10 @@ export type HeadlessPiOptions = {
   processGroup?: "own" | "inherit";
   /** Grace period before a process group receives SIGKILL. */
   abortGraceMs?: number;
-  /** Absolute path to the pi binary; defaults to the installed `pi`. */
-  piBin?: string;
+  /** The pinned pi. Nothing is looked up on `PATH` when a child starts. */
+  pi: HeadlessPiLaunch;
+  /** Opt-in extensions that load after the bridge; none unless the server lists some. */
+  extensions?: HeadlessExtensions;
   /** Extra environment for the child; the server's environment is inherited. */
   env?: Record<string, string>;
   /** Extra pi arguments, for example a model override. */
@@ -51,8 +64,114 @@ export function packagedExtensionPath(moduleUrl: string, name: string): string |
     .find((candidate) => fs.existsSync(candidate));
 }
 
+/**
+ * Reject a relative extension path in the Pi arguments that a server adds to every headless
+ * child. Each child starts in its run's project directory, so Pi would resolve a relative
+ * path there and could load code from every project. Every `-e` and `--extension` in the
+ * list is checked, wherever it is.
+ *
+ * A `--` is rejected as well. Pi gives it to an option before it that takes a value, such as
+ * `--model --`, and then keeps reading options, so `--` cannot mark where checking may stop.
+ * In RPC mode, headless pi ignores the messages that a real `--` would start.
+ */
+export function assertAbsoluteExtensionPaths(piArgs: readonly string[]): void {
+  for (let index = 0; index < piArgs.length; index += 1) {
+    const flag = piArgs[index] as string;
+    if (flag === "--") {
+      throw new Error(
+        "Extra Pi arguments cannot contain `--`. Pi can read it as the value of the option before it and then load extensions named after it, and headless pi takes no messages. Remove it.",
+      );
+    }
+    if (!EXTENSION_FLAGS.has(flag)) continue;
+    index += 1;
+    const source = piArgs[index];
+    if (source === undefined) {
+      throw new Error(`Extra Pi argument ${flag} requires an absolute extension path`);
+    }
+    if (isRelativeExtensionPath(source)) {
+      throw new Error(
+        `Extra Pi argument \`${flag} ${source}\` names a relative extension path. Headless pi starts in each run's project directory, so Pi would resolve it there and could load project code. Pass an absolute path.`,
+      );
+    }
+  }
+}
+
+function isRelativeExtensionPath(source: string): boolean {
+  if (NON_PATH_SOURCE.test(source.trim())) return false;
+  // Pi expands `~` to the home directory and reads a `file://` URL as an absolute path.
+  if (source === "~" || source.startsWith("~/") || source.startsWith("file://")) return false;
+  return !path.isAbsolute(source);
+}
+
 export function abortGraceMs(options: HeadlessPiOptions): number {
   return options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
+}
+
+export function describeHeadlessPi(pi: HeadlessPiLaunch): string {
+  if (pi.kind === "node") return `${pi.cli} run by ${pi.node}`;
+  if (pi.kind === "executable") return pi.executable;
+  return `unresolved: ${pi.error}`;
+}
+
+/**
+ * The program and arguments that start the pinned pi with pi's own `args`. An executable
+ * starts under its own file name, as a shell would start it, because a multicall shim such
+ * as mise or Volta picks the tool from that name.
+ */
+export function headlessPiSpawnArgs(
+  pi: HeadlessPiCommand,
+  args: readonly string[],
+): { command: string; args: string[]; argv0?: string } {
+  return pi.kind === "node"
+    ? { command: pi.node, args: [pi.cli, ...args] }
+    : { command: pi.executable, args: [...args], argv0: path.basename(pi.executable) };
+}
+
+/**
+ * The pinned pi, checked before each start. A pin outlives `pi update` or a Node upgrade that
+ * removes its files, so a missing file is reported with the restart that pins pi again.
+ */
+export function availableHeadlessPi(pi: HeadlessPiLaunch): HeadlessPiCommand {
+  if (pi.kind === "unresolved") throw new Error(pi.error);
+  const programs = pi.kind === "node" ? [pi.node] : [pi.executable];
+  const missing =
+    programs.find((program) => !isExecutableFile(program)) ??
+    (pi.kind === "node" && !isFile(pi.cli) ? pi.cli : undefined);
+  if (missing !== undefined) {
+    throw new Error(
+      `The workflow server pinned headless pi as ${describeHeadlessPi(pi)}, but ${missing} is missing or not executable. ${RESTART_HINT}.`,
+    );
+  }
+  return pi;
+}
+
+/** The pinned pi and the listed extensions, checked before each start. */
+export function availableHeadlessLaunch(options: HeadlessPiOptions): {
+  pi: HeadlessPiCommand;
+  extensions: string[];
+} {
+  return {
+    pi: availableHeadlessPi(options.pi),
+    extensions: availableHeadlessExtensions(options.extensions ?? { entries: [] }),
+  };
+}
+
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function isExecutableFile(file: string): boolean {
+  if (!isFile(file)) return false;
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -65,6 +184,7 @@ export class HeadlessPiProcess {
   private exitState: HeadlessPiExit | null = null;
   private registeredPid: number | null = null;
   private closePromise: Promise<void> | null = null;
+  private stderrClosed: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly extensionPath: string,
@@ -81,28 +201,44 @@ export class HeadlessPiProcess {
     return this.exitState;
   }
 
+  /**
+   * Wait until stderr has delivered its last line, for at most `timeoutMs`. Node can report
+   * the exit before it reads the stderr that the child wrote last, and a descendant that
+   * inherited stderr can keep the pipe open after the child exits.
+   */
+  async stderrDrained(timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.stderrClosed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+
   async start(): Promise<void> {
-    const child = spawn(
-      this.options.piBin ?? "pi",
-      [
-        "--mode",
-        "rpc",
-        "--no-session",
-        // Isolation is required: an installed pi-workflows extension would
-        // otherwise load beside the bridge, register a competing workflow
-        // tool, and start its own resume and resource runners.
-        "--no-extensions",
-        "-e",
-        this.extensionPath,
-        ...(this.options.piArgs ?? []),
-      ],
-      {
-        cwd: this.options.cwd,
-        env: { ...process.env, ...this.options.env },
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: this.options.processGroup !== "inherit",
-      },
-    );
+    const available = availableHeadlessLaunch(this.options);
+    const launch = headlessPiSpawnArgs(available.pi, [
+      "--mode",
+      "rpc",
+      "--no-session",
+      // Isolation is required: an installed pi-workflows extension would
+      // otherwise load beside the bridge, register a competing workflow
+      // tool, and start its own resume and resource runners.
+      "--no-extensions",
+      "-e",
+      this.extensionPath,
+      ...available.extensions.flatMap((extension) => ["-e", extension]),
+      ...(this.options.piArgs ?? []),
+    ]);
+    const child = spawn(launch.command, launch.args, {
+      ...(launch.argv0 === undefined ? {} : { argv0: launch.argv0 }),
+      cwd: this.options.cwd,
+      env: { ...process.env, ...this.options.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: this.options.processGroup !== "inherit",
+    });
     this.child = child;
     child.on("exit", (code, signal) => this.settle({ code, signal }));
     // A failed spawn (missing binary, EACCES) emits error instead of exit;
@@ -118,6 +254,11 @@ export class HeadlessPiProcess {
       stderr.push(chunk);
     });
     child.stderr?.on("end", () => stderr.end());
+    const stderrStream = child.stderr;
+    this.stderrClosed =
+      stderrStream === null
+        ? Promise.resolve()
+        : new Promise((resolve) => stderrStream.once("close", () => resolve()));
     // stdout carries the RPC event stream. It is drained even without a reader
     // so the pipe never blocks the child.
     const stdout = new LineSplitter(this.handlers.onStdoutLine);

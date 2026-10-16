@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   WorkflowProgressData,
+  WorkflowTraceEvent,
   WorkflowUpdateInput,
   WorkflowUpdateReceipt,
   WorkflowUpdateRecord,
@@ -107,6 +108,20 @@ export function updateProjection(
   next.push(record);
   next.sort((a, b) => a.seq - b.seq);
   return next;
+}
+
+/** The `update_published` trace event that records one accepted update. */
+export function updatePublishedEvent(record: WorkflowUpdateRecord): WorkflowTraceEvent {
+  return {
+    seq: record.seq,
+    at: record.at,
+    runId: record.runId,
+    scope: "node",
+    type: "update_published",
+    nodeId: record.nodeId,
+    attemptId: record.attemptId,
+    payload: { updateId: record.updateId, type: record.type, key: record.key, data: record.data },
+  };
 }
 
 export function createUpdateId(): string {

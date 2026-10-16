@@ -29,6 +29,8 @@ const PLAIN_NODE_MODULES = [
   "viewer/cli",
   "builtins/catalog",
   "builtins/index",
+  // Started by the agent group bridge as a plain Node process that imports Pi by path.
+  "builtins/pi-oauth-refresh",
   "workflows/index",
   "resource-managers/index",
   "client/index",
@@ -159,13 +161,21 @@ function packageName(specifier: string): string {
 const STATIC_SPECIFIER = /^\s*(?:import|export)\s+(?:[^;"'`]*?\s+from\s*)?(["'])([^"'\n]+)\1/gmu;
 const LITERAL_DYNAMIC_SPECIFIER = /(?<![\w$.])import\s*\(\s*(["'])([^"'\n]+)\1\s*\)/gu;
 const ANY_DYNAMIC_IMPORT = /(?<![\w$.])import\s*\(/gu;
+/**
+ * Modules whose computed dynamic imports load Pi by absolute path from the Pi installation that
+ * runs them. Those imports never resolve through this package's dependencies.
+ */
+const PI_PATH_IMPORTERS = new Set([path.join("dist", "builtins", "pi-oauth-refresh-contract.js")]);
 
 /** Runtime specifiers of one emitted module. Type-only imports are already erased by tsc. */
 function runtimeSpecifiers(file: string, source: string): string[] {
   const statics = [...source.matchAll(STATIC_SPECIFIER)].map((match) => match[2] ?? "");
   const dynamics = [...source.matchAll(LITERAL_DYNAMIC_SPECIFIER)].map((match) => match[2] ?? "");
   const dynamicCount = [...source.matchAll(ANY_DYNAMIC_IMPORT)].length;
-  if (dynamicCount !== dynamics.length) {
+  if (
+    dynamicCount !== dynamics.length &&
+    !PI_PATH_IMPORTERS.has(path.relative(builtPackage, file))
+  ) {
     throw new Error(`${file} has a dynamic import that the graph check cannot follow`);
   }
   return [...statics, ...dynamics];
@@ -259,7 +269,7 @@ describe("host package guard", () => {
         modulePath(form, "builtins/pi-agent-group"),
       );
       expect(blocked.code, `${form.name}: ${blocked.stderr}`).not.toBe(0);
-      expect(blocked.stderr).toContain(`${BLOCKED_MARKER} @earendil-works/pi-ai`);
+      expect(blocked.stderr).toContain(`${BLOCKED_MARKER} @earendil-works/pi-coding-agent`);
     }
   }, 120_000);
 });
@@ -326,13 +336,7 @@ describe.each(["src", "dist"] as const)(
       "runs Sanity Check's review through the headless pi agent group launcher",
       async () => {
         const form = formName === "src" ? sourceForm() : builtForm();
-        const piBin = path.join(sandbox, `fake-pi-${formName}`);
         const argvFile = path.join(sandbox, `fake-pi-${formName}.json`);
-        await fs.writeFile(
-          piBin,
-          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_PI)} "$@"\n`,
-          { encoding: "utf8", mode: 0o755 },
-        );
         const review = {
           areas: ["necessity", "duplication", "contracts", "scope_tests"].map((area) => ({
             area,
@@ -347,7 +351,7 @@ describe.each(["src", "dist"] as const)(
         const result = await runNode([...blockedArgs(form), REVIEW_PROBE], {
           PI_WORKFLOWS_TEST_FORM_ROOT: form.root,
           PI_WORKFLOWS_TEST_FORM_EXTENSION: form.extension,
-          FAKE_PI_BIN: piBin,
+          PI_WORKFLOWS_TEST_PI_CLI: FAKE_PI,
           FAKE_PI_ARGV_FILE: argvFile,
           FAKE_AGENT_GROUP_SCENARIO: "success",
           FAKE_AGENT_GROUP_TEXT: JSON.stringify(review),

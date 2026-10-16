@@ -1,7 +1,7 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isModelType } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createAgentSessionFromServices,
@@ -11,16 +11,22 @@ import {
   DefaultResourceLoader,
   ExtensionRunner,
   getAgentDir,
+  getPackageDir,
   ModelRegistry,
   ModelRuntime,
+  readStoredCredential,
   SessionManager,
   SettingsManager,
   type LoadExtensionsResult,
   type ResolvedResource,
 } from "@earendil-works/pi-coding-agent";
+import {
+  OAUTH_REFRESH_WAIT_MS,
+  oauthRefreshMarkerDirectory,
+  pruneOAuthRefreshMarkers,
+} from "../state/oauth-refresh-markers.js";
 import { PROMPT_CEILING_CHARS } from "../workflows/prompt-evidence.js";
 import {
-  boundedErrorText,
   PiAgentGroupError,
   type PiAgentGroupLaunchOptions,
   type PiAgentLifecycleEvent,
@@ -30,6 +36,16 @@ import {
   type PiAgentThinkingLevel,
   type PiAgentTool,
 } from "./pi-agent-launch.js";
+import {
+  encodeOAuthRefreshRequest,
+  isolatedResourceLoaderOptions,
+  OAUTH_REFRESH_EXIT,
+  OAUTH_REFRESH_REQUEST_ENV,
+  oauthRefreshEntryArgs,
+  oauthRefreshProcessEnv,
+  oauthRefreshProcessFailed,
+  piSdkEntry,
+} from "./pi-oauth-refresh-contract.js";
 
 // This module imports packages that only Pi supplies. Only processes that Pi starts may load
 // it: the agent group bridge that the workflow runner starts inside headless Pi, and tests.
@@ -54,6 +70,16 @@ const RESERVED_EXTENSION_NAMES = new Set([
   "workflow-resume",
   "workflow-cancel",
 ]);
+const CREDENTIALS_LOAD_FAILURE = "Could not load Pi credentials for isolated agents";
+const MODELS_LOAD_FAILURE = "Could not load Pi model catalog for isolated agents";
+/**
+ * Validity that a group's OAuth credential must have beyond the group's longest possible run.
+ * Pi refreshes a stored OAuth token in a model request when it expires within five minutes
+ * (`DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` in pi-ai's `auth/resolve.js`), so five minutes keep each
+ * child clear of that threshold. The other five minutes cover session abort and disposal after
+ * a timeout, slot scheduling, and timer delays.
+ */
+const OAUTH_GROUP_MARGIN_MS = 10 * 60_000;
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 type PiAgentEvent = Record<string, unknown>;
@@ -72,6 +98,11 @@ type PiAgentSession = {
   subscribe(listener: (event: PiAgentEvent) => void): () => void;
   abort(): Promise<void>;
   dispose(): void | Promise<void>;
+  /**
+   * The failure of a session that needed to refresh its OAuth credential, which children never
+   * do. Pi reports that request failure only as provider text, so the session keeps the fact.
+   */
+  credentialFailure?(): PiAgentGroupError | undefined;
   model: { provider: string; id: string } | undefined;
   thinkingLevel: PiAgentThinkingLevel;
 };
@@ -86,17 +117,69 @@ export type PiAgentGroupOptions = PiAgentGroupLaunchOptions & {
   now?: () => number;
 };
 
+/**
+ * Run one isolated agent group. Every error it throws is a `PiAgentGroupError` of this module,
+ * so {@link agentGroupErrorFields} can tell Pi Workflows' own facts from foreign text.
+ */
 export async function runPiAgentGroup(
   input: PiAgentRequest[],
   options: PiAgentGroupOptions,
 ): Promise<PiAgentResult[]> {
-  const { requests, maxFinalChars } = validateGroup(input, options);
+  try {
+    return await runGroupRequests(input, options);
+  } catch (error) {
+    throw groupBoundaryError(error);
+  }
+}
+
+/**
+ * The safe fields of an error that this module raised, or `undefined` for any other value.
+ *
+ * The check is `instanceof` against the `PiAgentGroupError` class that this module itself
+ * imports, so it holds in whatever module copy a loader made: the bridge imports this function
+ * from the same module as {@link runPiAgentGroup}. A foreign error that only copies the name
+ * and fields of an agent error is not an instance, so its text never becomes facts.
+ */
+export function agentGroupErrorFields(
+  error: unknown,
+): { agentId: string; code: string; facts: string; detail?: string } | undefined {
+  if (!(error instanceof PiAgentGroupError)) return undefined;
+  return {
+    agentId: error.agentId,
+    code: error.code,
+    facts: error.facts,
+    ...(error.detail === undefined ? {} : { detail: error.detail }),
+  };
+}
+
+/**
+ * Errors from preparing a group, such as a Pi SDK, settings, package manager, or extension
+ * failure, can be any value. Only this module's own agent errors pass; anything else keeps its
+ * text as private detail.
+ */
+function groupBoundaryError(error: unknown): PiAgentGroupError {
+  if (error instanceof PiAgentGroupError) return error;
+  return new PiAgentGroupError("group", "failed", "the agent group raised an error", {
+    detail: errorMessage(error),
+  });
+}
+
+async function runGroupRequests(
+  input: PiAgentRequest[],
+  options: PiAgentGroupOptions,
+): Promise<PiAgentResult[]> {
+  const { requests, maxFinalChars } = validatedGroup(input, options);
   if (requests.length === 0) return [];
   if (options.signal.aborted) throw cancellationError("group", options.signal.reason);
 
   const groupPlan =
     options.sessionFactory === undefined
-      ? await createSdkGroupPlan(requests, options.behaviorExtensionPaths ?? [], options.signal)
+      ? await createSdkGroupPlan(requests, {
+          behaviorExtensionPaths: options.behaviorExtensionPaths ?? [],
+          maxConcurrency: options.maxConcurrency,
+          now: options.now ?? Date.now,
+          signal: options.signal,
+        })
       : undefined;
   if (options.signal.aborted) throw cancellationError("group", options.signal.reason);
   const sessionFactory =
@@ -156,15 +239,12 @@ export async function createEphemeralCredentialStore(
   signal: AbortSignal,
 ): Promise<CredentialStore> {
   signal.throwIfAborted();
-  const authPath = path.join(getAgentDir(), "auth.json");
-  let source: unknown = {};
-  try {
-    source = JSON.parse(await fs.readFile(authPath, "utf8"));
-  } catch (error) {
-    if (!isMissingFile(error)) {
-      throw new Error("Could not load Pi credentials for isolated agents");
-    }
-  }
+  // A parse error can quote the file, and so a credential, so its text is not kept anywhere.
+  const source = await readAgentJson(
+    path.join(getAgentDir(), "auth.json"),
+    CREDENTIALS_LOAD_FAILURE,
+    false,
+  );
   const entries = parseCredentialEntries(source);
   const pending = new Map<string, Promise<Credential>>();
   const enqueue = (
@@ -215,12 +295,12 @@ export async function createEphemeralCredentialStore(
 
 function parseCredentialEntries(source: unknown): Map<string, StoredCredential> {
   if (source === null || typeof source !== "object" || Array.isArray(source)) {
-    throw new Error("Could not load Pi credentials for isolated agents");
+    throw loadFailure(CREDENTIALS_LOAD_FAILURE);
   }
   const entries = new Map<string, StoredCredential>();
   for (const [providerId, value] of Object.entries(source)) {
     if (!isStoredCredential(value)) {
-      throw new Error("Could not load Pi credentials for isolated agents");
+      throw loadFailure(CREDENTIALS_LOAD_FAILURE);
     }
     entries.set(providerId, cloneCredential(value)!);
   }
@@ -254,17 +334,46 @@ function isMissingFile(error: unknown): boolean {
   );
 }
 
+/**
+ * A failure of Pi Workflows' own loading. The fixed sentence is the message's facts. The text of
+ * an underlying filesystem or parser error is not Pi Workflows' own, so it is private detail.
+ */
+function loadFailure(facts: string, cause?: unknown): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "failed",
+    facts,
+    cause === undefined ? {} : { detail: errorMessage(cause) },
+  );
+}
+
+/** A JSON file in Pi's agent directory. A missing file reads as an empty object. */
+async function readAgentJson(
+  file: string,
+  failure: string,
+  keepParseError: boolean,
+): Promise<unknown> {
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) return {};
+    throw loadFailure(failure, error);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw loadFailure(failure, keepParseError ? error : undefined);
+  }
+}
+
 export async function createEphemeralModelStore(signal: AbortSignal): Promise<ModelStore> {
   signal.throwIfAborted();
-  const storePath = path.join(getAgentDir(), "models-store.json");
-  let source: unknown = {};
-  try {
-    source = JSON.parse(await fs.readFile(storePath, "utf8"));
-  } catch (error) {
-    if (!isMissingFile(error)) {
-      throw new Error("Could not load Pi model catalog for isolated agents");
-    }
-  }
+  const source = await readAgentJson(
+    path.join(getAgentDir(), "models-store.json"),
+    MODELS_LOAD_FAILURE,
+    true,
+  );
   const entries = parseModelStoreEntries(source);
   return {
     async read(providerId) {
@@ -285,12 +394,12 @@ export async function createEphemeralModelStore(signal: AbortSignal): Promise<Mo
 
 function parseModelStoreEntries(source: unknown): Map<string, StoredModelStoreEntry> {
   if (source === null || typeof source !== "object" || Array.isArray(source)) {
-    throw new Error("Could not load Pi model catalog for isolated agents");
+    throw loadFailure(MODELS_LOAD_FAILURE);
   }
   const entries = new Map<string, StoredModelStoreEntry>();
   for (const [providerId, value] of Object.entries(source)) {
     if (!isModelStoreEntry(value)) {
-      throw new Error("Could not load Pi model catalog for isolated agents");
+      throw loadFailure(MODELS_LOAD_FAILURE);
     }
     entries.set(providerId, structuredClone(value));
   }
@@ -321,8 +430,11 @@ type SdkGroupPlan = {
   cwd: string;
   dispatch: PiAgentDispatch;
   extensionPaths: readonly string[];
+  /** An admitted extension registers the dispatch provider. Otherwise Pi itself defines it. */
+  providerExtension: boolean;
   credentialSnapshot: CredentialSnapshot;
-  modelSnapshot: StoredModelStoreEntry;
+  /** The dispatch provider's cached catalog entry, when Pi has saved one. */
+  modelSnapshot: StoredModelStoreEntry | undefined;
 };
 
 type ExtensionCandidate = {
@@ -330,51 +442,264 @@ type ExtensionCandidate = {
   source: string;
 };
 
+type ChildExtensionProfile = {
+  extensionPaths: readonly string[];
+  providerExtension: boolean;
+};
+
+type GroupPlanOptions = {
+  behaviorExtensionPaths: string[];
+  maxConcurrency: number;
+  now: () => number;
+  signal: AbortSignal;
+};
+
 async function createSdkGroupPlan(
   requests: PiAgentRequest[],
-  behaviorExtensionPaths: string[],
-  signal: AbortSignal,
+  options: GroupPlanOptions,
 ): Promise<SdkGroupPlan> {
+  const { signal } = options;
   signal.throwIfAborted();
   const cwd = requests[0]!.cwd;
   if (requests.some((request) => request.cwd !== cwd)) {
-    throw new Error("Pi agent group requests must use one working directory");
+    throw invalidRequest("the requests must use one working directory");
   }
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const dispatch = resolveGroupDispatch(requests, settingsManager);
-  const extensionPaths = await resolveChildExtensionPaths(
+  const profile = await resolveChildExtensionProfile(
     cwd,
     agentDir,
     settingsManager,
     dispatch.provider,
-    behaviorExtensionPaths,
+    options.behaviorExtensionPaths,
     signal,
   );
-  const credentials = await createEphemeralCredentialStore(signal);
-  const credentialSnapshot = new Map<string, StoredCredential>();
-  for (const { providerId } of await credentials.list()) {
-    const credential = await credentials.read(providerId);
-    if (credential !== undefined) credentialSnapshot.set(providerId, cloneCredential(credential)!);
+  if (!profile.providerExtension && !(await isPiProvider(dispatch.provider, signal))) {
+    throw new PiAgentGroupError("group", "has unknown provider", dispatch.provider);
   }
+  const credentials = await createEphemeralCredentialStore(signal);
+  // Children receive only the dispatch provider's stored credential. Pi resolves a provider's
+  // authentication from its own entry, and the dispatch is the only provider a child may use.
+  const credential = await prepareDispatchCredential({
+    cwd,
+    agentDir,
+    provider: dispatch.provider,
+    extensionPaths: profile.extensionPaths,
+    credential: await credentials.read(dispatch.provider),
+    requiredValidityMs: groupRunBoundMs(requests, options.maxConcurrency) + OAUTH_GROUP_MARGIN_MS,
+    now: options.now,
+    signal,
+  });
+  const credentialSnapshot: CredentialSnapshot = new Map(
+    credential === undefined ? [] : [[dispatch.provider, credential]],
+  );
+  // The cached catalog is optional. Providers built into Pi and providers that declare their
+  // models resolve without it, so a group also runs offline before any catalog refresh.
   const models = await createEphemeralModelStore(signal);
   const modelSnapshot = await models.read(dispatch.provider);
-  if (modelSnapshot === undefined) {
-    throw new PiAgentGroupError(
-      "group",
-      "has no model catalog",
-      `${dispatch.provider}/${dispatch.modelId}`,
-    );
-  }
   signal.throwIfAborted();
   return {
     agentDir,
     cwd,
     dispatch,
-    extensionPaths,
+    ...profile,
     credentialSnapshot,
-    modelSnapshot: structuredClone(modelSnapshot),
+    modelSnapshot,
   };
+}
+
+/**
+ * Whether Pi defines the provider itself: built into Pi or configured in `models.json`. A
+ * dispatch provider that no admitted extension registers must be one of these.
+ */
+async function isPiProvider(provider: string, signal: AbortSignal): Promise<boolean> {
+  const modelRuntime = await offlineModelRuntime(signal);
+  return modelRuntime.getProvider(provider) !== undefined;
+}
+
+/**
+ * The longest time from the start of a group until its last session can make a model request.
+ * Each slot runs requests one after another, and every session stops at its own timeout, so
+ * request `k` starts at most `floor(k / slots)` timeouts after the group starts.
+ */
+function groupRunBoundMs(requests: PiAgentRequest[], maxConcurrency: number): number {
+  const slots = Math.min(maxConcurrency, requests.length);
+  const longest = Math.max(...requests.map((request) => request.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+  return Math.ceil(requests.length / slots) * longest;
+}
+
+type DispatchCredentialInput = {
+  cwd: string;
+  agentDir: string;
+  provider: string;
+  extensionPaths: readonly string[];
+  credential: StoredCredential | undefined;
+  /** How long the credential must stay valid from now: the group's run bound plus the margin. */
+  requiredValidityMs: number;
+  now: () => number;
+  signal: AbortSignal;
+};
+
+/**
+ * The dispatch credential that children receive. Children never refresh OAuth credentials, so
+ * an OAuth credential that could expire while a child still needs it is refreshed here, once,
+ * before any session starts, through Pi's own locked credential store. Afterwards the group
+ * reads the stored credential again with Pi's public `readStoredCredential`. It fails closed
+ * when the credential is gone or unreadable, is no longer an OAuth credential, or still expires
+ * too soon: the group never switches to another kind of authentication on its own.
+ */
+async function prepareDispatchCredential(
+  input: DispatchCredentialInput,
+): Promise<StoredCredential | undefined> {
+  const { credential, provider, requiredValidityMs, now, signal } = input;
+  if (credential?.type !== "oauth") return credential;
+  if (credential.expires - now() > requiredValidityMs) return credential;
+  const piPackageDir = getPackageDir();
+  if (process.versions.bun !== undefined || piSdkEntry(piPackageDir) === undefined) {
+    throw unsupportedPiInstallation(provider);
+  }
+  const entryArgs = oauthRefreshEntryArgs(path.dirname(fileURLToPath(import.meta.url)));
+  if (entryArgs === undefined) {
+    throw new PiAgentGroupError(
+      "group",
+      "cannot refresh OAuth credentials",
+      `${provider}; this Pi or Node installation cannot run the OAuth refresh process; configure an API key for the provider`,
+    );
+  }
+  // A cancelled group starts no refresh. Once one starts, the group waits for it to finish.
+  if (signal.aborted) throw cancellationError("group", signal.reason);
+  const exit = await refreshInOwnProcess(input, piPackageDir, entryArgs);
+  // The refresh has finished, or its process finishes it on its own, before the group reacts
+  // to a cancellation.
+  if (signal.aborted) throw cancellationError("group", signal.reason);
+  if (exit === OAUTH_REFRESH_EXIT.storeFailed) throw credentialStoreFailure(provider);
+  if (exit === OAUTH_REFRESH_EXIT.unsupported) throw unsupportedPiInstallation(provider);
+  if (exit === OAUTH_REFRESH_EXIT.markerFailed) {
+    throw new PiAgentGroupError(
+      "group",
+      "cannot record the OAuth refresh process",
+      `${provider}; make ${oauthRefreshMarkerDirectory()} a private directory of this user`,
+    );
+  }
+  const refreshed = readRefreshedCredential(input.agentDir, provider);
+  if (refreshed.expires - now() > requiredValidityMs) return refreshed;
+  const unchanged =
+    refreshed.access === credential.access &&
+    refreshed.refresh === credential.refresh &&
+    refreshed.expires === credential.expires;
+  if (unchanged) {
+    throw oauthRefreshProcessFailed(exit)
+      ? refreshProcessFailure(provider)
+      : couldNotRefresh(provider);
+  }
+  throw new PiAgentGroupError(
+    "group",
+    "has OAuth credentials that expire too soon",
+    `${provider}; the refreshed credentials expire before the agent group can finish, which can take ${Math.ceil(requiredValidityMs / 60_000)} minutes`,
+  );
+}
+
+function couldNotRefresh(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not refresh OAuth credentials",
+    `${provider}; sign in to the provider again in Pi, or configure an API key for it`,
+  );
+}
+
+/** The refresh process failed before Pi could refresh, so signing in again would not help. */
+function refreshProcessFailure(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not run the OAuth refresh process",
+    `${provider}; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group`,
+  );
+}
+
+function credentialStoreFailure(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "could not lock or update Pi credentials",
+    `${provider}; another Pi process may be holding auth.json, or Pi could not write it; retry the agent group`,
+  );
+}
+
+function unsupportedPiInstallation(provider: string): PiAgentGroupError {
+  return new PiAgentGroupError(
+    "group",
+    "cannot refresh OAuth credentials",
+    `${provider}; this Pi installation does not provide the modules that agent groups use to refresh OAuth credentials; use Pi's Node package, or configure an API key for the provider`,
+  );
+}
+
+/**
+ * Refresh the dispatch credential in a process of its own (`pi-oauth-refresh.ts`), started
+ * detached and registered with no supervisor, so no stop that Pi Workflows issues can end a
+ * refresh before Pi saves it. Stale markers of earlier refresh processes are pruned first. The
+ * group waits at most {@link OAUTH_REFRESH_WAIT_MS} for the exit status and never stops the
+ * process. No credential and no error text crosses the process boundary.
+ */
+async function refreshInOwnProcess(
+  input: DispatchCredentialInput,
+  piPackageDir: string,
+  entryArgs: string[],
+): Promise<number | undefined> {
+  pruneOAuthRefreshMarkers(oauthRefreshMarkerDirectory());
+  const child = spawn(process.execPath, entryArgs, {
+    cwd: input.cwd,
+    detached: true,
+    stdio: "ignore",
+    env: oauthRefreshProcessEnv(process.env, {
+      PI_CODING_AGENT_DIR: input.agentDir,
+      [OAUTH_REFRESH_REQUEST_ENV]: encodeOAuthRefreshRequest({
+        piPackageDir,
+        agentDir: input.agentDir,
+        cwd: input.cwd,
+        provider: input.provider,
+        extensionPaths: [...input.extensionPaths],
+        minValidityMs: input.requiredValidityMs,
+      }),
+    }),
+  });
+  child.unref();
+  return await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), OAUTH_REFRESH_WAIT_MS);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code ?? undefined);
+    });
+    child.once("error", () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+  });
+}
+
+/**
+ * The dispatch provider's stored OAuth credential after the refresh, read with Pi's public
+ * `readStoredCredential`. Pi 1.1.0 exports no locked read, so this read takes no lock. It reads
+ * the whole file at once, and Pi writes `auth.json` only under its lock, so a read that meets a
+ * write in progress cannot parse and returns nothing. Every such read, and any lock or IO error,
+ * fails closed as `could not refresh OAuth credentials`.
+ */
+function readRefreshedCredential(
+  agentDir: string,
+  provider: string,
+): StoredCredential & { type: "oauth" } {
+  const stored: unknown = readStoredCredential(provider, path.join(agentDir, "auth.json"));
+  if (!isStoredCredential(stored) || stored.type !== "oauth") throw couldNotRefresh(provider);
+  return structuredClone(stored);
+}
+
+type IsolatedSettings = NonNullable<Parameters<typeof SettingsManager.inMemory>[0]>;
+
+/** In-memory settings for an isolated runtime: no discovered resources, no project trust. */
+function isolatedSettings(defaults: IsolatedSettings): SettingsManager {
+  return SettingsManager.inMemory(
+    { ...defaults, extensions: [], skills: [], prompts: [], themes: [] },
+    { projectTrusted: false },
+  );
 }
 
 function resolveGroupDispatch(
@@ -391,7 +716,7 @@ function resolveGroupDispatch(
   if (hasAnyOverride) {
     for (const [index, override] of overrides.entries()) {
       if (override.model === undefined || override.thinkingLevel === undefined) {
-        throw new Error(
+        throw invalidRequest(
           `Pi agent ${requests[index]!.id} must override model and thinkingLevel together`,
         );
       }
@@ -405,7 +730,7 @@ function resolveGroupDispatch(
           override.thinkingLevel !== first.thinkingLevel,
       )
     ) {
-      throw new Error("Pi agent group requests must use one exact model dispatch");
+      throw invalidRequest("the requests must use one exact model dispatch");
     }
     return {
       provider: first.model!.provider,
@@ -417,19 +742,23 @@ function resolveGroupDispatch(
   const modelId = settingsManager.getDefaultModel();
   const thinkingLevel = settingsManager.getDefaultThinkingLevel();
   if (provider === undefined || modelId === undefined || thinkingLevel === undefined) {
-    throw new Error("Pi agent group requires configured provider, model, and thinking level");
+    throw new PiAgentGroupError(
+      "group",
+      "has no default model",
+      "configure a default provider, model, and thinking level in Pi",
+    );
   }
   return { provider, modelId, thinkingLevel };
 }
 
-async function resolveChildExtensionPaths(
+async function resolveChildExtensionProfile(
   cwd: string,
   agentDir: string,
   settingsManager: SettingsManager,
   provider: string,
   behaviorExtensionPaths: string[],
   signal: AbortSignal,
-): Promise<readonly string[]> {
+): Promise<ChildExtensionProfile> {
   signal.throwIfAborted();
   const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
   const resolved = await packageManager.resolve(async () => "skip");
@@ -441,9 +770,7 @@ async function resolveChildExtensionPaths(
   }
   const behaviorPaths = await canonicalizeBehaviorPaths(behaviorExtensionPaths, signal);
   for (const candidate of behaviorPaths) candidates.set(candidate.path, candidate);
-  if (candidates.size === 0) {
-    throw new PiAgentGroupError("group", "has no provider extension", provider);
-  }
+  if (candidates.size === 0) return { extensionPaths: Object.freeze([]), providerExtension: false };
 
   const candidateList = [...candidates.values()].toSorted((left, right) =>
     left.path.localeCompare(right.path),
@@ -452,17 +779,10 @@ async function resolveChildExtensionPaths(
     cwd,
     agentDir,
     settingsManager: SettingsManager.inMemory({}, { projectTrusted: false }),
-    additionalExtensionPaths: candidateList.map((candidate) => candidate.path),
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-    systemPromptOverride: () => undefined,
-    appendSystemPromptOverride: () => [],
+    ...isolatedResourceLoaderOptions(candidateList.map((candidate) => candidate.path)),
   });
   let result: LoadExtensionsResult | undefined;
-  let admittedPaths: readonly string[] | undefined;
+  let profile: ChildExtensionProfile | undefined;
   let failure: unknown;
   try {
     await loader.reload();
@@ -489,17 +809,21 @@ async function resolveChildExtensionPaths(
         owners.add(await canonicalPath(registration.extensionPath, signal));
       }
     }
-    if (owners.size === 0) {
-      throw new PiAgentGroupError("group", "has no provider extension", provider);
-    }
     if (owners.size > 1) {
       throw new PiAgentGroupError("group", "has competing provider extensions", provider);
     }
-    const providerPath = [...owners][0]!;
-    if (!candidates.has(providerPath) || !byPath.has(providerPath)) {
+    // Without an owner, the child loads no provider extension and uses Pi's own provider.
+    const providerPath = [...owners][0];
+    if (
+      providerPath !== undefined &&
+      (!candidates.has(providerPath) || !byPath.has(providerPath))
+    ) {
       throw new PiAgentGroupError("group", "has invalid provider extension", provider);
     }
-    const admitted = new Set([providerPath, ...behaviorPaths.map((candidate) => candidate.path)]);
+    const admitted = new Set([
+      ...(providerPath === undefined ? [] : [providerPath]),
+      ...behaviorPaths.map((candidate) => candidate.path),
+    ]);
     for (const admittedPath of admitted) {
       const extension = byPath.get(admittedPath);
       if (extension === undefined) {
@@ -507,7 +831,10 @@ async function resolveChildExtensionPaths(
       }
       validateAdmittedExtension(extension, candidates.get(admittedPath)?.source ?? "extension");
     }
-    admittedPaths = Object.freeze([...admitted].toSorted());
+    profile = {
+      extensionPaths: Object.freeze([...admitted].toSorted()),
+      providerExtension: providerPath !== undefined,
+    };
   } catch (error) {
     failure = error;
   }
@@ -525,7 +852,18 @@ async function resolveChildExtensionPaths(
     }
   }
   if (failure !== undefined) throw failure;
-  return admittedPaths!;
+  return profile!;
+}
+
+/** A model runtime with Pi's own providers and no credentials, cache, or network. */
+async function offlineModelRuntime(signal: AbortSignal): Promise<ModelRuntime> {
+  return await ModelRuntime.create({
+    allowModelNetwork: false,
+    refreshOnCreate: false,
+    signal,
+    credentials: credentialStoreFromSnapshot(new Map(), signal, readOnlyCredentials),
+    modelsStore: emptyModelStore(signal),
+  });
 }
 
 async function shutdownLoadedExtensions(
@@ -533,13 +871,7 @@ async function shutdownLoadedExtensions(
   cwd: string,
   signal: AbortSignal,
 ): Promise<void> {
-  const modelRuntime = await ModelRuntime.create({
-    allowModelNetwork: false,
-    refreshOnCreate: false,
-    signal,
-    credentials: credentialStoreFromSnapshot(new Map(), signal),
-    modelsStore: emptyModelStore(signal),
-  });
+  const modelRuntime = await offlineModelRuntime(signal);
   const runner = new ExtensionRunner(
     result.extensions,
     result.runtime,
@@ -581,7 +913,7 @@ async function extensionCandidate(
 ): Promise<ExtensionCandidate | undefined> {
   const resolvedPath = await canonicalPath(resource.path, signal);
   if (await isPiWorkflowsExtension(resolvedPath, resource, signal)) return undefined;
-  return { path: resolvedPath, source: boundedSource(resource.metadata.source) };
+  return { path: resolvedPath, source: resource.metadata.source };
 }
 
 async function canonicalizeBehaviorPaths(
@@ -593,7 +925,7 @@ async function canonicalizeBehaviorPaths(
     operationalText(value, "Pi agent behavior extension path", 4_000);
     const resolvedPath = await canonicalPath(value, signal);
     if (await isPiWorkflowsExtension(resolvedPath, undefined, signal)) {
-      throw new Error("Pi Workflows cannot be admitted as a child extension");
+      throw invalidRequest("Pi Workflows cannot be admitted as a child extension");
     }
     result.set(resolvedPath, { path: resolvedPath, source: "explicit behavior extension" });
   }
@@ -604,8 +936,8 @@ async function canonicalPath(value: string, signal: AbortSignal): Promise<string
   signal.throwIfAborted();
   try {
     return await fs.realpath(path.resolve(value));
-  } catch {
-    throw new Error("Could not resolve Pi child extension path");
+  } catch (error) {
+    throw loadFailure("Could not resolve Pi child extension path", error);
   }
 }
 
@@ -697,33 +1029,20 @@ function isReservedExtensionName(value: string): boolean {
   );
 }
 
-function boundedSource(value: string): string {
-  const source = value.trim();
-  return source.length <= 200 ? source : `${source.slice(0, 200)}…`;
-}
-
+/**
+ * An isolated runtime's credentials: copies of a snapshot that never change. Pi writes a stored
+ * credential only to refresh or replace it, and isolated runtimes do neither. `refused` returns
+ * the error that rejects a write. The write's update, which would run the OAuth refresh, is
+ * never called.
+ */
 function credentialStoreFromSnapshot(
   snapshot: CredentialSnapshot,
   signal: AbortSignal,
+  refused: () => Error,
 ): CredentialStore {
   const entries = new Map(
     [...snapshot].map(([providerId, credential]) => [providerId, cloneCredential(credential)!]),
   );
-  const pending = new Map<string, Promise<Credential>>();
-  const enqueue = (
-    providerId: string,
-    operation: () => Promise<Credential>,
-  ): Promise<Credential> => {
-    const work = (pending.get(providerId) ?? Promise.resolve(undefined))
-      .catch(() => undefined)
-      .then(operation);
-    pending.set(providerId, work);
-    const release = () => {
-      if (pending.get(providerId) === work) pending.delete(providerId);
-    };
-    void work.then(release, release);
-    return work;
-  };
   return {
     async read(providerId) {
       signal.throwIfAborted();
@@ -736,31 +1055,29 @@ function credentialStoreFromSnapshot(
         type: credential.type,
       }));
     },
-    async modify(providerId, update) {
-      return await enqueue(providerId, async () => {
-        signal.throwIfAborted();
-        const next = await update(cloneCredential(entries.get(providerId)));
-        signal.throwIfAborted();
-        if (next !== undefined) entries.set(providerId, cloneCredential(next)!);
-        return cloneCredential(entries.get(providerId));
-      });
+    async modify() {
+      signal.throwIfAborted();
+      throw refused();
     },
-    async delete(providerId) {
-      await enqueue(providerId, async () => {
-        signal.throwIfAborted();
-        entries.delete(providerId);
-        return undefined;
-      });
+    async delete() {
+      signal.throwIfAborted();
+      throw readOnlyCredentials();
     },
   };
 }
 
+function readOnlyCredentials(): Error {
+  return new Error("isolated agent credentials are read-only");
+}
+
 function modelStoreFromSnapshot(
   provider: string,
-  snapshot: StoredModelStoreEntry,
+  snapshot: StoredModelStoreEntry | undefined,
   signal: AbortSignal,
 ): ModelStore {
-  const entries = new Map<string, StoredModelStoreEntry>([[provider, structuredClone(snapshot)]]);
+  const entries = new Map<string, StoredModelStoreEntry>(
+    snapshot === undefined ? [] : [[provider, structuredClone(snapshot)]],
+  );
   return {
     async read(providerId) {
       signal.throwIfAborted();
@@ -831,18 +1148,7 @@ async function runOneAgent(
     if (abortKind !== undefined || options.signal.aborted) {
       abortSession(abortKind ?? "cancelled");
       await abortWork;
-      if (abortKind === "timeout") {
-        throw new PiAgentGroupError(
-          request.id,
-          "timed out",
-          `after ${timeoutMs}ms${abortSuffix(abortFailure)}`,
-        );
-      }
-      throw new PiAgentGroupError(
-        request.id,
-        "cancelled",
-        `${cancellationReason(options.signal.reason)}${abortSuffix(abortFailure)}`,
-      );
+      throw stoppedError(request.id, abortKind, timeoutMs, options.signal, abortFailure);
     }
 
     await session.prompt(request.prompt, {
@@ -851,19 +1157,8 @@ async function runOneAgent(
       },
     });
     await abortWork;
-    if (abortKind === "timeout") {
-      throw new PiAgentGroupError(
-        request.id,
-        "timed out",
-        `after ${timeoutMs}ms${abortSuffix(abortFailure)}`,
-      );
-    }
-    if (abortKind === "cancelled" || options.signal.aborted) {
-      throw new PiAgentGroupError(
-        request.id,
-        "cancelled",
-        `${cancellationReason(options.signal.reason)}${abortSuffix(abortFailure)}`,
-      );
+    if (abortKind !== undefined || options.signal.aborted) {
+      throw stoppedError(request.id, abortKind, timeoutMs, options.signal, abortFailure);
     }
     if (preflightDisposition !== "started") {
       throw new PiAgentGroupError(
@@ -884,7 +1179,9 @@ async function runOneAgent(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    failure = normalizeAgentError(request.id, error, abortKind, options.signal);
+    failure =
+      session?.credentialFailure?.() ??
+      normalizeAgentError(request.id, error, abortKind, timeoutMs, options.signal);
   } finally {
     clearTimeout(timeout);
     options.signal.removeEventListener("abort", onAbort);
@@ -893,7 +1190,17 @@ async function runOneAgent(
     try {
       await session?.dispose();
     } catch (error) {
-      failure ??= new PiAgentGroupError(request.id, "cleanup failed", errorMessage(error));
+      failure ??=
+        error instanceof PiAgentGroupError
+          ? error
+          : new PiAgentGroupError(
+              request.id,
+              "cleanup failed",
+              "the session could not be disposed",
+              {
+                detail: errorMessage(error),
+              },
+            );
     }
     const state = terminalState(failure);
     lifecycle.emit(state, state, true);
@@ -957,40 +1264,30 @@ async function createSdkSession(
   signal: AbortSignal,
 ): Promise<PiAgentSession> {
   if (signal.aborted) throw cancellationError(request.id, signal.reason);
-  // One provider model ID can name a chat entry and an image or classifier
-  // entry. An agent session needs the chat entry.
-  const model = plan.modelSnapshot.models
-    .filter((candidate) => isModelType(candidate, "chat"))
-    .find(
-      (candidate) =>
-        candidate.provider === plan.dispatch.provider && candidate.id === plan.dispatch.modelId,
-    );
-  if (model === undefined) {
-    throw new PiAgentGroupError(
+  // The group refreshed the credential so that no child needs to. A child that would still
+  // need to refresh fails instead, before Pi runs the refresh.
+  let refreshFailure: PiAgentGroupError | undefined;
+  const refuseRefresh = () =>
+    (refreshFailure ??= new PiAgentGroupError(
       request.id,
-      "has no model",
-      `${plan.dispatch.provider}/${plan.dispatch.modelId}`,
-    );
-  }
+      "would need to refresh OAuth credentials mid-group",
+      `${plan.dispatch.provider}; an agent group refreshes OAuth credentials only once, before it starts`,
+    ));
   let latestExtensions: LoadExtensionsResult | undefined;
   const runtime = await createAgentSessionRuntime(
     async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
-      const settingsManager = SettingsManager.inMemory(
-        {
-          defaultProvider: plan.dispatch.provider,
-          defaultModel: plan.dispatch.modelId,
-          defaultThinkingLevel: plan.dispatch.thinkingLevel,
-          extensions: [],
-          skills: [],
-          prompts: [],
-          themes: [],
-        },
-        { projectTrusted: false },
-      );
+      const settingsManager = isolatedSettings({
+        defaultProvider: plan.dispatch.provider,
+        defaultModel: plan.dispatch.modelId,
+        defaultThinkingLevel: plan.dispatch.thinkingLevel,
+      });
+      // Skip the create-time refresh: createAgentSessionServices refreshes once, offline,
+      // after it registers the admitted provider extension.
       const modelRuntime = await ModelRuntime.create({
         allowModelNetwork: false,
+        refreshOnCreate: false,
         signal,
-        credentials: credentialStoreFromSnapshot(plan.credentialSnapshot, signal),
+        credentials: credentialStoreFromSnapshot(plan.credentialSnapshot, signal, refuseRefresh),
         modelsStore: modelStoreFromSnapshot(plan.dispatch.provider, plan.modelSnapshot, signal),
       });
       try {
@@ -1000,20 +1297,12 @@ async function createSdkSession(
           settingsManager,
           modelRuntime,
           modelRuntimeSignal: signal,
-          resourceLoaderOptions: {
-            additionalExtensionPaths: [...plan.extensionPaths],
-            noExtensions: true,
-            noSkills: true,
-            noPromptTemplates: true,
-            noThemes: true,
-            noContextFiles: true,
-            systemPromptOverride: () => undefined,
-            appendSystemPromptOverride: () => [],
-          },
+          resourceLoaderOptions: isolatedResourceLoaderOptions(plan.extensionPaths),
         });
         latestExtensions = services.resourceLoader.getExtensions();
         assertLoadedProfile(request.id, latestExtensions, plan.extensionPaths);
-        assertProviderRegistration(request.id, services, plan.dispatch.provider);
+        assertProviderRegistration(request.id, services, plan);
+        const model = dispatchModel(request.id, services.modelRuntime, plan.dispatch);
         const sessionResult = await createAgentSessionFromServices({
           services,
           sessionManager,
@@ -1056,7 +1345,12 @@ async function createSdkSession(
     });
     await session.bindExtensions({ mode: "print" });
     assertExactSession(request, session, plan.dispatch);
-    const auth = await runtime.services.modelRuntime.getAuth(model, { signal });
+    let auth: Awaited<ReturnType<ModelRuntime["getAuth"]>>;
+    try {
+      auth = await runtime.services.modelRuntime.getAuth(session.model!, { signal });
+    } catch (error) {
+      throw refreshFailure ?? error;
+    }
     if (auth === undefined) {
       throw new PiAgentGroupError(
         request.id,
@@ -1088,8 +1382,11 @@ async function createSdkSession(
           source: "interactive",
         }),
       subscribe: (listener) =>
+        // Pi session events are plain objects, and PiAgentEvent is only their record view.
+        // SAFETY: the listener checks each field it reads before using it.
         session.subscribe((event) => listener(event as unknown as PiAgentEvent)),
       abort: async () => await session.abort(),
+      credentialFailure: () => refreshFailure,
       dispose: async () => {
         if (disposed) return;
         disposed = true;
@@ -1127,14 +1424,35 @@ async function createSdkSession(
 function assertProviderRegistration(
   id: string,
   services: Awaited<ReturnType<typeof createAgentSessionServices>>,
-  provider: string,
+  plan: SdkGroupPlan,
 ): void {
   if (services.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
     throw new PiAgentGroupError(id, "could not register provider extension", "registration failed");
   }
-  if (!services.modelRuntime.getRegisteredProviderIds().includes(provider)) {
-    throw new PiAgentGroupError(id, "could not register provider extension", provider);
+  if (
+    plan.providerExtension &&
+    !services.modelRuntime.getRegisteredProviderIds().includes(plan.dispatch.provider)
+  ) {
+    throw new PiAgentGroupError(
+      id,
+      "could not register provider extension",
+      plan.dispatch.provider,
+    );
   }
+}
+
+/**
+ * The exact dispatch model from the child's model runtime, which resolves it the way Pi does:
+ * Pi's bundled catalog, the cached catalog snapshot, `models.json`, and the admitted provider
+ * extension. Only a physical chat model qualifies, so a virtual model cannot route the session
+ * to another model.
+ */
+function dispatchModel(id: string, modelRuntime: ModelRuntime, dispatch: PiAgentDispatch) {
+  const model = modelRuntime.getPhysicalModel(dispatch.provider, dispatch.modelId);
+  if (model === undefined) {
+    throw new PiAgentGroupError(id, "has no model", `${dispatch.provider}/${dispatch.modelId}`);
+  }
+  return model;
 }
 
 function assertLoadedProfile(
@@ -1172,6 +1490,25 @@ function assertExactSession(
         ? "no model selected"
         : `${session.model.provider}/${session.model.id} ${session.thinkingLevel}`,
     );
+  }
+}
+
+/**
+ * A request that Pi Workflows rejects. The text is Pi Workflows' own and names only request
+ * fields, so the message keeps it, unlike the text of a foreign SDK or settings error.
+ */
+function invalidRequest(text: string): PiAgentGroupError {
+  return new PiAgentGroupError("group", "has an invalid request", text);
+}
+
+function validatedGroup(
+  input: PiAgentRequest[],
+  options: PiAgentGroupOptions,
+): { requests: PiAgentRequest[]; maxFinalChars: number } {
+  try {
+    return validateGroup(input, options);
+  } catch (error) {
+    throw invalidRequest(errorMessage(error));
   }
 }
 
@@ -1269,10 +1606,13 @@ function finalAssistantText(
   if (message === undefined)
     throw new PiAgentGroupError(id, "returned no final output", "missing assistant message");
   if (message.stopReason === "error" || message.stopReason === "aborted") {
+    // The provider's error text can quote the prompt, the response, or credentials.
+    const detail = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
     throw new PiAgentGroupError(
       id,
       `stopped with ${String(message.stopReason)}`,
-      typeof message.errorMessage === "string" ? message.errorMessage : "provider stopped",
+      detail === undefined ? "provider stopped" : "the provider reported an error",
+      detail === undefined ? {} : { detail },
     );
   }
   const text = messageText(message.content).trim();
@@ -1314,16 +1654,26 @@ async function publishQueuedCancellations(
   ).catch(() => undefined);
 }
 
+/** A thrown SDK or provider error keeps its text as private detail. */
 function normalizeAgentError(
   id: string,
   error: unknown,
   abortKind: "timeout" | "cancelled" | undefined,
+  timeoutMs: number,
   signal: AbortSignal,
-): unknown {
+): PiAgentGroupError {
   if (error instanceof PiAgentGroupError) return error;
-  if (abortKind === "timeout") return new PiAgentGroupError(id, "timed out", errorMessage(error));
+  const detail = { detail: errorMessage(error) };
+  if (abortKind === "timeout") {
+    return new PiAgentGroupError(
+      id,
+      "timed out",
+      `after ${timeoutMs}ms; the session raised an error`,
+      detail,
+    );
+  }
   if (abortKind === "cancelled" || signal.aborted) return cancellationError(id, signal.reason);
-  return new PiAgentGroupError(id, "failed", errorMessage(error));
+  return new PiAgentGroupError(id, "failed", "the session raised an error", detail);
 }
 
 function terminalState(error: unknown): PiAgentLifecycleState {
@@ -1339,8 +1689,24 @@ function cancellationReason(reason: unknown): string {
   return reason === undefined ? "operation cancelled" : errorMessage(reason);
 }
 
-function abortSuffix(error: unknown): string {
-  return error === undefined ? "" : `; abort failed: ${boundedErrorText(errorMessage(error))}`;
+/**
+ * A session stopped by its timeout or by cancellation. A failed session abort is a fact; the
+ * abort's own error text is private detail.
+ */
+function stoppedError(
+  id: string,
+  abortKind: "timeout" | "cancelled" | undefined,
+  timeoutMs: number,
+  signal: AbortSignal,
+  abortFailure: unknown,
+): PiAgentGroupError {
+  const timedOut = abortKind === "timeout";
+  const code = timedOut ? "timed out" : "cancelled";
+  const facts = timedOut ? `after ${timeoutMs}ms` : cancellationReason(signal.reason);
+  if (abortFailure === undefined) return new PiAgentGroupError(id, code, facts);
+  return new PiAgentGroupError(id, code, `${facts}; the session abort failed`, {
+    detail: errorMessage(abortFailure),
+  });
 }
 
 function modelName(model: { provider: string; id: string } | undefined): string {

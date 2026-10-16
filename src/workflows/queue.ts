@@ -12,6 +12,7 @@ import {
 } from "../state/project-store.js";
 import { initializeViewerRun, recordViewerDeltas } from "../state/viewer.js";
 import { WorkflowMessageStore } from "../state/workflow-messages.js";
+import { settleEndedRunProgress } from "./store.js";
 
 /**
  * Queue states that hold the one-active-run reservation for a Pi session. Keep this list
@@ -1956,7 +1957,6 @@ export class WorkflowRunQueueStore extends ProjectStore {
       ) {
         return false;
       }
-      const revision = this.resourceRevision(row.resourceId);
       const errorHash = this.state.putText(error, now);
       const queueUpdate = this.state.connection
         .prepare(
@@ -1990,6 +1990,7 @@ export class WorkflowRunQueueStore extends ProjectStore {
       this.workflowMessages.cancelPendingForRun(runId, now);
       if (status === "failed") {
         closeRunTime(this.state, runId);
+        settleEndedRunProgress(this.state, runId, "failed", now);
         this.state.connection
           .prepare(
             `UPDATE node_attempts SET status = 'failed', error_hash = COALESCE(error_hash, ?),
@@ -2012,6 +2013,8 @@ export class WorkflowRunQueueStore extends ProjectStore {
           now,
         );
       }
+      // Read after failure or cancellation settles progress, which advances the run revision.
+      const revision = this.resourceRevision(row.resourceId);
       this.bumpResource(row.resourceId, revision, now);
       this.insertEvent(
         row.resourceId,
@@ -2040,6 +2043,7 @@ export class WorkflowRunQueueStore extends ProjectStore {
     now: number,
   ): void {
     closeRunTime(this.state, runId);
+    settleEndedRunProgress(this.state, runId, "cancelled", now);
     this.state.connection
       .prepare(
         `UPDATE node_attempts

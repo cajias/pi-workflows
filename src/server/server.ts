@@ -16,6 +16,7 @@ import {
   type TelegramMessageReference,
 } from "../channels/protocol.js";
 import { WorkflowClient } from "../client/client.js";
+import type { HeadlessPiCommand } from "../client/headless-pi-command.js";
 import {
   CLIENT_PROTOCOL_SCHEMA,
   encodeProtocolFrameOrNull,
@@ -23,6 +24,8 @@ import {
   clientSocketPath,
   NdjsonFrameDecoder,
   parseClientRequest,
+  SESSION_BRANCH_UNREPORTED_ERROR,
+  SESSION_COORDINATOR_REPLACED_ERROR,
   type ClientEvent,
   type ClientMessage,
   type ClientOutcome,
@@ -64,6 +67,10 @@ import { StateDatabase, workflowStatePath } from "../state/database.js";
 import { canonicalJson, type JsonValue } from "../state/json.js";
 import { resourceIdFor } from "../state/mutation.js";
 import {
+  listOAuthRefreshMarkers,
+  oauthRefreshMarkerDirectory,
+} from "../state/oauth-refresh-markers.js";
+import {
   AUTOMATIC_STATE_PRUNE_INTERVAL_MS,
   pruneState,
   pruneStateAutomatically,
@@ -71,7 +78,12 @@ import {
 import { recordViewerDeltas } from "../state/viewer.js";
 import { workflowMessageIdFor } from "../state/workflow-messages.js";
 import { humanDecisionChannelRequest } from "../workflows/decision-presentation.js";
-import { workflowStateViolations } from "../workflows/diagnostics.js";
+import {
+  workflowStateNoticeLines,
+  workflowStateNoticeSummary,
+  workflowStateNotices,
+  workflowStateViolations,
+} from "../workflows/diagnostics.js";
 import { errorMessage } from "../workflows/errors.js";
 import { HumanDecisionStore } from "../workflows/human-decision.js";
 import { WorkflowRunQueueStore, type WorkflowRunQueueRecord } from "../workflows/queue.js";
@@ -109,6 +121,13 @@ import {
   type ChannelEffectRecord,
 } from "./channel-effects.js";
 import { ChannelAdapterSupervisor } from "./channel-supervisor.js";
+import {
+  HEADLESS_EXTENSIONS_ENV,
+  readHeadlessExtensions,
+  type HeadlessExtensions,
+} from "./headless-extensions.js";
+import { pinHeadlessPi, type HeadlessPiPin } from "./headless-pi-resolution.js";
+import { describeHeadlessPi, type HeadlessPiLaunch } from "./headless-pi.js";
 import {
   assertNoServingServer,
   readServerLock,
@@ -157,6 +176,11 @@ export type WorkflowServerOptions = {
   databasePath?: string;
   registry?: ServerProcessRegistry;
   piArgs?: string[];
+  /**
+   * The pi of the Pi session that starts this server. Headless children run it for the whole
+   * server lifetime. Without it, the server resolves `pi` from its `PATH` once at start.
+   */
+  headlessPi?: HeadlessPiCommand | undefined;
   env?: Record<string, string>;
   claimPollMs?: number;
   /** Combined capacity for workflow runner and resource runner processes. */
@@ -281,6 +305,12 @@ export class WorkflowServer {
   /** This process's start identity, recorded in the lock file once this server owns the epoch. */
   private startIdentity: string | null = null;
   private claim: ServerClaim | null = null;
+  /** Pinned once at start; every runner receives it for its headless pi children. */
+  private headlessPi: HeadlessPiPin | null = null;
+  /** The one retry of a pin that was unresolved at start. Runners wait for it. */
+  private headlessPiRetry: Promise<void> | null = null;
+  /** Opt-in extensions for every headless child, read once at start. */
+  private headlessExtensions: HeadlessExtensions = { entries: [] };
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private viewTimer: ReturnType<typeof setInterval> | null = null;
@@ -372,6 +402,9 @@ export class WorkflowServer {
     // check only reads. A fenced starter can then never remove, replace, or
     // restore the owner's lock file.
     await assertNoServingServer(this.lockPath, { socketPath: this.socketPath });
+    this.headlessPiRetry = null;
+    this.headlessPi = await pinHeadlessPi(this.options.headlessPi, this.headlessPiEnvironment());
+    this.headlessExtensions = readHeadlessExtensions(this.headlessPiEnvironment());
     try {
       const previousServer = this.serverState.serverStatus();
       this.claim = this.serverState.acquireServer({
@@ -392,6 +425,8 @@ export class WorkflowServer {
       this.startTimers();
       this.started = true;
       this.log(`ready on ${this.socketPath} at epoch ${this.claim.epoch}`);
+      this.logHeadlessPi(this.headlessPi, "");
+      this.logHeadlessExtensions();
       this.requestAutomaticStatePrune();
       void this.expireTimedOutDecision().finally(() => this.resumeAutomaticStatePruneIfDue());
       void this.claimOne().finally(() => this.resumeAutomaticStatePruneIfDue());
@@ -953,6 +988,10 @@ export class WorkflowServer {
             this.recoverDecisionChannel(request, session.targetSessionId),
           );
         }
+        case "run.start":
+          // Checked before receipt adoption, like every other session command.
+          this.requireInteractiveStartSession(connection, request);
+          return this.handleRequest(request, connection);
         case "run.restart":
         case "interaction.update":
         case "checkpoint.answer":
@@ -968,13 +1007,19 @@ export class WorkflowServer {
         case "state.verify": {
           this.state.integrityCheck();
           const violations = workflowStateViolations(this.state);
+          // Notices are reported beside the result and never make the state invalid.
+          const notices = workflowStateNotices(this.state);
+          const valid = violations.length === 0;
           return clientResponse(
             request.requestId,
-            violations.length === 0 ? "accepted" : "rejected",
-            { valid: violations.length === 0, violations },
-            violations.length === 0
+            valid ? "accepted" : "rejected",
+            { valid, violations, notices },
+            valid
               ? undefined
-              : violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`).join("\n"),
+              : [
+                  ...violations.map((item) => `${item.code} ${item.runId}: ${item.detail}`),
+                  ...workflowStateNoticeLines(notices),
+                ].join("\n"),
           );
         }
         case "state.backup":
@@ -1114,7 +1159,7 @@ export class WorkflowServer {
       coordinator.connectionId !== connection.id ||
       coordinator.epoch !== epoch
     ) {
-      throw new Error("Workflow session coordinator was replaced");
+      throw new Error(SESSION_COORDINATOR_REPLACED_ERROR);
     }
     return coordinator;
   }
@@ -1135,9 +1180,31 @@ export class WorkflowServer {
       coordinatorEpoch,
     );
     if (!coordinator.branchReported) {
-      throw new Error("Workflow session branch must be reported before session control");
+      throw new Error(SESSION_BRANCH_UNREPORTED_ERROR);
     }
     return { targetSessionId, coordinatorEpoch };
+  }
+
+  /**
+   * An interactive run hands its steps and terminal result to its origin session,
+   * so only that live session may start one. A start that names a session which
+   * never connects would leave a terminal message no session can receive.
+   */
+  private requireInteractiveStartSession(
+    connection: ClientConnection | undefined,
+    request: ClientRequest,
+  ): void {
+    const payload = requireRecord(request.payload, "run.start payload");
+    if (payload.executionMode === "headless") return;
+    if (payload.targetSessionId === undefined || payload.coordinatorEpoch === undefined) {
+      throw new Error(
+        'An interactive run.start requires the live Pi session coordinator of its origin session. Use executionMode "headless" for a run without a Pi session',
+      );
+    }
+    const session = this.requireSessionCommand(connection, request);
+    if (session.targetSessionId !== requireString(payload.originSessionId, "originSessionId")) {
+      throw new Error("An interactive run.start must name its own Pi session as originSessionId");
+    }
   }
 
   private reportWorkflowBranch(
@@ -2246,6 +2313,49 @@ export class WorkflowServer {
     return { outcome: "accepted", receipt: deleting as unknown as JsonValue };
   }
 
+  private headlessPiEnvironment(): NodeJS.ProcessEnv {
+    return { ...process.env, ...this.options.env };
+  }
+
+  private logHeadlessPi(pin: HeadlessPiPin, note: string): void {
+    const source = pin.source === "session" ? "the starting Pi session" : "PATH";
+    this.log(`headless pi from ${source}${note}: ${describeHeadlessPi(pin.pi)}`);
+  }
+
+  private logHeadlessExtensions(): void {
+    const extensions = this.headlessExtensions;
+    if ("error" in extensions) this.log(`headless extensions unavailable: ${extensions.error}`);
+    else if (extensions.entries.length > 0) {
+      const listed = extensions.entries.map((entry) =>
+        entry.realpath === entry.path ? entry.path : `${entry.path} (${entry.realpath})`,
+      );
+      this.log(`headless extensions from ${HEADLESS_EXTENSIONS_ENV}: ${listed.join(", ")}`);
+    }
+  }
+
+  /**
+   * Resolve a pin that was unresolved at start once more, when the next runner launches. A
+   * Node probe can fail for a passing reason, such as a slow version manager under load, and
+   * every headless child would otherwise fail until a restart. The retry overlaps the runner's
+   * own startup, and its result is kept and reported by `server.status`, resolved or not.
+   */
+  private retryUnresolvedHeadlessPi(): void {
+    if (this.headlessPiRetry !== null || this.headlessPi?.pi.kind !== "unresolved") return;
+    this.headlessPiRetry = pinHeadlessPi(this.options.headlessPi, this.headlessPiEnvironment())
+      .then((pin) => {
+        this.headlessPi = pin;
+        this.logHeadlessPi(pin, " after a retry");
+      })
+      .catch((error: unknown) => {
+        this.log(`headless pi retry failed: ${errorMessage(error)}`);
+      });
+  }
+
+  private pinnedHeadlessPi(): HeadlessPiLaunch {
+    if (this.headlessPi === null) throw new Error("The workflow server has not pinned headless pi");
+    return this.headlessPi.pi;
+  }
+
   private statusReceipt(): JsonValue {
     const serverStatus = this.serverState.serverStatus();
     const count = (sql: string, ...params: unknown[]): number => {
@@ -2287,6 +2397,14 @@ export class WorkflowServer {
       activeResourceRunners: this.activeResourceManagers.size,
       executionRunners: this.executionRunnerCount(),
       maxRunners: this.maxRunners,
+      ...(this.headlessPi === null
+        ? {}
+        : { headlessPi: { source: this.headlessPi.source, ...this.headlessPi.pi } }),
+      headlessExtensions: this.headlessExtensions,
+      // Agent group OAuth refresh processes run unsupervised; their markers make them visible.
+      oauthRefreshes: listOAuthRefreshMarkers(
+        oauthRefreshMarkerDirectory(this.headlessPiEnvironment()),
+      ),
       lifecycleContradictions: violations.filter((item) => item.code === "queueState").length,
       stateViolations: violations,
     };
@@ -2449,6 +2567,8 @@ export class WorkflowServer {
           "SELECT COUNT(*) AS count FROM effects WHERE status IN ('pending', 'applying', 'ambiguous')",
         ),
       },
+      // Status names no session, run, or message; `state verify` lists them.
+      notices: workflowStateNoticeSummary(this.state, now),
     };
   }
 
@@ -4159,6 +4279,7 @@ export class WorkflowServer {
       protocolVersion: 1,
     };
     this.serverState.recordRunnerStart(envelope, this.claim.epoch);
+    this.retryUnresolvedHeadlessPi();
     let active: ActiveRun;
     const supervisor = new WorkflowRunnerSupervisor(envelope, {
       registry: this.registry,
@@ -4274,6 +4395,8 @@ export class WorkflowServer {
     message: WorkflowRunnerMessage,
   ): Promise<WorkflowRunnerResponse> {
     if (message.operation === "runner.ready") {
+      // A retried pin settles before this runner receives it.
+      if (this.headlessPiRetry !== null) await this.headlessPiRetry;
       if (
         !this.queue.verifyWorkflowRunClaim({ runId: message.runId, claimToken: active.claimToken })
       ) {
@@ -4302,6 +4425,8 @@ export class WorkflowServer {
           stateDirectory: this.stateDirectory,
           ...(candidateInteraction === undefined ? {} : { candidateInteraction }),
           ...(this.options.piArgs === undefined ? {} : { piArgs: this.options.piArgs }),
+          headlessPi: this.pinnedHeadlessPi(),
+          headlessExtensions: this.headlessExtensions,
         } as JsonValue,
         undefined,
         revision,

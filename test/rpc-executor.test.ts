@@ -9,9 +9,12 @@ describe("RpcStepExecutor spawn", () => {
   it("marks assistant responses unsupported unless an origin session can resume them", async () => {
     const dir = await makeTempDir("pi-rpc-assistant-mode");
     const registry = new ServerProcessRegistry(dir);
-    expect(new RpcStepExecutor({ cwd: dir, registry }).assistantMessageMode).toBe("unsupported");
+    const pi = { kind: "executable", executable: path.join(dir, "pi") } as const;
+    expect(new RpcStepExecutor({ cwd: dir, registry, pi }).assistantMessageMode).toBe(
+      "unsupported",
+    );
     expect(
-      new RpcStepExecutor({ cwd: dir, registry, assistantMessageMode: "park" })
+      new RpcStepExecutor({ cwd: dir, registry, pi, assistantMessageMode: "park" })
         .assistantMessageMode,
     ).toBe("park");
   });
@@ -29,7 +32,11 @@ sleep 60
       { encoding: "utf8", mode: 0o755 },
     );
     const registry = new ServerProcessRegistry(dir);
-    const executor = new RpcStepExecutor({ cwd: dir, registry, piBin: fakePi });
+    const executor = new RpcStepExecutor({
+      cwd: dir,
+      registry,
+      pi: { kind: "executable", executable: fakePi },
+    });
     const abort = new AbortController();
     const stepPromise = executor
       .runAgentStep(
@@ -63,13 +70,14 @@ sleep 60
     expect(bridgeIndex).toBeGreaterThan(noExtensionsIndex);
   });
 
-  it("fails the step instead of crashing when pi is missing", async () => {
+  it("fails the step instead of crashing when the pinned pi is missing", async () => {
     const dir = await makeTempDir("pi-rpc-missing");
     const registry = new ServerProcessRegistry(dir);
+    const missing = path.join(dir, "definitely-not-a-real-pi-binary");
     const executor = new RpcStepExecutor({
       cwd: dir,
       registry,
-      piBin: path.join(dir, "definitely-not-a-real-pi-binary"),
+      pi: { kind: "executable", executable: missing },
     });
     const abort = new AbortController();
     const result = await executor
@@ -93,6 +101,38 @@ sleep 60
         (error: unknown) => error,
       );
     expect(result).not.toBe("resolved");
+    expect((result as Error).message).toContain(`${missing} is missing or not executable`);
+    expect((result as Error).message).toContain("pi-workflows server stop");
+    expect(registry.size).toBe(0);
+    await executor.close();
+  });
+
+  it("reports why the server could not pin pi instead of starting a child", async () => {
+    const dir = await makeTempDir("pi-rpc-unresolved");
+    const registry = new ServerProcessRegistry(dir);
+    const executor = new RpcStepExecutor({
+      cwd: dir,
+      registry,
+      pi: { kind: "unresolved", error: "The workflow server could not pin headless pi: no pi." },
+    });
+    await expect(
+      executor.runAgentStep(
+        {
+          contract: {
+            requestId: "test-request-1",
+            runId: "r",
+            workflowName: "w",
+            nodeId: "n",
+            attemptId: "a",
+            completion: "submit",
+          },
+          prompt: "hi",
+          accept: async () => ({ ok: true as const, value: null }),
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("The workflow server could not pin headless pi: no pi.");
+    expect(registry.size).toBe(0);
     await executor.close();
   });
 });
@@ -108,7 +148,11 @@ describe("RpcStepExecutor.close", () => {
       mode: 0o755,
     });
     const registry = new ServerProcessRegistry(dir);
-    const executor = new RpcStepExecutor({ cwd: dir, registry, piBin: fakePi });
+    const executor = new RpcStepExecutor({
+      cwd: dir,
+      registry,
+      pi: { kind: "executable", executable: fakePi },
+    });
     const abort = new AbortController();
     const stepPromise = executor
       .runAgentStep(

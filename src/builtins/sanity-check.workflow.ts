@@ -29,6 +29,14 @@ const REVIEW_EVIDENCE_CHARS = 60_000;
 const VERIFICATION_EVIDENCE_CHARS = 32_000;
 const VERIFICATION_REVIEWS_CHARS = 48_000;
 const INPUT_TRUNCATION_MARKER = "\n...[input truncated]";
+/**
+ * The longest label that a `pi-workflows.progress.v1` update accepts: `validateProgressData` in
+ * `src/workflows/updates.ts` enforces it, and docs/WORKFLOW_UPDATES.md documents it.
+ */
+const MAX_PROGRESS_LABEL_CHARS = 200;
+/** The update that keeps an agent track's complete label when it exceeds that limit. */
+const AGENT_LABEL_UPDATE_TYPE = "sanity-check.agent-label";
+const AGENT_LABEL_SCHEMA = "pi-workflows.sanity-check-agent-label.v1";
 
 const reviewAreas = ["necessity", "duplication", "contracts", "scope_tests"] as const;
 export type SanityCheckArea = (typeof reviewAreas)[number];
@@ -447,20 +455,21 @@ async function createAgentProgress(
 ): Promise<AgentProgress> {
   const aggregateKey = `agents/${group}`;
   const settled = new Set<string>();
+  const trackLabel = completeLabelKeeper(context);
   await safeProgress(context, aggregateKey, "running", group, 0, requests.length);
   await Promise.all(
-    requests.map(
-      async (request) =>
-        await safeProgress(
-          context,
-          `${aggregateKey}/${request.id}`,
-          "pending",
-          "pending",
-          0,
-          1,
-          request.role,
-        ),
-    ),
+    requests.map(async (request) => {
+      const key = `${aggregateKey}/${request.id}`;
+      await safeProgress(
+        context,
+        key,
+        "pending",
+        "pending",
+        0,
+        1,
+        await trackLabel(key, request.role),
+      );
+    }),
   );
   let updateWork = Promise.resolve();
   const enqueue = (update: () => Promise<void>) => {
@@ -472,15 +481,16 @@ async function createAgentProgress(
       await enqueue(async () => {
         const terminal = event.state !== "running";
         if (terminal) settled.add(event.id);
+        const key = `${aggregateKey}/${event.id}`;
         const label = event.model === undefined ? event.role : `${event.role} · ${event.model}`;
         await safeProgress(
           context,
-          `${aggregateKey}/${event.id}`,
+          key,
           event.state,
           event.phase,
           terminal ? 1 : 0,
           1,
-          label,
+          await trackLabel(key, label),
         );
         if (terminal) {
           await safeProgress(
@@ -523,6 +533,38 @@ async function createAgentProgress(
   };
 }
 
+/**
+ * Fit an agent track's label to the progress schema. A longer label, which only a long
+ * provider or model ID makes, ends with `…`, and a `sanity-check.agent-label` update under
+ * the same key keeps the complete label. After it is accepted, it is published again only
+ * when the complete label changes; a rejected one is retried with the key's next label.
+ */
+function completeLabelKeeper(
+  context: WorkflowActionContext,
+): (key: string, label: string) => Promise<string> {
+  const published = new Map<string, string>();
+  return async (key, label) => {
+    if (label.length <= MAX_PROGRESS_LABEL_CHARS) return label;
+    if (published.get(key) !== label) {
+      try {
+        await context.publishUpdate({
+          type: AGENT_LABEL_UPDATE_TYPE,
+          key,
+          data: { schema: AGENT_LABEL_SCHEMA, label },
+        });
+        published.set(key, label);
+      } catch {
+        // A rejected or rate-limited update is not recorded, so the key's next label retries it.
+      }
+    }
+    // Never end on half of a surrogate pair.
+    let end = MAX_PROGRESS_LABEL_CHARS - 1;
+    const last = label.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    return `${label.slice(0, end)}…`;
+  };
+}
+
 async function safeProgress(
   context: WorkflowActionContext,
   key: string,
@@ -543,7 +585,7 @@ async function safeProgress(
         completed,
         total,
         unit: "sessions",
-        ...(label !== undefined ? { label: label.slice(0, 200) } : {}),
+        ...(label !== undefined ? { label } : {}),
       },
     })
     .catch(() => undefined);

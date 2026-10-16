@@ -176,6 +176,14 @@ export function parseClientResponse(line: string | Buffer): ClientResponse {
   return message;
 }
 
+/**
+ * A session command was refused because the coordinator authority it carried is not
+ * the session's current one. Fresh authority from the reconnected session can retry it.
+ */
+export const SESSION_COORDINATOR_REPLACED_ERROR = "Workflow session coordinator was replaced";
+export const SESSION_BRANCH_UNREPORTED_ERROR =
+  "Workflow session branch must be reported before session control";
+
 export function clientRequestFingerprint(request: ClientRequest): Buffer {
   // The workflow server verifies current session authority before reading these receipts.
   // Reconnecting changes authority evidence, not the logical response.
@@ -186,6 +194,7 @@ export function clientRequestFingerprint(request: ClientRequest): Buffer {
     "checkpoint.answer",
     "decision.answer",
     "run.restart",
+    "run.start",
   ].includes(request.operation);
   const payload =
     sessionResponse &&

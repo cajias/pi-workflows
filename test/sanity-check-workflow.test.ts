@@ -29,7 +29,9 @@ import sanityCheckWorkflow, {
 } from "../src/builtins/sanity-check.workflow.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
-import { makeStateDatabasePath, ScriptedExecutor } from "./helpers.js";
+import { readWorkflowRun } from "../src/workflows/store.js";
+import type { WorkflowUpdateRecord } from "../src/workflows/types.js";
+import { makeStateDatabasePath, ScriptedExecutor, waitUntil } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 const areas: SanityCheckArea[] = ["necessity", "duplication", "contracts", "scope_tests"];
@@ -140,6 +142,66 @@ async function runAgentProbe(mode: SanityCheckMode) {
   }).run(agentProbe(mode), {});
 }
 
+/**
+ * Start every session, then wait for the abort and report final states the
+ * way the headless launcher does after the action attempt has already ended.
+ */
+function installAbortedHost(): { started: () => boolean; lateEvents: () => number } {
+  let started = false;
+  let lateEvents = 0;
+  setPiAgentGroupLauncher(async (requests, options) => {
+    for (const request of requests) {
+      await options.onLifecycle?.({
+        id: request.id,
+        role: request.role,
+        elapsedMs: 1,
+        model: "fixture/model",
+        state: "running",
+        phase: "thinking",
+      });
+    }
+    started = true;
+    await new Promise((resolve) => options.signal.addEventListener("abort", resolve));
+    for (const request of requests) {
+      lateEvents += 1;
+      await options.onLifecycle?.({
+        id: request.id,
+        role: request.role,
+        elapsedMs: 2,
+        state: "cancelled",
+        phase: "cancelled: headless pi did not report that the session settled",
+      });
+    }
+    throw new Error("Pi agent group was cancelled");
+  });
+  return { started: () => started, lateEvents: () => lateEvents };
+}
+
+function reviewProbe(timeoutMs?: number) {
+  return defineWorkflow({
+    name: "sanity-check-review",
+    startAt: "prepare",
+    nodes: {
+      prepare: compute({ run: () => ({ mode: "parallel" }) }),
+      collectEvidence: compute({ run: () => evidence() }),
+      review: {
+        ...sanityCheckWorkflow.nodes.review!,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      },
+    },
+    edges: [
+      { from: "prepare", to: "collectEvidence" },
+      { from: "collectEvidence", to: "review" },
+    ],
+  });
+}
+
+function progressStates(updates: WorkflowUpdateRecord[] | undefined) {
+  return Object.fromEntries(
+    (updates ?? []).map((update) => [update.key, [update.data.status, update.data.phase]]),
+  );
+}
+
 afterEach(() => setPiAgentGroupLauncher(undefined));
 
 describe("sanity-check workflow", () => {
@@ -189,6 +251,126 @@ describe("sanity-check workflow", () => {
     expect(calls[0]?.requests.map((request) => request.id)).toEqual(areas);
   });
 
+  it("fits long agent labels to the progress schema and keeps the complete label", async () => {
+    const runWithModel = async (model: string) => {
+      setPiAgentGroupLauncher(async (requests, options) => {
+        for (const request of requests) {
+          for (const state of ["running", "completed"] as const) {
+            await options.onLifecycle?.({
+              id: request.id,
+              role: request.role,
+              elapsedMs: 1,
+              model,
+              state,
+              phase: state,
+            });
+          }
+        }
+        return requests.map((request) => ({
+          id: request.id,
+          text: JSON.stringify(request.id === "verification" ? finalResult("keep") : review()),
+          model,
+          thinkingLevel: "high" as const,
+          durationMs: 1,
+        }));
+      });
+      const result = await runAgentProbe("serial");
+      expect(result.state.status).toBe("completed");
+      return result.state.updates ?? [];
+    };
+    const track = (updates: WorkflowUpdateRecord[], type: string, key: string) =>
+      updates.find((update) => update.type === type && update.key === key)?.data;
+
+    // A model ID that pushes the label past 200 characters.
+    const longModel = `provider/${"m".repeat(250)}`;
+    const long = await runWithModel(longModel);
+    const complete = `Combined review · ${longModel}`;
+    const label = track(long, "progress", "agents/review/review")?.label as string;
+    expect(label).toBe(`${complete.slice(0, 199)}…`);
+    expect(label).toHaveLength(200);
+    expect(track(long, "sanity-check.agent-label", "agents/review/review")).toEqual({
+      schema: "pi-workflows.sanity-check-agent-label.v1",
+      label: complete,
+    });
+    // One complete-label record per track, even though the track updated several times.
+    expect(
+      long.filter((update) => update.type === "sanity-check.agent-label").map((u) => u.key),
+    ).toEqual(["agents/review/review", "agents/verification/verification"]);
+
+    // The cut never ends on half of a surrogate pair.
+    const emojiModel = `p/${"x".repeat(178)}${"😀".repeat(20)}`;
+    const emoji = await runWithModel(emojiModel);
+    expect(track(emoji, "progress", "agents/review/review")?.label).toBe(
+      `${`Combined review · ${emojiModel}`.slice(0, 198)}…`,
+    );
+
+    // A label within the limit stays whole and needs no complete-label record.
+    const short = await runWithModel("fixture/model");
+    expect(track(short, "progress", "agents/review/review")?.label).toBe(
+      "Combined review · fixture/model",
+    );
+    expect(short.some((update) => update.type === "sanity-check.agent-label")).toBe(false);
+  });
+
+  it("retries a complete-label update that the runtime rejected", async () => {
+    const model = `provider/${"m".repeat(250)}`;
+    const complete = `Review · ${model}`;
+    const published: Array<{ type: string; key: string; label: unknown }> = [];
+    let rejectedOnce = false;
+    setPiAgentGroupLauncher(async (requests, options) => {
+      for (const state of ["running", "running", "completed"] as const) {
+        await options.onLifecycle?.({
+          id: "review",
+          role: "Review",
+          elapsedMs: 1,
+          model,
+          state,
+          phase: state,
+        });
+      }
+      return requests.map((request) => ({
+        id: request.id,
+        text: JSON.stringify(review()),
+        model,
+        thinkingLevel: "high" as const,
+        durationMs: 1,
+      }));
+    });
+    const context = {
+      input: {},
+      outputs: { prepare: { mode: "serial" }, collectEvidence: evidence() },
+      results: {},
+      state: {},
+      signal: new AbortController().signal,
+      effect: {
+        type: "pi-workflows.sanity-check.review",
+        idempotencyKey: "review",
+        recovery: "manual",
+      },
+      publishUpdate: async (update: {
+        type: string;
+        key: string;
+        data: Record<string, unknown>;
+      }) => {
+        // The first complete-label update is rejected, as by the update rate limit.
+        if (update.type === "sanity-check.agent-label" && !rejectedOnce) {
+          rejectedOnce = true;
+          throw new Error("update rate limit exceeded");
+        }
+        published.push({ type: update.type, key: update.key, label: update.data.label });
+        return { updateId: "u", seq: published.length, at: "", type: update.type, key: update.key };
+      },
+    } as unknown as Parameters<NonNullable<typeof sanityCheckWorkflow.nodes.review.run>>[0];
+
+    await sanityCheckWorkflow.nodes.review.run!(context);
+
+    expect(rejectedOnce).toBe(true);
+    // The next lifecycle event for the key publishes the complete label again, once.
+    expect(published.filter((update) => update.type === "sanity-check.agent-label")).toEqual([
+      { type: "sanity-check.agent-label", key: "agents/review/review", label: complete },
+    ]);
+  });
+
   it("fails the review action with the launcher error and marks its progress failed", async () => {
     installFakeHost(() => new Error("Pi agent review failed: provider unavailable"));
     const result = await runAgentProbe("serial");
@@ -202,6 +384,54 @@ describe("sanity-check workflow", () => {
     );
     expect(progress.get("agents/review")).toBe("failed");
     expect(progress.get("agents/review/review")).toBe("failed");
+  });
+
+  it("settles every agent track as timed out when the review action times out", async () => {
+    const host = installAbortedHost();
+    const databasePath = await makeStateDatabasePath("sanity-check-timeout");
+    const result = await new WorkflowEngine({
+      executor: new ScriptedExecutor(),
+      databasePath,
+    }).run(reviewProbe(500), {});
+
+    expect(result.state.status).toBe("timed_out");
+    const timedOut = ["failed", "timed out"];
+    const expected = Object.fromEntries(
+      ["agents/review", ...areas.map((area) => `agents/review/${area}`)].map((key) => [
+        key,
+        timedOut,
+      ]),
+    );
+    expect(progressStates(result.state.updates)).toEqual(expected);
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
+    // The launcher's own final events arrive after the attempt ended and change nothing.
+    await waitUntil(() => host.lateEvents() === areas.length);
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
+  });
+
+  it("settles every agent track as cancelled when the run is cancelled", async () => {
+    const host = installAbortedHost();
+    const databasePath = await makeStateDatabasePath("sanity-check-cancel");
+    const engine = new WorkflowEngine({ executor: new ScriptedExecutor(), databasePath });
+    const running = engine.run(reviewProbe(), {});
+    await waitUntil(host.started);
+    engine.cancel();
+    const result = await running;
+
+    expect(result.state.status).toBe("cancelled");
+    const expected = Object.fromEntries(
+      ["agents/review", ...areas.map((area) => `agents/review/${area}`)].map((key) => [
+        key,
+        ["cancelled", "cancelled"],
+      ]),
+    );
+    expect(progressStates(readWorkflowRun(result.runId, { databasePath })?.state.updates)).toEqual(
+      expected,
+    );
   });
 
   it("bounds malformed agent output errors without retaining model text", () => {

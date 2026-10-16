@@ -43,9 +43,11 @@ import type { InteractiveRequestRecord } from "../src/workflows/requests.js";
 import { SESSION_BINDING_SCHEMA, WorkflowRunStore } from "../src/workflows/store.js";
 import {
   ScriptedExecutor,
+  type SessionAuthority,
   currentWorkflowMessageId,
   makeTempDir,
   reportBranch,
+  requestInteractiveStart,
   waitUntil,
 } from "./helpers.js";
 
@@ -637,13 +639,16 @@ async function startRun(options: {
   workflowPath: string;
   runId: string;
   executionMode?: "headless" | "interactive";
+  /** The coordinator `client` already holds for the origin session. */
+  authority?: SessionAuthority;
 }): Promise<void> {
   const resolved = await options.client.resolveWorkflow({
     cwd: options.cwd,
     workflowRef: options.workflowPath,
   });
-  const response = await options.client.request({
-    operation: "run.start",
+  const executionMode = options.executionMode ?? "headless";
+  const request = {
+    operation: "run.start" as const,
     runId: options.runId,
     payload: {
       projectPath: options.cwd,
@@ -655,9 +660,13 @@ async function startRun(options: {
       input: { value: 1 },
       launchOptions: {},
       originSessionId: "server-test-session",
-      executionMode: options.executionMode ?? "headless",
+      executionMode,
     },
-  });
+  };
+  const response =
+    executionMode === "headless"
+      ? await options.client.request(request)
+      : await requestInteractiveStart(options.client, request, options.authority);
   expect(response.outcome).toBe("accepted");
 }
 
@@ -1089,18 +1098,15 @@ describe("global workflow server", () => {
       const stateDir = await makeTempDir("server-headless-group-state");
       const databasePath = path.join(stateDir, "state.sqlite");
       const workflowPath = await writeHeadlessAgentWorkflow(cwd);
-      const binDir = path.join(cwd, "bin");
       const pidFile = path.join(cwd, "fake-pi-pids.json");
-      const fakePi = path.join(binDir, "pi");
-      await fs.mkdir(binDir);
+      const fakePi = path.join(cwd, "fake-pi.cjs");
       await fs.writeFile(
         fakePi,
-        `#!/usr/bin/env node
-const fs = require("node:fs");
+        `const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-fs.writeFileSync(process.env.FAKE_PI_PIDS, JSON.stringify({ leader: process.pid, grandchild: grandchild.pid }));
+fs.writeFileSync(process.env.FAKE_PI_PIDS, JSON.stringify({ leader: process.pid, grandchild: grandchild.pid, node: process.execPath, cli: process.argv[1] }));
 let submitted = false;
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (submitted) return;
@@ -1113,17 +1119,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 });
 setInterval(() => {}, 1000);
 `,
-        { encoding: "utf8", mode: 0o755 },
+        "utf8",
       );
       const registry = new ServerProcessRegistry(stateDir);
+      // The runner receives this pin from the server and starts headless pi with it.
       const server = new WorkflowServer({
         databasePath,
         registry,
         claimPollMs: 10,
-        env: {
-          PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-          FAKE_PI_PIDS: pidFile,
-        },
+        headlessPi: { kind: "node", node: process.execPath, cli: fakePi },
+        env: { FAKE_PI_PIDS: pidFile },
       });
       const client = new WorkflowClient({ databasePath });
       await server.start();
@@ -1143,7 +1148,10 @@ setInterval(() => {}, 1000);
         const pids = JSON.parse(await fs.readFile(pidFile, "utf8")) as {
           leader: number;
           grandchild: number;
+          node: string;
+          cli: string;
         };
+        expect({ node: pids.node, cli: pids.cli }).toEqual({ node: process.execPath, cli: fakePi });
         await waitUntil(
           () =>
             !processExists(pids.leader) && !processExists(pids.grandchild) && registry.size === 0,
@@ -1953,13 +1961,15 @@ setInterval(() => {}, 1000);
       const coordinatorEpoch = (subscribed.receipt as { coordinatorEpoch?: string } | undefined)
         ?.coordinatorEpoch;
       if (coordinatorEpoch === undefined) throw new Error("coordinator epoch missing");
-      await reportBranch(client, { targetSessionId: "server-test-session", coordinatorEpoch });
+      const authority = { targetSessionId: "server-test-session", coordinatorEpoch };
+      await reportBranch(client, authority);
       await startRun({
         client,
         cwd,
         workflowPath: await writeChannelDecisionWorkflow(cwd),
         runId: "channel-crash-parent",
         executionMode: "interactive",
+        authority,
       });
       await waitUntil(() => {
         const state = new ServerStateStore(databasePath, { readOnly: true });
@@ -2999,7 +3009,7 @@ export { default } from ${JSON.stringify(path.resolve("examples/workflows/echo.w
     try {
       const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
       await fs.writeFile(workflowPath, `${originalSource}\n// changed before worker load\n`);
-      const response = await client.request({
+      const response = await requestInteractiveStart(client, {
         operation: "run.start",
         runId: "source-load-run",
         payload: {

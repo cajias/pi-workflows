@@ -5,7 +5,7 @@ import { WorkflowClient } from "../src/client/client.js";
 import { WorkflowServer } from "../src/server/server.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
 import { WorkflowRunStore } from "../src/workflows/store.js";
-import { makeTempDir, reportBranch, waitUntil } from "./helpers.js";
+import { makeTempDir, reportBranch, requestInteractiveStart, waitUntil } from "./helpers.js";
 
 it("keeps a completed parent's follow-up when its explicit restart fails", async () => {
   const cwd = await makeTempDir("restart-follow-up-project");
@@ -36,7 +36,7 @@ export default defineWorkflow({ name: "restart-follow-up", startAt: "done", node
   try {
     const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
     expect(
-      await client.request({
+      await requestInteractiveStart(client, {
         operation: "run.start",
         runId: "original",
         payload: {
@@ -123,7 +123,7 @@ export default defineWorkflow({ name: "restart", startAt: "done",
   const store = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
   try {
     const resolved = await client.resolveWorkflow({ cwd, workflowRef: workflowPath });
-    await client.request({
+    await requestInteractiveStart(client, {
       operation: "run.start",
       runId: "original",
       payload: {

@@ -1,18 +1,26 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  agentGroupErrorFields,
+  createEphemeralCredentialStore,
+  runPiAgentGroup,
+} from "../src/builtins/pi-agent-group.js";
 import {
   PiAgentGroupError,
   type PiAgentLifecycleEvent,
   type PiAgentRequest,
 } from "../src/builtins/pi-agent-launch.js";
+import { DIAGNOSTICS_RETENTION_MS } from "../src/server/agent-group-diagnostics.js";
 import {
   CANCEL_SETTLE_MS,
   HeadlessPiAgentGroupLauncher,
   RESULT_IDLE_MS,
   type HeadlessPiAgentGroupSettings,
 } from "../src/server/agent-group-launcher.js";
+import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import type { HeadlessPiOptions } from "../src/server/headless-pi.js";
+import { ClaimLostError } from "../src/workflows/errors.js";
 import { makeTempDir, waitUntil } from "./helpers.js";
 
 const FAKE_PI = path.resolve("test/fixtures/fake-agent-group-pi.mjs");
@@ -21,7 +29,7 @@ const UNSETTLED_CANCEL = "cancelled: headless pi did not report that the session
 const UNFINISHED_RUN = "failed: headless pi stopped before the session finished";
 const NEVER_STARTED = "cancelled: the session did not start";
 const LAUNCH_HINT =
-  "The workflow runner starts agent groups with the same `pi` command, arguments, and environment as headless workflow steps; check that this command runs on the workflow server";
+  "The workflow runner starts agent groups with the same pinned pi, arguments, and environment as headless workflow steps; `pi-workflows server status` reports that pi as `headlessPi`";
 
 function request(id: string): PiAgentRequest {
   return { id, role: `Role ${id}`, prompt: `Prompt ${id}`, cwd: "/repo", tools: ["read"] };
@@ -39,7 +47,7 @@ type Harness = {
   launcher(): HeadlessPiAgentGroupLauncher;
 };
 
-/** A launcher whose `pi` is the fake bridge child, started through the same launch options. */
+/** A launcher whose pinned pi is the fake bridge child, started through the same launch options. */
 async function harness(
   scenario: string,
   extra: Partial<HeadlessPiOptions> = {},
@@ -48,19 +56,13 @@ async function harness(
   const dir = await makeTempDir("agent-group-launcher");
   const logs = path.join(dir, "logs");
   await fs.mkdir(logs);
-  const piBin = path.join(dir, "pi");
-  await fs.writeFile(
-    piBin,
-    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_PI)} "$@"\n`,
-    { encoding: "utf8", mode: 0o755 },
-  );
   const registered: number[] = [];
   const unregistered: number[] = [];
   const argvFile = path.join(dir, "argv.json");
   const commandsFile = path.join(dir, "commands.jsonl");
   const options: HeadlessPiOptions = {
     cwd: dir,
-    piBin,
+    pi: { kind: "node", node: process.execPath, cli: FAKE_PI },
     processGroup: "own",
     abortGraceMs: 300,
     env: {
@@ -124,9 +126,74 @@ async function namedStderrLog(error: unknown): Promise<string> {
   return await fs.readFile(namedStderrLogPath(error), "utf8");
 }
 
+/** The cause file that an error names; the launcher keeps it after every failed group. */
+function namedCausePath(error: unknown): string {
+  const match = /complete cause: (\S+cause\.txt)(?:;|$)/u.exec((error as Error).message);
+  if (match?.[1] === undefined) throw new Error(`no cause file in: ${(error as Error).message}`);
+  return match[1];
+}
+
+async function namedCause(error: unknown): Promise<string> {
+  return await fs.readFile(namedCausePath(error), "utf8");
+}
+
+/** The private modes of a kept diagnostics directory and each file in it. */
+async function diagnosticModes(file: string): Promise<{ directory: number; files: number[] }> {
+  const directory = path.dirname(file);
+  const names = (await fs.readdir(directory)).toSorted();
+  return {
+    directory: (await fs.stat(directory)).mode & 0o777,
+    files: await Promise.all(
+      names.map(async (name) => (await fs.stat(path.join(directory, name))).mode & 0o777),
+    ),
+  };
+}
+
+/** Collect the runner's housekeeping reports, which start with "Could not", from stderr. */
+function captureHousekeepingReports(): string[] {
+  const written: string[] = [];
+  const write = process.stderr.write.bind(process.stderr);
+  vi.spyOn(process.stderr, "write").mockImplementation((chunk, ...rest) => {
+    if (String(chunk).startsWith("Could not")) {
+      written.push(String(chunk));
+      return true;
+    }
+    return write(chunk, ...(rest as []));
+  });
+  return written;
+}
+
 function states(events: PiAgentLifecycleEvent[]): string[] {
   return events.map((event) => `${event.id}:${event.state}:${event.phase}`);
 }
+
+/**
+ * A kept diagnostics directory, as AgentGroupDiagnostics leaves it, last modified `ageMs` ago.
+ * It holds the named files: `pi-stderr.log` by default.
+ */
+async function keptLog(
+  parent: string,
+  name: string,
+  ageMs: number,
+  files: string[] = ["pi-stderr.log"],
+): Promise<string> {
+  const directory = path.join(parent, name);
+  await fs.mkdir(directory, { mode: 0o700 });
+  await fs.chmod(directory, 0o700);
+  const mtime = new Date(Date.now() - ageMs);
+  for (const file of files) {
+    const target = path.join(directory, file);
+    await fs.writeFile(target, `${file}\n`, { mode: 0o600 });
+    await fs.chmod(target, 0o600);
+    await fs.utimes(target, mtime, mtime);
+  }
+  await fs.utimes(directory, mtime, mtime);
+  return directory;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("headless pi agent group launcher", () => {
   it("documents bounded waits longer than the runner's process stop grace", () => {
@@ -152,9 +219,14 @@ describe("headless pi agent group launcher", () => {
     expect(results.map((result) => result.text)).toEqual(["result a", "result b"]);
     expect(seen).toEqual(["a:running", "b:running", "a:completed", "b:completed", "resolved"]);
     const launched = JSON.parse(await fs.readFile(setup.argvFile, "utf8")) as {
+      node: string;
+      cli: string;
       argv: string[];
       env: string;
     };
+    // The pinned Node runs the pinned CLI script; nothing comes from PATH.
+    expect(launched.node).toBe(process.execPath);
+    expect(launched.cli).toBe(FAKE_PI);
     expect(launched.argv.slice(0, 5)).toEqual([
       "--mode",
       "rpc",
@@ -224,28 +296,172 @@ describe("headless pi agent group launcher", () => {
     expect(results[0]?.text).toBe(unit.repeat(40_000));
   }, 30_000);
 
-  it("rebuilds agent errors and reports other failures by message", async () => {
+  it("rebuilds agent errors and saves the complete cause of every reported failure", async () => {
     const agent = await harness("agent-error");
     const agentFailure = await agent
       .launcher()
       .run([request("review")], { maxConcurrency: 1, signal: new AbortController().signal })
       .catch((error: unknown) => error);
     expect(agentFailure).toBeInstanceOf(PiAgentGroupError);
+    const agentCause = namedCausePath(agentFailure);
     expect(agentFailure).toMatchObject({
       agentId: "review",
       code: "timed out",
-      message: "Pi agent review timed out: after 5ms",
+      facts: "after 5ms",
+      message: `Pi agent review timed out: after 5ms. complete cause: ${agentCause}`,
     });
+    expect(await namedCause(agentFailure)).toBe("Pi agent review timed out: after 5ms\n");
+    // Errors that the bridge reports keep the cause file, not the stderr log.
+    expect(await fs.readdir(path.dirname(agentCause))).toEqual(["cause.txt"]);
+    expect(await diagnosticModes(agentCause)).toEqual({ directory: 0o700, files: [0o600] });
+  });
 
-    const plain = await harness("plain-error");
-    await expect(
-      plain.launcher().run([request("a")], {
+  it.each([
+    ["a provider error", "provider-error", "stopped with error: the provider reported an error"],
+    ["a thrown SDK error", "sdk-error", "failed: the session raised an error"],
+  ])("keeps the complete text of %s only in the cause file", async (_name, scenario, facts) => {
+    const privateText = `PRIVATE_PROVIDER_MARKER ${"provider text ".repeat(600)}END OF PRIVATE TEXT`;
+    const setup = await harness(scenario, {}, { FAKE_AGENT_GROUP_PRIVATE_TEXT: privateText });
+    const seen: PiAgentLifecycleEvent[] = [];
+    const error = await setup
+      .launcher()
+      .run([request("review")], {
         maxConcurrency: 1,
         signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          seen.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    const message = (error as Error).message;
+    expect(message).toBe(`Pi agent review ${facts}. complete cause: ${namedCausePath(error)}`);
+    expect(message).not.toContain("PRIVATE_PROVIDER_MARKER");
+    expect(JSON.stringify(seen)).not.toContain("PRIVATE_PROVIDER_MARKER");
+    expect(privateText.length).toBeGreaterThan(8_000);
+    expect(await namedCause(error)).toBe(`Pi agent review ${facts}\n\n${privateText}\n`);
+    // Pi's stderr carried the same text from a provider extension; that log is not kept.
+    expect(await fs.readdir(path.dirname(namedCausePath(error)))).toEqual(["cause.txt"]);
+  });
+
+  it("shows its own validation and loader text and hides foreign error text, as the bridge reports them", async () => {
+    const signal = new AbortController().signal;
+    // The bridge's own description of each error, from the real group runner.
+    const reported = async (run: Promise<unknown>) =>
+      JSON.stringify(
+        await run.catch((error: unknown) =>
+          describeAgentGroupFailure(error, agentGroupErrorFields(error)),
+        ),
+      );
+    const invalid = await reported(
+      runPiAgentGroup([request("same"), request("same")], { maxConcurrency: 1, signal }),
+    );
+    const thrown = await reported(
+      runPiAgentGroup([request("sdk")], {
+        maxConcurrency: 1,
+        signal,
+        sessionFactory: async () => {
+          throw new Error("PRIVATE_SDK_MARKER could not read settings");
+        },
       }),
-    ).rejects.toThrow(/^Invalid Pi agent id: !$/);
-    // Errors that the bridge reports keep no stderr log.
-    expect(await fs.readdir(plain.logs)).toEqual([]);
+    );
+
+    const run = async (failure: string) => {
+      const setup = await harness("relay-failure", {}, { FAKE_AGENT_GROUP_FAILURE: failure });
+      return await setup
+        .launcher()
+        .run([request("same")], { maxConcurrency: 1, signal })
+        .catch((error: unknown) => error);
+    };
+    const invalidError = await run(invalid);
+    expect((invalidError as Error).message).toBe(
+      `Pi agent group has an invalid request: Duplicate Pi agent id: same. complete cause: ${namedCausePath(invalidError)}`,
+    );
+    const loader = await reported(
+      (async () => {
+        // Pi Workflows' own loader sentence with a foreign filesystem error beneath it.
+        vi.stubEnv("PI_CODING_AGENT_DIR", await makeTempDir("agent-group-launcher-agent-dir"));
+        vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+          Object.assign(new Error("PRIVATE_FS_MARKER permission denied"), { code: "EACCES" }),
+        );
+        try {
+          return await createEphemeralCredentialStore(signal);
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      })(),
+    );
+    const loaderError = await run(loader);
+    expect((loaderError as Error).message).toBe(
+      `Pi agent group failed: Could not load Pi credentials for isolated agents. complete cause: ${namedCausePath(loaderError)}`,
+    );
+    expect(await namedCause(loaderError)).toBe(
+      "Pi agent group failed: Could not load Pi credentials for isolated agents\n\nPRIVATE_FS_MARKER permission denied\n",
+    );
+    // A foreign error that copies an agent error's name and fields stays private.
+    const forged = await reported(
+      Promise.reject(
+        Object.assign(new Error("PRIVATE_FORGED_MARKER settings text"), {
+          name: "PiAgentGroupError",
+          agentId: "group",
+          code: "has unknown provider",
+          facts: "PRIVATE_FORGED_MARKER",
+        }),
+      ),
+    );
+    const forgedError = await run(forged);
+    expect((forgedError as Error).message).toBe(
+      `Pi agent group failed: the agent group raised an error. complete cause: ${namedCausePath(forgedError)}`,
+    );
+    expect(await namedCause(forgedError)).toBe(
+      "Pi agent group failed: the agent group raised an error\n\nPRIVATE_FORGED_MARKER settings text\n",
+    );
+    const thrownError = await run(thrown);
+    expect((thrownError as Error).message).toBe(
+      `Pi agent sdk failed: the session raised an error. complete cause: ${namedCausePath(thrownError)}`,
+    );
+    expect(await namedCause(thrownError)).toBe(
+      "Pi agent sdk failed: the session raised an error\n\nPRIVATE_SDK_MARKER could not read settings\n",
+    );
+  });
+
+  it("keeps every character of a group-level error only in the cause file", async () => {
+    const privateText = `PRIVATE_SDK_MARKER settings failed: ${"z".repeat(9_000)} END OF SDK ERROR`;
+    const setup = await harness("plain-error", {}, { FAKE_AGENT_GROUP_PRIVATE_TEXT: privateText });
+    const error = await setup
+      .launcher()
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect(error).toMatchObject({
+      agentId: "group",
+      code: "failed",
+      message: `Pi agent group failed: the agent group raised an error. complete cause: ${namedCausePath(error)}`,
+    });
+    expect((error as Error).message).not.toContain("PRIVATE_SDK_MARKER");
+    expect(await namedCause(error)).toBe(
+      `Pi agent group failed: the agent group raised an error\n\n${privateText}\n`,
+    );
+    expect(await diagnosticModes(namedCausePath(error))).toEqual({
+      directory: 0o700,
+      files: [0o600],
+    });
+  });
+
+  it("names a cause file it could not write without quoting the cause", async () => {
+    const setup = await harness("provider-error");
+    vi.spyOn(fs, "writeFile").mockRejectedValueOnce(new Error("disk full"));
+    const error = await setup
+      .launcher()
+      .run([request("review")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toBe(
+      "Pi agent review stopped with error: the provider reported an error. complete cause was not saved: disk full",
+    );
+    // Nothing is kept, so nothing is left behind.
+    expect(await fs.readdir(setup.logs)).toEqual([]);
   });
 
   it("cancels through the bridge and forwards the settled lifecycle facts", async () => {
@@ -351,7 +567,7 @@ describe("headless pi agent group launcher", () => {
       .catch((caught: unknown) => caught);
 
     expect((error as Error).message).toMatch(
-      /^Pi agent group could not run: headless pi exited before the agent group finished \(code 5, signal null\)\. complete pi stderr: /u,
+      /^Pi agent group could not run: headless pi exited before the agent group finished \(code 5, signal null\)\. complete cause: \S+; complete pi stderr: /u,
     );
     expect(states(seen)).toEqual([
       "a:running:running",
@@ -409,52 +625,150 @@ describe("headless pi agent group launcher", () => {
   it.each([
     [
       "exit-before-ready",
-      /headless pi exited before the agent group bridge loaded \(code 3, signal null\)/,
+      "headless pi exited before the agent group bridge loaded (code 3, signal null)",
+      undefined,
       "boom diagnostics\n",
     ],
-    ["unrouted", /pi did not route the agent group command to its bridge \(disposition started\)/],
-    ["rejected", /pi rejected the agent group command: Unknown command/],
-    ["handled-without-result", /the agent group bridge returned without a result/],
-  ])("fails clearly when %s", async (scenario, expected, stderr?: string) => {
+    [
+      "unrouted",
+      "pi did not route the agent group command to its bridge",
+      "disposition started",
+      undefined,
+    ],
+    ["rejected", "pi rejected the agent group command", "Unknown command", undefined],
+    [
+      "handled-without-result",
+      "the agent group bridge returned without a result",
+      undefined,
+      undefined,
+    ],
+  ])("fails clearly when %s", async (scenario, facts, piText?: string, stderr?: string) => {
     const setup = await harness(scenario);
     const error = await setup
       .launcher()
       .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
       .catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(PiAgentGroupError);
-    expect((error as Error).message).toMatch(/^Pi agent group could not run: /);
-    expect((error as Error).message).toMatch(expected);
-    expect((error as Error).message).toContain("same `pi` command");
-    // The complete stderr stream stays in the named private log, not in the error.
+    const message = (error as Error).message;
+    expect(message).toBe(
+      `Pi agent group could not run: ${facts}. complete cause: ${namedCausePath(error)}; complete pi stderr: ${namedStderrLogPath(error)}. ${LAUNCH_HINT}`,
+    );
+    // Text that Pi supplied is only in the cause file; the stream is only in the log.
+    const cause = `Pi agent group could not run: ${facts}\n`;
+    expect(await namedCause(error)).toBe(piText === undefined ? cause : `${cause}\n${piText}\n`);
+    if (piText !== undefined) expect(message).not.toContain(piText);
     const log = await namedStderrLog(error);
     if (stderr !== undefined) {
       expect(log).toContain(stderr);
-      expect((error as Error).message).not.toContain(stderr.trim());
+      expect(message).not.toContain(stderr.trim());
     }
-    const [directory] = await fs.readdir(setup.logs);
-    expect((await fs.stat(path.join(setup.logs, directory ?? ""))).mode & 0o777).toBe(0o700);
-    expect(
-      (await fs.stat(path.join(setup.logs, directory ?? "", "pi-stderr.log"))).mode & 0o777,
-    ).toBe(0o600);
+    expect(path.dirname(namedCausePath(error))).toBe(path.dirname(namedStderrLogPath(error)));
+    expect(await diagnosticModes(namedCausePath(error))).toEqual({
+      directory: 0o700,
+      files: [0o600, 0o600],
+    });
     await waitUntil(() => groupGone(setup.registered[0]), 5_000);
   });
 
   it("fails clearly when pi cannot start", async () => {
     const setup = await harness("success");
-    const missing = path.join(setup.dir, "missing-pi");
+    // The pinned file exists, but its interpreter does not, so the spawn itself fails.
+    const brokenPi = path.join(setup.dir, "broken-pi");
+    await fs.writeFile(brokenPi, "#!/nonexistent/interpreter\n", { mode: 0o755 });
     const error = await new HeadlessPiAgentGroupLauncher(
-      { ...setup.options, piBin: missing },
+      { ...setup.options, pi: { kind: "executable", executable: brokenPi } },
       setup.settings,
     )
       .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
       .catch((caught: unknown) => caught);
-    expect((error as Error).message).toContain(`bridge loaded (spawn ${missing} ENOENT)`);
+    // The operating system's spawn error is private detail, like any text about pi itself.
+    expect((error as Error).message).toContain("bridge loaded (pi could not be started)");
+    expect((error as Error).message).not.toContain("ENOENT");
+    expect(await namedCause(error)).toBe(
+      `Pi agent group could not run: headless pi exited before the agent group bridge loaded (pi could not be started)\n\nspawn ${brokenPi} ENOENT\n`,
+    );
     expect(await namedStderrLog(error)).toBe("");
   });
 
-  it("names the complete log path after a long pi rejection, beyond the message cap", async () => {
+  it("names the missing file when the pinned pi no longer exists", async () => {
+    const setup = await harness("success");
+    const missing = path.join(setup.dir, "removed-release", "cli.js");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      { ...setup.options, pi: { kind: "node", node: process.execPath, cli: missing } },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      `Pi agent group could not run: headless pi is unavailable. The workflow server pinned headless pi as ${missing} run by ${process.execPath}, but ${missing} is missing or not executable. Restart the workflow server with \`pi-workflows server stop\` to pin pi again.`,
+    );
+    expect(setup.registered).toEqual([]);
+    expect(await fs.readdir(setup.logs)).toEqual([]);
+  });
+
+  it("reports why the server could not pin pi before any session starts", async () => {
+    const setup = await harness("success");
+    const events: PiAgentLifecycleEvent[] = [];
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        pi: { kind: "unresolved", error: "The workflow server could not pin headless pi: no pi." },
+      },
+      setup.settings,
+    )
+      .run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          events.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+    expect((error as Error).message).toBe(
+      "Pi agent group could not run: headless pi is unavailable. The workflow server could not pin headless pi: no pi.",
+    );
+    expect(events).toEqual([]);
+    await expect(fs.access(setup.argvFile)).rejects.toThrow();
+  });
+
+  it("loads listed headless extensions into the group's host after the bridge", async () => {
+    const setup = await harness("success");
+    const extension = path.join(setup.dir, "provider.ts");
+    await fs.writeFile(extension, "export default function provider() {}\n");
+    await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        extensions: { entries: [{ path: extension, realpath: await fs.realpath(extension) }] },
+      },
+      setup.settings,
+    ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    const launched = JSON.parse(await fs.readFile(setup.argvFile, "utf8")) as { argv: string[] };
+    expect(path.basename(launched.argv[5] ?? "")).toMatch(/^agent-group-bridge\.(?:ts|js)$/);
+    expect(launched.argv.slice(6)).toEqual(["-e", extension, "--model", "fixture/model"]);
+  });
+
+  it("starts no group host when the listed headless extensions are invalid", async () => {
+    const setup = await harness("success");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        extensions: { error: "PI_WORKFLOWS_HEADLESS_EXTENSIONS is invalid: x." },
+      },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      "Pi agent group could not run: headless pi is unavailable. PI_WORKFLOWS_HEADLESS_EXTENSIONS is invalid: x.",
+    );
+    await expect(fs.access(setup.argvFile)).rejects.toThrow();
+  });
+
+  it("keeps a long pi rejection out of the message and names both complete files", async () => {
     const setup = await harness("rejected-long");
-    // A log directory whose path alone is longer than the 2,000-character cause cap.
+    // A diagnostics directory whose path alone is longer than 2,000 characters.
     const deep = path.join(
       setup.logs,
       ...Array.from({ length: 9 }, (_, index) => `${index}`.repeat(240)),
@@ -468,15 +782,19 @@ describe("headless pi agent group launcher", () => {
       .catch((caught: unknown) => caught);
 
     const message = (error as Error).message;
-    // Pi's rejection is bounded in the message; the complete text is in the log.
-    expect(message).toMatch(
-      /^Pi agent group could not run: pi rejected the agent group command: x+…\. complete pi stderr: /u,
-    );
+    // Pi's rejection is never in the message; the complete text is in the cause file and log.
+    expect(message).not.toContain("xxxx");
     expect(message).not.toContain("END OF REJECTION");
     const logPath = namedStderrLogPath(error);
+    const causePath = namedCausePath(error);
     expect(logPath.startsWith(`${deep}${path.sep}`)).toBe(true);
     expect(logPath.length).toBeGreaterThan(2_000);
-    expect(message.endsWith(`complete pi stderr: ${logPath}. ${LAUNCH_HINT}`)).toBe(true);
+    expect(message).toBe(
+      `Pi agent group could not run: pi rejected the agent group command. complete cause: ${causePath}; complete pi stderr: ${logPath}. ${LAUNCH_HINT}`,
+    );
+    expect(await namedCause(error)).toBe(
+      `Pi agent group could not run: pi rejected the agent group command\n\n${"x".repeat(10_000)} END OF REJECTION\n`,
+    );
     const log = await namedStderrLog(error);
     expect(log).toContain('[pi-workflows] pi RPC response on stdout: {"id"');
     expect(log).toContain("END OF REJECTION");
@@ -533,7 +851,7 @@ describe("headless pi agent group launcher", () => {
       .catch((caught: unknown) => caught);
 
     expect((error as Error).message).toMatch(
-      /^Pi agent group could not run: the agent group bridge returned without a result\. complete pi stderr: /u,
+      /^Pi agent group could not run: the agent group bridge returned without a result\. complete cause: \S+; complete pi stderr: /u,
     );
     expect((await commands(setup.commandsFile)).map((command) => command.type)).toEqual([
       "run",
@@ -551,28 +869,199 @@ describe("headless pi agent group launcher", () => {
         ...setup.settings,
         diagnosticsDirectory: path.join(setup.dir, "missing-directory"),
       }).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal }),
-    ).rejects.toThrow(/bridge loaded \(code 3, signal null\)\. pi stderr was not saved: ENOENT/u);
+    ).rejects.toThrow(
+      /bridge loaded \(code 3, signal null\)\. complete cause was not saved: ENOENT[^;]*; pi stderr was not saved: ENOENT/u,
+    );
   });
 
-  it("kills the child when the server refuses to supervise it", async () => {
+  it("prunes expired stderr logs and cause files once, before its first group", async () => {
+    const setup = await harness("success");
+    const day = 24 * 60 * 60 * 1_000;
+    const expired = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old001",
+      DIAGNOSTICS_RETENTION_MS + day,
+    );
+    const expiredCause = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old003",
+      DIAGNOSTICS_RETENTION_MS + day,
+      ["cause.txt"],
+    );
+    const expiredBoth = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old004",
+      DIAGNOSTICS_RETENTION_MS + day,
+      ["cause.txt", "pi-stderr.log"],
+    );
+    const recent = await keptLog(
+      setup.logs,
+      "pi-workflows-run-2-agent-group-new001",
+      DIAGNOSTICS_RETENTION_MS - day,
+    );
+    const launcher = setup.launcher();
+    const run = async () =>
+      await launcher.run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      });
+
+    await run();
+    expect(await fs.readdir(setup.logs)).toEqual([path.basename(recent)]);
+    for (const directory of [expired, expiredCause, expiredBoth]) {
+      await expect(fs.lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+
+    // Later groups of the same launcher do not scan again.
+    const later = await keptLog(
+      setup.logs,
+      "pi-workflows-run-3-agent-group-old002",
+      DIAGNOSTICS_RETENTION_MS + day,
+    );
+    await run();
+    expect((await fs.readdir(setup.logs)).sort()).toEqual(
+      [path.basename(recent), path.basename(later)].sort(),
+    );
+  });
+
+  it("runs the group when pruning fails and reports the failure on stderr", async () => {
+    const setup = await harness("success");
+    const expired = await keptLog(
+      setup.logs,
+      "pi-workflows-run-1-agent-group-old001",
+      DIAGNOSTICS_RETENTION_MS + 24 * 60 * 60 * 1_000,
+    );
+    vi.spyOn(fs, "rmdir").mockRejectedValue(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    const written: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk, ...rest) => {
+      if (String(chunk).startsWith("Could not prune")) {
+        written.push(String(chunk));
+        return true;
+      }
+      return write(chunk, ...(rest as []));
+    });
+
+    const results = await setup
+      .launcher()
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    expect(results.map((result) => result.text)).toEqual(["result a"]);
+    expect(written).toEqual([
+      `Could not prune agent group diagnostics at ${expired}: device busy\n`,
+    ]);
+  });
+
+  it("kills the child when the server refuses to supervise it and saves the refusal", async () => {
     const setup = await harness("hang");
     let pid: number | undefined;
-    await expect(
-      new HeadlessPiAgentGroupLauncher(
-        {
-          ...setup.options,
-          registry: {
-            register: (value) => {
-              pid = value;
-              throw new Error("Runner process is not a direct child of the active runner");
-            },
-            unregister: () => undefined,
+    const seen: PiAgentLifecycleEvent[] = [];
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        registry: {
+          register: (value) => {
+            pid = value;
+            throw new Error("PRIVATE_REGISTRY_MARKER: not a direct child of the active runner");
           },
+          unregister: () => undefined,
         },
-        setup.settings,
-      ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal }),
-    ).rejects.toThrow("Runner process is not a direct child of the active runner");
+      },
+      setup.settings,
+    )
+      .run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        onLifecycle: (event) => {
+          seen.push(event);
+        },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    // The raw start failure goes through the same cause file as any group pi could not run.
+    expect((error as Error).message).toBe(
+      `Pi agent group could not run: headless pi could not be started. complete cause: ${namedCausePath(error)}; complete pi stderr: ${namedStderrLogPath(error)}. ${LAUNCH_HINT}`,
+    );
+    expect(await namedCause(error)).toBe(
+      "Pi agent group could not run: headless pi could not be started\n\nPRIVATE_REGISTRY_MARKER: not a direct child of the active runner\n",
+    );
+    // The queued request's track ends instead of staying pending.
+    expect(states(seen)).toEqual([`a:cancelled:${NEVER_STARTED}`]);
+    await waitUntil(() => groupGone(pid), 5_000);
+  });
+
+  it("keeps a lost claim as the engine's own error when pi starts", async () => {
+    const setup = await harness("hang");
+    let pid: number | undefined;
+    const lost = new ClaimLostError("run-1", "ownerChanged");
+    const error = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...setup.options,
+        registry: {
+          register: (value) => {
+            pid = value;
+            throw lost;
+          },
+          unregister: () => undefined,
+        },
+      },
+      setup.settings,
+    )
+      .run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBe(lost);
     await waitUntil(() => groupGone(pid), 5_000);
     expect(await fs.readdir(setup.logs)).toEqual([]);
+  });
+
+  it("keeps the group's outcome when cleanup fails and reports the failure on stderr", async () => {
+    const written = captureHousekeepingReports();
+    // Unregistering the child fails after a successful group.
+    const unregistering = await harness("success");
+    const results = await new HeadlessPiAgentGroupLauncher(
+      {
+        ...unregistering.options,
+        registry: {
+          register: () => undefined,
+          unregister: () => {
+            throw new Error("unregister refused");
+          },
+        },
+      },
+      unregistering.settings,
+    ).run([request("a")], { maxConcurrency: 1, signal: new AbortController().signal });
+    expect(results.map((result) => result.text)).toEqual(["result a"]);
+
+    // Removing the diagnostics fails after a successful group and after a failed one.
+    const removing = await harness("success");
+    vi.spyOn(fs, "rm").mockRejectedValueOnce(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    await expect(
+      removing.launcher().run([request("a")], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toHaveLength(1);
+    const failing = await harness("provider-error");
+    vi.spyOn(fs, "rm").mockRejectedValueOnce(
+      Object.assign(new Error("device busy"), { code: "EBUSY" }),
+    );
+    const error = await failing
+      .launcher()
+      .run([request("review")], { maxConcurrency: 1, signal: new AbortController().signal })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect((error as Error).message).toBe(
+      `Pi agent review stopped with error: the provider reported an error. complete cause: ${namedCausePath(error)}`,
+    );
+
+    expect(written).toEqual([
+      "Could not stop an agent group's headless pi: unregister refused\n",
+      "Could not finish agent group diagnostics: device busy\n",
+      "Could not finish agent group diagnostics: device busy\n",
+    ]);
   });
 });

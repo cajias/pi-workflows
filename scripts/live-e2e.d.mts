@@ -31,6 +31,8 @@ export function assertPackageIsolation(
   rpc: { request(command: string): Promise<unknown> },
   candidate: string,
 ): Promise<void>;
+export function candidateInstallArgs(archivePath: string, consumer: string): string[];
+export function assertHostPackagesAbsent(candidate: string, root?: string): Promise<void>;
 export function assertSafeTempRoot(root: string, temporaryDirectory?: string): string;
 export function removeTemporaryRoot(root: string, temporaryDirectory?: string): Promise<void>;
 export function withTemporaryRoot<T>(

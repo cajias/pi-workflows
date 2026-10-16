@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { parseHeadlessPiCommandArgs } from "../client/headless-pi-command.js";
 import { errorMessage } from "../workflows/errors.js";
 import { WorkflowServer } from "./server.js";
 
@@ -18,6 +19,7 @@ async function main(): Promise<void> {
     const databasePath = databaseIndex < 0 ? undefined : process.argv[databaseIndex + 1];
     const server = new WorkflowServer({
       ...(databasePath === undefined ? {} : { databasePath }),
+      headlessPi: parseHeadlessPiCommandArgs(process.argv),
       ...(process.env.PI_WORKFLOWS_MAX_RUNNERS === undefined
         ? {}
         : { maxRunners: Number(process.env.PI_WORKFLOWS_MAX_RUNNERS) }),

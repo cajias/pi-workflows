@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
+  agentGroupErrorFields,
   createEphemeralCredentialStore,
   createEphemeralModelStore,
   runPiAgentGroup,
@@ -12,8 +14,21 @@ import {
   type PiAgentLifecycleEvent,
   type PiAgentRequest,
 } from "../src/builtins/pi-agent-launch.js";
+import { describeAgentGroupFailure } from "../src/server/agent-group-protocol.js";
 import { startMockOpenAiServer } from "./e2e/mock-openai.js";
 import { makeTempDir } from "./helpers.js";
+
+/**
+ * Per-agent timeout for requests that do not test timeout behavior. A real SDK session loads
+ * extensions and a model runtime, and its first model request loads the provider's API client,
+ * which can take more than a second on a loaded machine. This bound only stops a session that
+ * never settles: a hang still fails with a timeout error, after the runner has aborted and
+ * disposed the session. Tests of timeout behavior set their own short `timeoutMs` on sessions
+ * that never settle by themselves.
+ */
+const SESSION_HANG_MS = 30_000;
+/** Vitest timeout for this file, long enough that the per-agent bound fires first. */
+const TEST_TIMEOUT_MS = 3 * SESSION_HANG_MS;
 
 function request(id: string): PiAgentRequest {
   return {
@@ -22,7 +37,7 @@ function request(id: string): PiAgentRequest {
     prompt: `Prompt ${id}`,
     cwd: process.cwd(),
     tools: ["read", "grep", "find", "ls"],
-    timeoutMs: 1_000,
+    timeoutMs: SESSION_HANG_MS,
   };
 }
 
@@ -79,6 +94,60 @@ async function writeNativeFixtureConfig(agentDir: string, extensions?: string[])
   await fs.writeFile(path.join(agentDir, "auth.json"), "{}\n", "utf8");
 }
 
+// A provider built into Pi with an OpenAI-compatible API. Tests point it at a local mock
+// server through `models.json`, the way a user configures a proxy, so no request leaves the
+// machine.
+const BUILTIN_PROVIDER = "cerebras";
+const BUILTIN_MODEL = "gpt-oss-120b";
+const BUILTIN_PROVIDER_KEY = "builtin-provider-key";
+const BUILTIN_PROVIDER_KEY_ENV = "CEREBRAS_API_KEY";
+// A stored OAuth credential that does not expire during a test, so nothing refreshes it.
+const FIXTURE_OAUTH_CREDENTIAL = {
+  type: "oauth",
+  refresh: "fixture-refresh-token",
+  access: "fixture-access-token",
+  expires: Date.UTC(2100, 0, 1),
+};
+
+async function writeBuiltinProviderConfig(
+  agentDir: string,
+  baseUrl: string,
+  options: { extensions?: string[]; auth?: boolean } = {},
+): Promise<void> {
+  await fs.writeFile(
+    path.join(agentDir, "settings.json"),
+    JSON.stringify({
+      defaultProvider: BUILTIN_PROVIDER,
+      defaultModel: BUILTIN_MODEL,
+      defaultThinkingLevel: "high",
+      extensions: options.extensions ?? [],
+    }),
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(agentDir, "models.json"),
+    JSON.stringify({ providers: { [BUILTIN_PROVIDER]: { baseUrl } } }),
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(agentDir, "auth.json"),
+    JSON.stringify(
+      options.auth === false
+        ? {}
+        : { [BUILTIN_PROVIDER]: { type: "api_key", key: BUILTIN_PROVIDER_KEY } },
+    ),
+    "utf8",
+  );
+}
+
+async function readAgentConfig(agentDir: string): Promise<string[]> {
+  return await Promise.all(
+    ["settings.json", "models.json", "auth.json"].map(
+      async (name) => await fs.readFile(path.join(agentDir, name), "utf8"),
+    ),
+  );
+}
+
 function successfulFactory(
   delays: Record<string, number> = {},
   results: Record<string, string> = {},
@@ -119,7 +188,104 @@ function successfulFactory(
   };
 }
 
-describe("Pi agent groups", () => {
+describe("Pi agent groups", { timeout: TEST_TIMEOUT_MS }, () => {
+  it("keeps its own validation text in the message and foreign error text private", async () => {
+    const signal = new AbortController().signal;
+    const invalid = await runPiAgentGroup([request("same"), request("same")], {
+      maxConcurrency: 1,
+      signal,
+    }).catch((error: unknown) => error);
+    expect(invalid).toBeInstanceOf(PiAgentGroupError);
+    expect(invalid).toMatchObject({
+      agentId: "group",
+      code: "has an invalid request",
+      facts: "Duplicate Pi agent id: same",
+      detail: undefined,
+      message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
+    });
+    // The bridge sends the facts as the safe part of the error.
+    expect(describeAgentGroupFailure(invalid, agentGroupErrorFields(invalid))).toEqual({
+      message: "Pi agent group has an invalid request: Duplicate Pi agent id: same",
+      agentId: "group",
+      code: "has an invalid request",
+      facts: "Duplicate Pi agent id: same",
+    });
+
+    const thrown = await runPiAgentGroup([request("sdk")], {
+      maxConcurrency: 1,
+      signal,
+      sessionFactory: async () => {
+        throw new Error("PRIVATE_SDK_ERROR settings could not be read");
+      },
+    }).catch((error: unknown) => error);
+    expect(describeAgentGroupFailure(thrown, agentGroupErrorFields(thrown))).toEqual({
+      message: "Pi agent sdk failed: the session raised an error",
+      agentId: "sdk",
+      code: "failed",
+      facts: "the session raised an error",
+      detail: "PRIVATE_SDK_ERROR settings could not be read",
+    });
+
+    // A Pi without a default model is told what to configure.
+    const agentDir = await makeTempDir("pi-agent-group-no-default");
+    await fs.writeFile(path.join(agentDir, "settings.json"), "{}\n", "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("unconfigured"), cwd: agentDir }], {
+          maxConcurrency: 1,
+          signal,
+        }),
+      ).rejects.toThrow(
+        "Pi agent group has no default model: configure a default provider, model, and thinking level in Pi",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("never trusts a foreign error that copies an agent error's name and fields", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-forged-error");
+    await writeNativeFixtureConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    const forged = Object.assign(new Error("PRIVATE_FORGED_MARKER settings text"), {
+      name: "PiAgentGroupError",
+      agentId: "group",
+      code: "has unknown provider",
+      facts: "PRIVATE_FORGED_MARKER",
+    });
+    // Preparing the group meets the forged error, as from settings or extension code.
+    vi.spyOn(SettingsManager, "create").mockImplementationOnce(() => {
+      throw forged;
+    });
+    try {
+      const error = await runPiAgentGroup([{ ...request("forged"), cwd: agentDir }], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PiAgentGroupError);
+      expect(error).toMatchObject({
+        agentId: "group",
+        code: "failed",
+        facts: "the agent group raised an error",
+        detail: "PRIVATE_FORGED_MARKER settings text",
+        message: "Pi agent group failed: the agent group raised an error",
+      });
+      expect(agentGroupErrorFields(forged)).toBeUndefined();
+      expect(describeAgentGroupFailure(forged, agentGroupErrorFields(forged))).toEqual({
+        message: "PRIVATE_FORGED_MARKER settings text",
+      });
+      expect(
+        JSON.stringify(agentGroupErrorFields(error)?.facts) + (error as Error).message,
+      ).not.toContain("PRIVATE_FORGED_MARKER");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("validates requests and options before creating sessions", async () => {
     const signal = new AbortController().signal;
     await expect(runPiAgentGroup([], { maxConcurrency: 1, signal })).resolves.toEqual([]);
@@ -208,7 +374,8 @@ describe("Pi agent groups", () => {
     expect(maximum).toBe(2);
   });
 
-  it("fails on a provider error and disposes the session", async () => {
+  it("fails on a provider error, keeps its text private, and disposes the session", async () => {
+    const providerText = `PRIVATE_PROVIDER_ERROR ${"p".repeat(6_000)} END`;
     let disposed = false;
     const factory: PiAgentSessionFactory = async () => {
       const listeners = new Set<(event: Record<string, unknown>) => void>();
@@ -221,7 +388,7 @@ describe("Pi agent groups", () => {
         },
         async prompt(_prompt, options) {
           options?.preflightResult?.("started");
-          for (const listener of listeners) listener(message("", "error", "provider failed"));
+          for (const listener of listeners) listener(message("", "error", providerText));
         },
         async abort() {},
         dispose() {
@@ -229,13 +396,17 @@ describe("Pi agent groups", () => {
         },
       };
     };
-    await expect(
-      runPiAgentGroup([request("provider")], {
-        maxConcurrency: 1,
-        signal: new AbortController().signal,
-        sessionFactory: factory,
-      }),
-    ).rejects.toThrow(/provider failed/);
+    const error = await runPiAgentGroup([request("provider")], {
+      maxConcurrency: 1,
+      signal: new AbortController().signal,
+      sessionFactory: factory,
+    }).catch((caught: unknown) => caught);
+    // The provider's text can quote the prompt or credentials, so only the detail holds it.
+    expect(error).toBeInstanceOf(PiAgentGroupError);
+    expect(error).toMatchObject({
+      message: "Pi agent provider stopped with error: the provider reported an error",
+      detail: providerText,
+    });
     expect(disposed).toBe(true);
   });
 
@@ -320,7 +491,7 @@ describe("Pi agent groups", () => {
           events.push(event);
         },
       }),
-    ).rejects.toThrow(/first failed/);
+    ).rejects.toMatchObject({ agentId: "first", detail: "first failed" });
     expect(created).toEqual(["first"]);
     expect(events).toContainEqual(
       expect.objectContaining({ id: "queued", state: "cancelled", phase: "cancelled" }),
@@ -331,7 +502,7 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/first failed/);
+    ).rejects.toMatchObject({ agentId: "first-no-progress", detail: "first failed" });
   });
 
   it("rejects duplicate tools and invalid limits", async () => {
@@ -596,7 +767,7 @@ describe("Pi agent groups", () => {
     ).rejects.toThrow(/assistant text is empty/);
   });
 
-  it("includes bounded abort diagnostics", async () => {
+  it("reports a failed abort as a fact and keeps the abort's text private", async () => {
     let release: (() => void) | undefined;
     const factory: PiAgentSessionFactory = async () => ({
       model: { provider: "mock", id: "model" },
@@ -609,7 +780,7 @@ describe("Pi agent groups", () => {
       },
       async abort() {
         release?.();
-        throw new Error("abort failed");
+        throw new Error("PRIVATE_ABORT_FAILURE");
       },
       dispose() {},
     });
@@ -619,10 +790,13 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/abort failed/);
+    ).rejects.toMatchObject({
+      message: "Pi agent abort-diagnostic timed out: after 5ms; the session abort failed",
+      detail: "PRIVATE_ABORT_FAILURE",
+    });
   });
 
-  it("bounds unexpected error messages", async () => {
+  it("keeps the complete text of unexpected errors out of the message", async () => {
     const blank: PiAgentSessionFactory = async () => {
       throw "";
     };
@@ -632,10 +806,15 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: blank,
       }),
-    ).rejects.toThrow(/unknown failure/);
+    ).rejects.toMatchObject({
+      message: "Pi agent blank failed: the session raised an error",
+      detail: "",
+    });
 
+    // A thrown SDK error keeps every character, but only in the private detail.
+    const sdkText = `PRIVATE_SDK_ERROR ${"x".repeat(5_000)} END`;
     const verbose: PiAgentSessionFactory = async () => {
-      throw new Error("x".repeat(3_000));
+      throw new Error(sdkText);
     };
     await expect(
       runPiAgentGroup([request("verbose")], {
@@ -643,7 +822,10 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: verbose,
       }),
-    ).rejects.toSatisfy((error: Error) => error.message.length < 2_100);
+    ).rejects.toMatchObject({
+      message: "Pi agent verbose failed: the session raised an error",
+      detail: sdkText,
+    });
   });
 
   it("reports missing models and cleanup failures", async () => {
@@ -661,7 +843,7 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: noModel,
       }),
-    ).rejects.toThrow(/No usable Pi model/);
+    ).rejects.toMatchObject({ code: "failed", detail: "No usable Pi model is configured" });
 
     const cleanup: PiAgentSessionFactory = async () => {
       const listeners = new Set<(event: Record<string, unknown>) => void>();
@@ -678,7 +860,7 @@ describe("Pi agent groups", () => {
         },
         async abort() {},
         dispose() {
-          throw new Error("dispose failed");
+          throw new Error("PRIVATE_DISPOSE_FAILURE");
         },
       };
     };
@@ -688,7 +870,10 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: cleanup,
       }),
-    ).rejects.toThrow(/cleanup failed/);
+    ).rejects.toMatchObject({
+      message: "Pi agent cleanup cleanup failed: the session could not be disposed",
+      detail: "PRIVATE_DISPOSE_FAILURE",
+    });
 
     const primary: PiAgentSessionFactory = async () => ({
       model: { provider: "mock", id: "model" },
@@ -708,7 +893,7 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: primary,
       }),
-    ).rejects.toThrow(/prompt failed first/);
+    ).rejects.toMatchObject({ code: "failed", detail: "prompt failed first" });
   });
 
   it("cancels a session while its prompt is running", async () => {
@@ -971,14 +1156,26 @@ describe("Pi agent groups", () => {
         );
       }
       await fs.writeFile(path.join(agentDir, "auth.json"), "PRIVATE_NOT_JSON", "utf8");
-      let message = "";
-      try {
-        await createEphemeralCredentialStore(new AbortController().signal);
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toBe("Could not load Pi credentials for isolated agents");
-      expect(message).not.toContain("PRIVATE_NOT_JSON");
+      const unparsable = await createEphemeralCredentialStore(new AbortController().signal).catch(
+        (error: unknown) => error,
+      );
+      // A parse error can quote a credential, so its text is kept nowhere, not even as detail.
+      expect(unparsable).toBeInstanceOf(PiAgentGroupError);
+      expect(unparsable).toMatchObject({
+        message: "Pi agent group failed: Could not load Pi credentials for isolated agents",
+        detail: undefined,
+      });
+      expect(JSON.stringify({ ...(unparsable as object) })).not.toContain("PRIVATE_NOT_JSON");
+      // A filesystem error is not Pi Workflows' text, so only the private detail holds it.
+      vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("PRIVATE_FS_MARKER: permission denied"), { code: "EACCES" }),
+      );
+      await expect(
+        createEphemeralCredentialStore(new AbortController().signal),
+      ).rejects.toMatchObject({
+        message: "Pi agent group failed: Could not load Pi credentials for isolated agents",
+        detail: "PRIVATE_FS_MARKER: permission denied",
+      });
       await fs.rm(path.join(agentDir, "auth.json"));
       await expect(
         createEphemeralCredentialStore(new AbortController().signal),
@@ -990,6 +1187,7 @@ describe("Pi agent groups", () => {
       );
     } finally {
       vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     }
   });
 
@@ -1018,14 +1216,22 @@ describe("Pi agent groups", () => {
         );
       }
       await fs.writeFile(path.join(agentDir, "models-store.json"), "PRIVATE_NOT_JSON", "utf8");
-      let message = "";
-      try {
-        await createEphemeralModelStore(new AbortController().signal);
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toBe("Could not load Pi model catalog for isolated agents");
-      expect(message).not.toContain("PRIVATE_NOT_JSON");
+      const unparsable = await createEphemeralModelStore(new AbortController().signal).catch(
+        (error: unknown) => error,
+      );
+      // The parser's text is not Pi Workflows' own, so it is private detail.
+      expect(unparsable).toBeInstanceOf(PiAgentGroupError);
+      expect((unparsable as Error).message).toBe(
+        "Pi agent group failed: Could not load Pi model catalog for isolated agents",
+      );
+      expect((unparsable as PiAgentGroupError).detail).toContain("PRIVATE_NOT_JSON");
+      vi.spyOn(fs, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("PRIVATE_FS_MARKER: device busy"), { code: "EBUSY" }),
+      );
+      await expect(createEphemeralModelStore(new AbortController().signal)).rejects.toMatchObject({
+        message: "Pi agent group failed: Could not load Pi model catalog for isolated agents",
+        detail: "PRIVATE_FS_MARKER: device busy",
+      });
       await fs.rm(path.join(agentDir, "models-store.json"));
       await expect(createEphemeralModelStore(new AbortController().signal)).resolves.toBeDefined();
       const cancelled = new AbortController();
@@ -1035,6 +1241,7 @@ describe("Pi agent groups", () => {
       );
     } finally {
       vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     }
   });
 
@@ -1135,7 +1342,7 @@ describe("Pi agent groups", () => {
     }
   });
 
-  it("fails without the exact provider extension or cached model", async () => {
+  it("fails with an unknown provider or model", async () => {
     const agentDir = await makeTempDir("pi-agent-group-exact-dispatch");
     const cwd = await makeTempDir("pi-agent-group-exact-project");
     await writeNativeFixtureConfig(agentDir, []);
@@ -1147,7 +1354,15 @@ describe("Pi agent groups", () => {
           maxConcurrency: 1,
           signal: new AbortController().signal,
         }),
-      ).rejects.toThrow(/has no provider extension/);
+      ).rejects.toThrow("Pi agent group has unknown provider: fixture-native");
+      // An extension that registers another provider does not make this one known.
+      await writeNativeFixtureConfig(agentDir, [fixtureExtension("legacy-provider")]);
+      await expect(
+        runPiAgentGroup([{ ...request("other-provider"), cwd }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow("Pi agent group has unknown provider: fixture-native");
       await writeNativeFixtureConfig(agentDir);
       await expect(
         runPiAgentGroup(
@@ -1161,7 +1376,328 @@ describe("Pi agent groups", () => {
           ],
           { maxConcurrency: 1, signal: new AbortController().signal },
         ),
-      ).rejects.toThrow(/has no model/);
+      ).rejects.toThrow("Pi agent missing-model has no model: fixture-native/missing");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("runs a provider built into Pi without a cached model catalog, online and offline", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"builtin"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin");
+    const cwd = await makeTempDir("pi-agent-group-builtin-project");
+    const lifecycleFile = path.join(agentDir, "lifecycle.log");
+    // A user extension that registers another provider is preflighted but not admitted.
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, {
+      extensions: [fixtureExtension("native-provider")],
+    });
+    const configBefore = await readAgentConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_AGENT_FIXTURE_LIFECYCLE_FILE", lifecycleFile);
+    try {
+      for (const offline of [undefined, "1"]) {
+        vi.stubEnv("PI_OFFLINE", offline);
+        await expect(
+          runPiAgentGroup([{ ...request("builtin"), cwd, tools: ["read"] }], {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+          }),
+        ).resolves.toEqual([
+          expect.objectContaining({
+            model: `${BUILTIN_PROVIDER}/${BUILTIN_MODEL}`,
+            thinkingLevel: "high",
+            text: '{"answer":"builtin"}',
+          }),
+        ]);
+      }
+      // Each child used the stored credential through Pi's own provider resolution.
+      expect(mock.authorizations).toEqual([
+        `Bearer ${BUILTIN_PROVIDER_KEY}`,
+        `Bearer ${BUILTIN_PROVIDER_KEY}`,
+      ]);
+      // Each group's preflight settled the extension, and no child session loaded it.
+      expect((await fs.readFile(lifecycleFile, "utf8")).trim().split("\n")).toEqual([
+        "session_shutdown",
+        "session_shutdown",
+      ]);
+      await expect(fs.stat(path.join(agentDir, "models-store.json"))).rejects.toThrow();
+      await expect(fs.stat(path.join(agentDir, "sessions"))).rejects.toThrow();
+      expect(await readAgentConfig(agentDir)).toEqual(configBefore);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("runs a built-in provider model that only the cached catalog knows while offline", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"cached"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-cached");
+    const cwd = await makeTempDir("pi-agent-group-builtin-cached-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    const catalogText = JSON.stringify({
+      [BUILTIN_PROVIDER]: {
+        models: [
+          {
+            id: "fixture-cached-model",
+            name: "Fixture cached model",
+            api: "openai-completions",
+            provider: BUILTIN_PROVIDER,
+            baseUrl: "https://catalog.invalid/v1",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 128_000,
+            maxTokens: 4_096,
+          },
+        ],
+        checkedAt: 1,
+        // Pi applies a cached catalog only when it is newer than its bundled catalog.
+        lastModified: Date.UTC(2100, 0, 1),
+      },
+    });
+    await fs.writeFile(path.join(agentDir, "models-store.json"), catalogText, "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("cached"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "fixture-cached-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 1, signal: new AbortController().signal },
+        ),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: `${BUILTIN_PROVIDER}/fixture-cached-model`,
+          text: '{"answer":"cached"}',
+        }),
+      ]);
+      expect(mock.authorizations).toEqual([`Bearer ${BUILTIN_PROVIDER_KEY}`]);
+      expect(await fs.readFile(path.join(agentDir, "models-store.json"), "utf8")).toBe(catalogText);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("fails before prompting without built-in provider authentication or model", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-missing");
+    const cwd = await makeTempDir("pi-agent-group-builtin-missing-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, { auth: false });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("builtin-auth"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow(
+        `Pi agent builtin-auth has no provider authentication: ${BUILTIN_PROVIDER}`,
+      );
+      await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("builtin-model"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "missing-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 1, signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow(`Pi agent builtin-model has no model: ${BUILTIN_PROVIDER}/missing-model`);
+      expect(mock.requests).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("gives each child only the dispatch provider's stored credential", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: '{"answer":"probe"}' }));
+    const agentDir = await makeTempDir("pi-agent-group-credential-scope");
+    const cwd = await makeTempDir("pi-agent-group-credential-scope-project");
+    const probeFile = path.join(agentDir, "credential-probe.log");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    // Stored API keys for two other built-in providers, which Pi resolves from auth.json.
+    await fs.writeFile(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify({
+        [BUILTIN_PROVIDER]: { type: "api_key", key: BUILTIN_PROVIDER_KEY },
+        openai: { type: "api_key", key: "other-openai-key" },
+        groq: { type: "api_key", key: "other-groq-key" },
+      }),
+      "utf8",
+    );
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("OPENAI_API_KEY", undefined);
+    vi.stubEnv("GROQ_API_KEY", undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    vi.stubEnv("PI_AGENT_CREDENTIAL_PROBE_FILE", probeFile);
+    vi.stubEnv("PI_AGENT_CREDENTIAL_PROBE_PROVIDERS", `${BUILTIN_PROVIDER},openai,groq`);
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("credential-scope"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+          behaviorExtensionPaths: [fixtureExtension("credential-probe")],
+        }),
+      ).resolves.toEqual([expect.objectContaining({ text: '{"answer":"probe"}' })]);
+      expect((await fs.readFile(probeFile, "utf8")).trim().split("\n")).toEqual([
+        `${BUILTIN_PROVIDER}=present`,
+        "openai=absent",
+        "groq=absent",
+      ]);
+      expect(mock.authorizations).toEqual([`Bearer ${BUILTIN_PROVIDER_KEY}`]);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("rejects a virtual model as the dispatch model before any request", async () => {
+    const mock = await startMockOpenAiServer(() => ({ kind: "text", text: "must not run" }));
+    const agentDir = await makeTempDir("pi-agent-group-virtual-model");
+    const cwd = await makeTempDir("pi-agent-group-virtual-model-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, undefined);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      // The admitted extension lists `fixture-virtual` under the dispatch provider. Its router
+      // would send requests to a physical model, so the dispatch is not exact.
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("virtual"),
+              cwd,
+              tools: ["read"],
+              model: { provider: BUILTIN_PROVIDER, id: "fixture-virtual" },
+              thinkingLevel: "high",
+            },
+          ],
+          {
+            maxConcurrency: 1,
+            signal: new AbortController().signal,
+            behaviorExtensionPaths: [fixtureExtension("virtual-model")],
+          },
+        ),
+      ).rejects.toThrow(`Pi agent virtual has no model: ${BUILTIN_PROVIDER}/fixture-virtual`);
+      expect(mock.requests).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("uses an environment API key for a provider built into Pi", async () => {
+    const mock = await startMockOpenAiServer(() => ({
+      kind: "text",
+      text: '{"answer":"environment"}',
+    }));
+    const agentDir = await makeTempDir("pi-agent-group-builtin-env-key");
+    const cwd = await makeTempDir("pi-agent-group-builtin-env-key-project");
+    await writeBuiltinProviderConfig(agentDir, mock.baseUrl, { auth: false });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv(BUILTIN_PROVIDER_KEY_ENV, "environment-provider-key");
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("builtin-env-key"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: `${BUILTIN_PROVIDER}/${BUILTIN_MODEL}`,
+          text: '{"answer":"environment"}',
+        }),
+      ]);
+      expect(mock.authorizations).toEqual(["Bearer environment-provider-key"]);
+    } finally {
+      vi.unstubAllEnvs();
+      await mock.close();
+    }
+  });
+
+  it("uses a long-lived OAuth credential of a native extension provider without refreshing it", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-extension-oauth");
+    const cwd = await makeTempDir("pi-agent-group-extension-oauth-project");
+    await writeNativeFixtureConfig(agentDir);
+    const authText = JSON.stringify({ "fixture-native": FIXTURE_OAUTH_CREDENTIAL });
+    await fs.writeFile(path.join(agentDir, "auth.json"), authText, "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("PI_AGENT_FIXTURE_OAUTH", "1");
+    // Without its API key, the provider can authenticate only through the stored OAuth credential.
+    vi.stubEnv("PI_AGENT_FIXTURE_DISABLE_AUTH", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("extension-oauth"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: "fixture-native/fixture-model",
+          text: '{"answer":"ok"}',
+        }),
+      ]);
+      expect(await fs.readFile(path.join(agentDir, "auth.json"), "utf8")).toBe(authText);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("runs an extension provider without a cached model catalog while offline", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-extension-offline");
+    const cwd = await makeTempDir("pi-agent-group-extension-offline-project");
+    await writeNativeFixtureConfig(agentDir);
+    await fs.rm(path.join(agentDir, "models-store.json"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("PI_OFFLINE", "1");
+    try {
+      await expect(
+        runPiAgentGroup([{ ...request("extension-offline"), cwd, tools: ["read"] }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          model: "fixture-native/fixture-model",
+          text: '{"answer":"ok"}',
+        }),
+      ]);
+      await expect(fs.stat(path.join(agentDir, "models-store.json"))).rejects.toThrow();
     } finally {
       vi.unstubAllEnvs();
     }
@@ -1367,6 +1903,86 @@ describe("Pi agent groups", () => {
     }
   });
 
+  it("shows that it could not resolve an extension path and keeps the file error private", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-missing-extension");
+    const cwd = await makeTempDir("pi-agent-group-missing-extension-project");
+    await writeNativeFixtureConfig(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    const missing = path.join(agentDir, "PRIVATE_PATH_MARKER", "extension.ts");
+    try {
+      const error = await runPiAgentGroup([{ ...request("missing-extension"), cwd }], {
+        maxConcurrency: 1,
+        signal: new AbortController().signal,
+        behaviorExtensionPaths: [missing],
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PiAgentGroupError);
+      expect((error as Error).message).toBe(
+        "Pi agent group failed: Could not resolve Pi child extension path",
+      );
+      expect((error as PiAgentGroupError).detail).toMatch(/^ENOENT: .*PRIVATE_PATH_MARKER/u);
+      // The bridge sends the facts as visible text and the file error only as detail.
+      expect(describeAgentGroupFailure(error, agentGroupErrorFields(error))).toEqual({
+        message: "Pi agent group failed: Could not resolve Pi child extension path",
+        agentId: "group",
+        code: "failed",
+        facts: "Could not resolve Pi child extension path",
+        detail: (error as PiAgentGroupError).detail,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("names a long extension source in full when it rejects the extension", async () => {
+    const agentDir = await makeTempDir("pi-agent-group-long-source");
+    const cwd = await makeTempDir("pi-agent-group-long-source-project");
+    // A local package whose source, its path in the settings, is longer than 200 characters.
+    const packageDir = path.join(agentDir, "a".repeat(120), "b".repeat(120));
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "fixture-long-source", pi: { extensions: ["./extension.ts"] } }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(packageDir, "extension.ts"),
+      `import nativeProvider from ${JSON.stringify(fixtureExtension("native-provider"))};
+import readOverride from ${JSON.stringify(fixtureExtension("read-override"))};
+export default function extension(pi) {
+  nativeProvider(pi);
+  readOverride(pi);
+}
+`,
+      "utf8",
+    );
+    await writeNativeFixtureConfig(agentDir, []);
+    const settingsPath = path.join(agentDir, "settings.json");
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8")) as Record<string, unknown>;
+    await fs.writeFile(
+      settingsPath,
+      JSON.stringify({ ...settings, packages: [packageDir] }),
+      "utf8",
+    );
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      expect(packageDir.length).toBeGreaterThan(200);
+      await expect(
+        runPiAgentGroup([{ ...request("long-source"), cwd }], {
+          maxConcurrency: 1,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toMatchObject({
+        code: "provider extension replaces a built-in tool",
+        facts: packageDir,
+        message: `Pi agent group provider extension replaces a built-in tool: ${packageDir}`,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("rejects incomplete, mixed, and slash-command dispatch requests", async () => {
     const signal = new AbortController().signal;
     await expect(
@@ -1387,23 +2003,32 @@ describe("Pi agent groups", () => {
         sessionFactory: successfulFactory(),
       }),
     ).rejects.toThrow(/must not invoke an extension command/);
-    await expect(
-      runPiAgentGroup(
-        [
-          {
-            ...request("first-dispatch"),
-            model: { provider: "fixture-native", id: "fixture-model" },
-            thinkingLevel: "high",
-          },
-          {
-            ...request("second-dispatch"),
-            model: { provider: "fixture-native", id: "other-model" },
-            thinkingLevel: "high",
-          },
-        ],
-        { maxConcurrency: 2, signal },
-      ),
-    ).rejects.toThrow(/one exact model dispatch/);
+    // The real SDK path reads settings before it compares dispatches, so it gets a temporary
+    // agent directory instead of the user's.
+    const agentDir = await makeTempDir("pi-agent-group-mixed-dispatch");
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    try {
+      await expect(
+        runPiAgentGroup(
+          [
+            {
+              ...request("first-dispatch"),
+              model: { provider: "fixture-native", id: "fixture-model" },
+              thinkingLevel: "high",
+            },
+            {
+              ...request("second-dispatch"),
+              model: { provider: "fixture-native", id: "other-model" },
+              thinkingLevel: "high",
+            },
+          ],
+          { maxConcurrency: 2, signal },
+        ),
+      ).rejects.toThrow(/one exact model dispatch/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("excludes Pi Workflows wrapper packages before their factories run", async () => {
@@ -1462,7 +2087,7 @@ describe("Pi agent groups", () => {
         signal: new AbortController().signal,
         sessionFactory: factory,
       }),
-    ).rejects.toThrow(/bad agent/);
+    ).rejects.toMatchObject({ agentId: "bad", detail: "bad agent" });
     expect(created).toEqual(["bad", "good"]);
   });
 });

@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { WorkflowClient } from "../src/client/client.js";
+import { vi } from "vitest";
+import { WorkflowClient } from "../src/client/client.js";
 import type { ClientResponse } from "../src/client/protocol.js";
-import { canonicalJson } from "../src/state/json.js";
+import { canonicalJson, type JsonObject } from "../src/state/json.js";
 import { resourceIdFor } from "../src/state/mutation.js";
 import { initializeViewerRun } from "../src/state/viewer.js";
 import type { HumanDecisionStore } from "../src/workflows/human-decision.js";
@@ -15,6 +16,40 @@ import type {
   HumanDecisionRequest,
 } from "../src/workflows/types.js";
 import { TEST_TEMP_ROOT_ENV } from "./global-setup.js";
+
+/**
+ * Hold back every timer started with exactly `delayMs`, such as the engine's timer for a node
+ * limit of that length. A held timer fires only when the test calls `fire()`, so the limit runs
+ * out after the test's own setup is done, however loaded the machine is. Other timers run
+ * normally. Use a delay that no other code in the test uses, and call `restore()` afterwards.
+ */
+export function holdTimers(delayMs: number): {
+  held: () => number;
+  fire: () => void;
+  restore: () => void;
+} {
+  const realSetTimeout = globalThis.setTimeout;
+  const held: Array<() => void> = [];
+  const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+    handler: (...values: unknown[]) => void,
+    delay?: number,
+    ...values: unknown[]
+  ) => {
+    if (delay !== delayMs || typeof handler !== "function") {
+      return realSetTimeout(handler, delay, ...values);
+    }
+    held.push(() => handler(...values));
+    // The caller still gets a real handle to clear. It never runs the held handler.
+    return realSetTimeout(() => undefined, delayMs).unref();
+  }) as typeof setTimeout);
+  return {
+    held: () => held.length,
+    fire: () => {
+      for (const run of held.splice(0)) run();
+    },
+    restore: () => spy.mockRestore(),
+  };
+}
 
 export async function makeTempDir(prefix: string): Promise<string> {
   const root = process.env[TEST_TEMP_ROOT_ENV];
@@ -189,6 +224,62 @@ export async function reportBranch(
       hasPendingMessages: options.hasPendingMessages ?? false,
     },
   });
+}
+
+/** Become the live coordinator of one origin session and report its empty branch. */
+export async function ownSessionCoordinator(
+  client: WorkflowClient,
+  targetSessionId: string,
+  subscriptionId = `owner-${targetSessionId}`,
+): Promise<SessionAuthority> {
+  const watched = await client.request({
+    operation: "view.session.watch",
+    payload: { subscriptionId, sessionId: targetSessionId, coordinator: true },
+  });
+  const coordinatorEpoch = (watched.receipt as { coordinatorEpoch?: unknown } | undefined)
+    ?.coordinatorEpoch;
+  if (typeof coordinatorEpoch !== "string") {
+    throw new Error(`Session coordinator was refused: ${watched.error ?? watched.outcome}`);
+  }
+  const authority = { targetSessionId, coordinatorEpoch };
+  const reported = await reportBranch(client, authority);
+  if (reported.outcome !== "accepted") {
+    throw new Error(`Session branch report was refused: ${reported.error ?? reported.outcome}`);
+  }
+  return authority;
+}
+
+type StartRequest = Omit<Parameters<WorkflowClient["request"]>[0], "payload"> & {
+  payload: JsonObject;
+};
+
+/**
+ * Send an interactive `run.start` the way a live Pi session does: from the
+ * coordinator connection of its origin session. With `authority`, `client` already
+ * holds that coordinator. Without it, a short-lived connection with the same client
+ * identity owns the session for this start only, so the session is disconnected
+ * again afterwards, as it was before the server required that authority.
+ */
+export async function requestInteractiveStart(
+  client: WorkflowClient,
+  request: StartRequest,
+  authority?: SessionAuthority,
+): Promise<ClientResponse> {
+  if (authority !== undefined) {
+    return await client.request({ ...request, payload: { ...request.payload, ...authority } });
+  }
+  const originSessionId = request.payload.originSessionId;
+  if (typeof originSessionId !== "string") throw new Error("run.start needs originSessionId");
+  const starter = new WorkflowClient({
+    databasePath: client.databasePath,
+    clientId: client.clientId,
+  });
+  try {
+    const owned = await ownSessionCoordinator(starter, originSessionId, "interactive-start");
+    return await starter.request({ ...request, payload: { ...request.payload, ...owned } });
+  } finally {
+    await starter.close();
+  }
 }
 
 /** Poll until `predicate` is true, failing after `timeoutMs`. */

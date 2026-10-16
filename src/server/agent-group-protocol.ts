@@ -33,11 +33,16 @@ export type AgentGroupCommand =
     }
   | { type: "cancel"; groupId: string; reason: string };
 
-/** A failed group. Agent errors keep their fields so the runner rebuilds the same error. */
+/**
+ * A failed group. Agent errors keep their fields so the runner rebuilds the same error. The
+ * `message` of any other error, and an agent error's `detail`, can quote provider, SDK, or Pi
+ * text, so the runner keeps them out of its error message.
+ */
 export type AgentGroupFailure = {
   message: string;
   agentId?: string;
   code?: string;
+  facts?: string;
   detail?: string;
 };
 
@@ -106,24 +111,17 @@ export function decodeAgentGroupEvent(line: string): AgentGroupEvent | undefined
   return groupEvent(value.groupId, value);
 }
 
-/** Describe a failure for the runner. Agent errors are recognized by shape across module copies. */
-export function describeAgentGroupFailure(error: unknown): AgentGroupFailure {
+/**
+ * Describe a failure for the runner. `fields` are the facts of an agent error that the group
+ * runner raised itself, from `agentGroupErrorFields`; without them the runner treats the whole
+ * failure as private text.
+ */
+export function describeAgentGroupFailure(
+  error: unknown,
+  fields?: { agentId: string; code: string; facts: string; detail?: string },
+): AgentGroupFailure {
   const message = error instanceof Error ? error.message : String(error);
-  const fields =
-    error instanceof Error && error.name === "PiAgentGroupError"
-      ? agentErrorFields(error)
-      : undefined;
   return fields === undefined ? { message } : { message, ...fields };
-}
-
-function agentErrorFields(
-  error: Error,
-): Required<Pick<AgentGroupFailure, "agentId" | "code" | "detail">> | undefined {
-  const fields: Record<string, unknown> = { ...error };
-  const { agentId, code, detail } = fields;
-  return typeof agentId === "string" && typeof code === "string" && typeof detail === "string"
-    ? { agentId, code, detail }
-    : undefined;
 }
 
 function groupEvent(groupId: string, value: Record<string, unknown>): AgentGroupEvent | undefined {

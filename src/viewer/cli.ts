@@ -6,8 +6,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { WorkflowClient, WorkflowClientVersionError } from "../client/client.js";
 import { materializeRunView } from "../client/materialize.js";
 import { syncHerdrPlugin } from "../herdr/setup.js";
+import { assertAbsoluteExtensionPaths } from "../server/headless-pi.js";
 import { serverLockPath, stopRecordedServer } from "../server/lock.js";
 import type { JsonValue } from "../state/json.js";
+import { workflowStateNoticeLines } from "../workflows/diagnostics.js";
 import { verifyInactiveBackup } from "./backup.js";
 import { renderClientView, runViewer } from "./tui.js";
 
@@ -105,6 +107,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
     if (piArgs.length > 0 && action !== "run") {
       throw new Error("Extra Pi arguments are available only for server run");
     }
+    assertAbsoluteExtensionPaths(piArgs);
     return { command, serverAction: action, once, json, piArgs };
   }
   if (command === "resource-manager") {
@@ -210,8 +213,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       args.stateAction === "verify" &&
       args.verifyBackup !== undefined
     ) {
-      verifyInactiveBackup(args.verifyBackup);
-      process.stdout.write(`Inactive SQLite backup is valid: ${path.resolve(args.verifyBackup)}\n`);
+      const notices = verifyInactiveBackup(args.verifyBackup);
+      process.stdout.write(
+        [
+          `Inactive SQLite backup is valid: ${path.resolve(args.verifyBackup)}`,
+          ...workflowStateNoticeLines(notices),
+        ]
+          .map((line) => `${line}\n`)
+          .join(""),
+      );
       return 0;
     }
 

@@ -7,7 +7,7 @@ import { SqliteResourceManagerStore } from "../src/resource-managers/sqlite.js";
 import { WorkflowServer } from "../src/server/server.js";
 import { ServerStateStore } from "../src/server/state.js";
 import { WorkflowRunQueueStore } from "../src/workflows/queue.js";
-import { makeTempDir, reportBranch, waitUntil } from "./helpers.js";
+import { makeTempDir, reportBranch, requestInteractiveStart, waitUntil } from "./helpers.js";
 
 async function setup(maxRunners: number) {
   const cwd = await makeTempDir("scheduler-project");
@@ -213,7 +213,7 @@ export default defineWorkflow({ name: "agent", startAt: "work", nodes: { work: a
       });
       expect(
         (
-          await test.client.request({
+          await requestInteractiveStart(test.client, {
             operation: "run.start",
             runId: "interactive",
             payload: {

@@ -21,7 +21,11 @@ const groupRunner = vi.hoisted(() => ({
   >(),
 }));
 
-vi.mock("../src/builtins/pi-agent-group.js", () => ({
+// Only the group runner is a fake; its own agent errors are recognized by the real check.
+vi.mock("../src/builtins/pi-agent-group.js", async (importOriginal) => ({
+  agentGroupErrorFields: (
+    await importOriginal<typeof import("../src/builtins/pi-agent-group.js")>()
+  ).agentGroupErrorFields,
   runPiAgentGroup: groupRunner.run,
 }));
 
@@ -156,8 +160,24 @@ describe("agent group bridge", () => {
       new PiAgentGroupError("review", "timed out", "after 5ms"),
     );
     await bridge.command(runArgument("agent"));
+    groupRunner.run.mockRejectedValueOnce(
+      new PiAgentGroupError("review", "stopped with error", "the provider reported an error", {
+        detail: "provider said no",
+      }),
+    );
+    await bridge.command(runArgument("provider"));
     groupRunner.run.mockRejectedValueOnce(new Error("Invalid Pi agent id: !"));
     await bridge.command(runArgument("plain"));
+    // A foreign error that copies an agent error's name and fields gets no trusted fields.
+    groupRunner.run.mockRejectedValueOnce(
+      Object.assign(new Error("PRIVATE_FORGED_MARKER"), {
+        name: "PiAgentGroupError",
+        agentId: "review",
+        code: "has unknown provider",
+        facts: "PRIVATE_FORGED_MARKER",
+      }),
+    );
+    await bridge.command(runArgument("forged"));
 
     expect(bridge.events.slice(1)).toEqual([
       {
@@ -167,10 +187,22 @@ describe("agent group bridge", () => {
           message: "Pi agent review timed out: after 5ms",
           agentId: "review",
           code: "timed out",
-          detail: "after 5ms",
+          facts: "after 5ms",
+        },
+      },
+      {
+        type: "failed",
+        groupId: "provider",
+        error: {
+          message: "Pi agent review stopped with error: the provider reported an error",
+          agentId: "review",
+          code: "stopped with error",
+          facts: "the provider reported an error",
+          detail: "provider said no",
         },
       },
       { type: "failed", groupId: "plain", error: { message: "Invalid Pi agent id: !" } },
+      { type: "failed", groupId: "forged", error: { message: "PRIVATE_FORGED_MARKER" } },
     ]);
   });
 
@@ -190,7 +222,7 @@ describe("agent group bridge", () => {
         message: "Pi agent group cancelled: stop now",
         agentId: "group",
         code: "cancelled",
-        detail: "stop now",
+        facts: "stop now",
       },
     });
   });
@@ -204,7 +236,7 @@ describe("agent group bridge", () => {
     expect(bridge.events.at(-1)).toMatchObject({
       type: "failed",
       groupId: "group-1",
-      error: { code: "cancelled", detail: "Headless pi is shutting down" },
+      error: { code: "cancelled", facts: "Headless pi is shutting down" },
     });
     await running;
   });

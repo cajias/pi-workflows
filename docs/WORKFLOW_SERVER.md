@@ -68,10 +68,10 @@ The package CLI owns server lifecycle commands:
 pi-workflows server start
 pi-workflows server status
 pi-workflows server stop
-pi-workflows server run
+pi-workflows server run [-- <extra pi args>]
 ```
 
-`run` stays attached for direct operation and tests. `start` starts the package process on demand and waits for a ready handshake. It does not install systemd, launchd, or another persistent service.
+`run` stays attached for direct operation and tests. Only `run` accepts [extra Pi arguments](#extra-pi-arguments) for headless Pi children. `start` starts the package process on demand and waits for a ready handshake. It does not install systemd, launchd, or another persistent service.
 
 The server uses one global lock file and one server epoch. The SQLite server claim decides ownership. A starting server first probes the socket and refuses to start when a server answers, even when the lock file is missing. Only the server that wins the epoch claim writes `server/server.lock.json`, atomically, and it rewrites a missing or foreign record while its claim still names it. A starter that loses the claim exits without writing or removing the lock file or the socket, and without reaping the owner's child processes. A server removes the lock only while it still owns the epoch and the lock names it; [Wake recovery](WORKFLOWS.md#wake-recovery) describes the narrow windows that the owner's poll repairs. Socket creation and the SQLite server claim must agree before the server accepts commands. A second live server refuses to start. After the old server lease expires, a new server increases the epoch before it handles work. Messages from an older epoch are rejected.
 
@@ -195,7 +195,9 @@ A runner exit is not automatically a run failure. The server decides from the la
 
 ## Process supervision
 
-Each runner starts in its own process group. A headless Pi child starts in another process group so normal runner completion can stop all Pi tool descendants without signaling the runner itself. The runner registers that direct child with the server before it sends a prompt and unregisters it only after group shutdown. The server owns the one process registry and reaps a registered child if its runner exits first. Headless Pi children that run [Sanity Check agent groups](WORKFLOWS.md#built-in-sanity-check) start and register the same way in interactive and headless runs, one child per group.
+Each runner starts in its own process group. A headless Pi child starts in another process group so normal runner completion can stop all Pi tool descendants without signaling the runner itself. The runner registers that direct child with the server before it sends a prompt and unregisters it only after group shutdown. The server owns the one process registry and reaps a registered child if its runner exits first. Headless Pi children that run [Sanity Check agent groups](WORKFLOWS.md#built-in-sanity-check) start and register the same way in interactive and headless runs, one child per group. The one process outside the registry is an agent group's OAuth refresh process: the group's headless Pi child starts it detached and unregistered, so that no stop that Pi Workflows issues can cut a credential refresh short. It exits on its own, at the latest five minutes after its refresh started. While it runs it keeps a marker, which `server status` lists as `oauthRefreshes`, as [OAuth credentials in agent groups](WORKFLOWS.md#oauth-credentials-in-agent-groups) describes.
+
+Pi chooses each headless child's model when the child starts. A headless agent step stops before any model request when its child cannot use the default model from Pi settings, or when no usable model matches its `--models` or `enabledModels` scope; see [Headless step model](WORKFLOWS.md#headless-step-model).
 
 The server enforces:
 
@@ -215,6 +217,63 @@ Execution reads are narrow. `prepareRunResume()` and continuation reads return o
 The full logical result and request receipt remain durable for repeat handling. Matching repeated requests return the same value or content reference. Normal blob pruning removes unreferenced transfer content. Viewer history continues through its separate bounded page and content-reference interface.
 
 The process registry includes a process start identity, not only a PID. The server accepts a runner registration only when the PID is a direct child of that active runner. A reused PID cannot let a new server kill an unrelated process.
+
+### Headless Pi command
+
+The server pins one pi for every headless Pi child, agent steps and agent groups alike, once when it starts. The server never looks `pi` or `node` up on `PATH` when a child starts. A pi that is a Node script runs as `<pinned node> <pinned pi CLI script> --mode rpc ...`. A pi executable that is not a Node script runs directly. Everything else about the child stays the same: its working directory, inherited environment and overrides, process group, registration, stop signals, server Pi arguments, and the `--no-extensions -e <bridge>` arguments.
+
+The pin comes from one of two places:
+
+- **The starting Pi session.** When the extension starts the server, it passes its own pi to the server as `server-entry` arguments. That pi is Pi's Node (`process.execPath`) with the real file behind Pi's entry script (`process.argv[1]`, symlinks resolved). Pi's own subagent example starts pi again in the same way. The extension accepts that script only when it is a `bin` of the nearest `package.json` and that package has a `piConfig`. A compiled pi, such as a Bun executable or a Node single executable application, is pinned as an executable. A process that is not a pi CLI, such as an SDK host or a test runner, passes no pin. Headless children of a server that a Pi session started therefore run the same pi and Node as that session.
+- **The server's `PATH`.** When nothing was passed, for example after `pi-workflows server run`, `server start`, or `piw` started the server, the server resolves `pi` on its own `PATH` once at start. If the real file behind it, with symlinks resolved, starts with `#!/usr/bin/env node` or `#!/path/to/node`, the server pins that real file. It also runs that Node once to read its `process.execPath`, so a version manager shim for Node is resolved once instead of at each child start. Any other `pi`, such as Pi's managed launcher, a compiled pi, or a mise or Volta shim, is pinned as the path found on `PATH`, not its real file, and each child starts it under the name `pi`, as a shell would. A mise or Volta shim is one shared program that picks the tool from that name. Such a program then makes its own choices each time a child starts: Pi's managed launcher and a version manager shim pick the pi version at each start, and mise can pick it per project directory, because each child starts in its run's project directory. This is a known limitation of a pin from `PATH`. A server that a Pi session starts is fully pinned.
+
+The pin does not change while the server runs. A later Pi session from another pi installation connects to the running server and does not change its pin. After `pi update`, or when a session should use another pi, restart the server with `pi-workflows server stop`. The next client starts a server with its own pin. Runs resumed after the restart use the new pin.
+
+`pi-workflows server status` reports the pin as `headlessPi`: `source` is `session` or `path`, and `kind` is `node` with `node` and `cli`, `executable` with `executable`, or `unresolved` with `error`. The server also logs it at start. The pin is not persisted: it lives in the server process and in each runner's startup reply.
+
+A server that cannot resolve pi still starts, because state commands and workflows without agent steps do not need pi. The reason names the cause, including a Node probe that timed out after its 5 seconds. When the next workflow runner launches, the server resolves pi once more, while that runner starts, and keeps the new result, resolved or not, so a passing failure such as a probe that timed out under load recovers without a restart. It does not retry again after that. While the pin stays unresolved, each headless child fails at start with the reason from `headlessPi.error`. Before each start, the runner also checks that the pinned files still exist and are executable. A pin whose files were removed, for example by an update that deleted the old release, fails the step or agent group with the missing path and the restart instruction instead of running a different pi.
+
+### Extra Pi arguments
+
+`pi-workflows server run -- <args>` appends `<args>` to every headless Pi child that the server starts, after `--no-extensions -e <bridge>`. That covers headless agent steps and the host process of each [Sanity Check agent group](WORKFLOWS.md#built-in-sanity-check), for every run and project that the server handles. A model override is the usual use, such as `-- --provider <provider> --model <model>`.
+
+Headless children start with `--no-extensions`, so a provider that only a user extension registers does not exist there, and `--provider <provider>` alone makes every child exit with `Unknown provider`. Pi still loads an explicit `-e` source under `--no-extensions`, and it registers extension providers before it resolves `--provider` and `--model`. Name the extension in the same arguments:
+
+```bash
+pi-workflows server run -- -e /abs/path/provider-ext.ts --provider <provider> --model <model>
+```
+
+This changes nothing about what a headless child may do without those arguments. The operator who starts the server chooses what it loads. Before you do:
+
+- **The whole extension loads, not only its provider.** Its tools, hooks, commands, and flags run in every headless agent step and every agent group host process. Headless steps enforce no tool allowlist, so the model can call the extension's tools there. Load only an extension that you trust with that reach.
+- **Never load the pi-workflows extension itself.** It would register a second `workflow` tool beside the bridge and start its own server client in each child. The bridge must stay the only pi-workflows code in a headless child. The server does not check this.
+- **Use an absolute path.** Each child starts in its run's project directory, where Pi would resolve a relative path and could load project code. `server run` therefore rejects a relative `-e` or `--extension` path, and names the flag and value. A path that starts with `~/`, a `file://` URL, and `npm:`, `git:`, `github:`, `http:`, `https:`, `ssh:`, or `builtin:` sources are accepted. Pi 1.1.0 loads extensions only from `-e <source>` and `--extension <source>`; each child reports `--extension=<source>` as an unknown option. Every `-e` and `--extension` in the arguments is checked, wherever it appears. `server run` also rejects a `--` among the Pi arguments. Pi reads a `--` that follows an option that takes a value, such as `--model --`, as that option's value and keeps reading options after it. Headless pi in RPC mode takes no messages, so a real `--` has no use there.
+- **An `npm:` or `git:` source installs a temporary copy in each child**, at every start, rather than using the copy that `pi install` manages. Pass the absolute path of the installed extension file or package directory instead.
+- **Sanity Check agent groups do not use these arguments to choose a model.** The group's child sessions choose the provider and model from the user's settings. They use a provider that Pi defines, or admit the user-scope extension that registers it, as [Built-in sanity check](WORKFLOWS.md#built-in-sanity-check) describes. In the group's host process, the arguments only need to let Pi start, so a `--provider` there also needs its `-e` extension.
+
+Only `server run` accepts extra Pi arguments. A server that a Pi session, `server start`, or `piw` starts gets none. To load a provider extension into the headless children of any server, list it in [headless extensions](#headless-extensions) instead.
+
+### Headless extensions
+
+`PI_WORKFLOWS_HEADLESS_EXTENSIONS` lists extensions that every headless Pi child loads beside its bridge. It is off by default, and without it a headless child loads only its bridge. Set it in the environment of whatever starts the server. The extension starts the server with the Pi session's own environment, so this covers the server that a session starts:
+
+```bash
+PI_WORKFLOWS_HEADLESS_EXTENSIONS=/abs/path/provider-ext.ts pi
+```
+
+`pi-workflows server start`, `server run`, and `piw` read it the same way. Separate entries with the platform path delimiter, `:` on Linux and macOS and `;` on Windows. Empty entries are skipped.
+
+The server reads the list once at start and keeps it for its whole life, like the [pinned pi](#headless-pi-command). Whoever starts the server fixes the list. A later Pi session with another value connects to the running server and does not change it; restart the server with `pi-workflows server stop` to apply a change. Each child gets `-e <realpath>` for every entry, after the bridge's `-e` and before the server's [extra Pi arguments](#extra-pi-arguments). `--no-extensions` stays, so the child still discovers no other extension. To use a provider that only a listed extension registers, select it with `defaultProvider` and `defaultModel` in the user's settings, or with `server run -- --provider <provider> --model <model>`.
+
+Each entry must:
+
+- be an absolute path; `~` is not expanded;
+- name an existing regular file: the extension's entry file, such as `<package>/dist/index.js` or `<package>/index.ts`. A directory is refused. Pi resolves `-e <directory>` like a package: it loads the extension files that a manifest names anywhere on disk, an index file, or every extension under the directory, following symlinks, and it adds the package's skills, prompts, and themes. A directory could therefore load pi-workflows itself, and more than the provider that you meant;
+- not be part of pi-workflows: not inside this package's root, and not inside any package named `@osolmaz/pi-workflows`. The pi-workflows extension would register a second `workflow` tool beside the bridge and start its own server client in every child.
+
+A list with one bad entry is invalid as a whole and fails closed. The server still starts, `server status` reports `headlessExtensions` as `{"error": "..."}`, the server logs the reason, and every headless agent step and agent group fails at start with it, instead of running without an extension that the operator asked for. A valid list appears as `{"entries": [{"path": "...", "realpath": "..."}]}`: each configured path and the real file behind it, which the server pins at start and children load. An unset list is `{"entries": []}`. Before each start, the runner repeats every check on each configured path and requires it to resolve to the same real file. A removed file, a path that no longer passes the checks, for example one replaced by a directory, or a path that now resolves to another file, such as a symlink pointed elsewhere, fails that start with the reason instead of loading a file that was never checked. The file's contents are not pinned: a regular file replaced at the same real path, by an edit in place or a rename over it, passes, and children load its new contents.
+
+The whole extension loads, not only its provider. Its tools, hooks, commands, and flags run in every headless agent step and every agent group host process, for every run and project that the server handles. Headless steps enforce no tool allowlist, so the model can call the extension's tools there. List only an extension that you trust with that reach. The child sessions of a Sanity Check agent group do not load the listed extensions; they choose their own provider as described in [Built-in sanity check](WORKFLOWS.md#built-in-sanity-check).
 
 ## Live client protocol
 
@@ -388,6 +447,8 @@ These tables remain part of `pi-workflows-state` schema version 1. The DDL diges
 
 Agent and assistant-message steps for an interactive run execute in the origin Pi session.
 
+Only that session can start the run. An interactive `run.start` payload carries the session command authority, `targetSessionId` and `coordinatorEpoch`, beside `originSessionId`. Like `run.restart`, it needs the active coordinator epoch of a connection that has reported its branch, and the server checks it before receipt lookup. `targetSessionId` must equal `originSessionId`. A start without that authority, for a session that has no live coordinator, or for another session is rejected before any run, queue row, or command receipt is written, so no client can create a terminal message for a session that never receives it. The durable request fingerprint excludes `coordinatorEpoch`, so a retry from the reconnected session adopts the stored receipt. A headless start carries no session authority and is not checked.
+
 The runner commits the node's resolved wall-clock deadline before it proposes `interaction.requested`. The server commits the request, changes the node attempt to waiting, parks the queue row, releases the claim, and acknowledges the runner. The runner then exits. The server continues to enforce the durable deadline while no runner exists. If the deadline passes, one control claim atomically closes the stale request and schedules a supervised timeout-resume child. The child preserves the same attempt and deadline, records `timed_out`, and follows any `$result.outcome` edge. A run with no timeout recovery edge becomes terminal and releases its session reservation. Restart recovery starts this timeout path before it schedules other work.
 
 The extension finds eligible workflow messages during `session_start`, after model turns settle, and once per second while the session is open. The same poll also establishes the one session subscription when initial server startup or connection fails. It keeps at most one connection attempt and one active subscription, so the open Pi session recovers without a restart and without duplicate coordinators. One `WorkflowMessageCoordinator` handles every message kind. After every server connection, it waits for the complete origin-session view and reports the active branch before it sends a workflow message or reports a model turn. The server view names the next eligible pending message only to the active coordinator epoch.
@@ -418,9 +479,9 @@ A notify node creates a passive `notification` message in the same transaction a
 
 ## Detached execution
 
-A run with headless execution mode uses the existing `pi --mode rpc` integration for agent steps. The Pi child uses a separate process group registered with the server. The runner stops that group during normal completion. Cancellation gives the runner a bounded cleanup interval, and the server reaps the registered group if the runner exits first.
+A run with headless execution mode uses the existing `pi --mode rpc` integration for agent steps, started with the [pinned pi](#headless-pi-command). The Pi child uses a separate process group registered with the server. The runner stops that group during normal completion. Cancellation gives the runner a bounded cleanup interval, and the server reaps the registered group if the runner exits first.
 
-The headless child receives only the workflow step prompt, configured model arguments, and the bridge extension. Its submission uses the same exact request contract as origin-session work. A headless run cannot use a visible assistant-message step because it has no origin Pi session.
+The headless child receives only the workflow step prompt, the server's [extra Pi arguments](#extra-pi-arguments), and the bridge extension, plus any extension that those arguments name. Its submission uses the same exact request contract as origin-session work. A headless run cannot use a visible assistant-message step because it has no origin Pi session.
 
 The run binding records `interactive` or `headless` execution mode. Viewers show that mode without exposing provider credentials.
 

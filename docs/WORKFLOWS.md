@@ -17,6 +17,37 @@ session whose reservation is taken fails with the identity of the active run;
 wait for that run, inspect it, or cancel it first. A headless run does not take
 the session reservation, so it can run beside an interactive run.
 
+An interactive run starts only from its live origin Pi session. The run sends
+its steps and its terminal result to that session, so the workflow server
+accepts an interactive `run.start` only with the session's current coordinator
+authority: the `targetSessionId` and `coordinatorEpoch` of the connection that
+owns the session and has reported its branch. `targetSessionId` must equal
+`originSessionId`. The server checks that authority before it looks up an
+earlier receipt, so a retried start also needs the live session. A start from
+another client, from another session, or for a session that never connected is
+rejected and creates no run. Without this check, such a start would create a
+terminal message that no session can receive; the message would stay pending
+and keep its run from retention. The extension sends its session's authority
+with every start. When the session is still connecting or reporting its branch,
+the start waits up to 15 seconds for it. Aborting the workflow tool call ends
+the wait; Pi gives a `/workflow` command no abort signal, so its wait ends at the
+deadline. At the deadline, the start fails with `Workflow session coordinator is
+not ready because ...`, which names the last reason, such as a stale session view
+or an unreported branch. When the connection drops during a start, or the server
+refuses the start's epoch as replaced, the start may already be committed. The
+extension then waits, within the same 15 seconds, for the session's next epoch
+and sends the start again with the same idempotency key and run ID, in at most
+three start attempts. After a lost connection, each attempt's client may resend
+once, and the server refuses that resend as replaced. The server adopts a start
+it already committed instead of creating a second run. When the extension cannot
+confirm the start, its error names the run ID; check `/workflow status` before
+you start the workflow again. A headless start (`executionMode: "headless"`)
+needs no Pi session and carries no session authority. Verification scripts and
+tests never use the live server or its configuration: they use a scratch
+database or a scratch `HOME`, each with a scratch `PI_WORKFLOWS_CONFIG_DIR` so
+the server cannot load the real decision channels and credentials; see
+[Verification scripts](DEVELOPMENT.md#verification-scripts).
+
 Resume uses the run's original source and graph, including ordinary workflows
 without included workflows. Source and graph checks run before any durable
 mutation. `WorkflowEngine.resumeRun` has no `force` option. Restore the original
@@ -152,11 +183,22 @@ control the same user-level server for all projects:
 pi-workflows server start
 pi-workflows server status
 pi-workflows server stop
-pi-workflows server run
+pi-workflows server run [-- <extra pi args>]
 ```
 
 `server run` stays attached. The other commands start, inspect, or stop the
 on-demand process. No command installs an operating-system service.
+
+`server run -- <args>` adds Pi arguments to every headless Pi child. To use a
+provider that only a user extension registers, name that extension by its
+absolute path: `pi-workflows server run -- -e /abs/path/provider-ext.ts
+--provider <provider> --model <model>`. The whole extension then loads into
+every headless agent step and agent group host process, for every run and
+project. It must not be the pi-workflows extension, and `server run` rejects a
+relative extension path. A server started any other way gets no extra Pi
+arguments; list the extension in [headless extensions](#headless-extensions)
+instead. See
+[Extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments) for every caveat.
 
 The extension, CLI, and `piw` use the same version-1 client protocol over a Unix socket or Windows named pipe. The server sends byte-bounded run-list and run-view pages. Clients collect a complete run list for one revision and reject stale run pages whose cursor or revision no longer matches. A run view's `revision` is the presentation cursor; `runRevision` is the execution resource revision used by restart and other exact execution commands. The server reads only the selected history ranges and reuses an unchanged subscribed view after a lightweight revision check. It waits for a slow socket to drain and removes every subscription when its client unsubscribes. Large values stay available through verified content chunks. Server-generated aggregate values are saved and linked to the run before the server advertises them.
 
@@ -191,6 +233,17 @@ kind with different display reasons. A terminal workflow message becomes
 eligible only after the terminal outcome is committed. A resource manager child
 without an origin session can use a supervised headless `pi --mode rpc` child
 for structured agent steps.
+
+Every headless Pi child runs the pi and Node that the server pinned when it
+started; it never looks `pi` up on `PATH`. A server that a Pi session starts
+pins that session's own pi. A server that the CLI or `piw` starts resolves `pi`
+on its own `PATH` once. The pin stays until the server restarts, and
+`pi-workflows server status` reports it as `headlessPi`. See
+[Headless Pi command](WORKFLOW_SERVER.md#headless-pi-command).
+
+A headless agent step fails before any model request when its Pi child cannot use the default
+model from Pi settings, or when no usable model matches its model scope. See
+[Headless step model](#headless-step-model).
 
 Pause stops the runner and parks at the last durable boundary. Resume takes a
 new generation. Cancellation can stop a live runner or atomically claim and
@@ -435,6 +488,10 @@ action({
   },
 });
 ```
+
+If the attempt times out or is cancelled before the action marks a track
+finished, the runtime settles that track. See
+[Progress of timed-out and cancelled attempts](#progress-of-timed-out-and-cancelled-attempts).
 
 A shell action can parse complete lines from stdout or stderr and return one
 or more updates through `updates.parseLine`. Parsing applies backpressure and
@@ -784,7 +841,7 @@ Autoimplement uses batches for pi-reviewer and pending CI watches. It keeps mode
 
 Autoimplement inspects every pull request or merge request before it waits for CI. On GitHub, it accepts only supported pending `gh pr checks --watch` or `gh run watch` descriptors and binds each one to the validated pull request as `gh pr checks <PR URL> --watch`. On GitLab, it accepts only `glab ci status` watches and binds each one to the published source branch and the merge request's project, as [Autoimplement forge selection](#autoimplement-forge-selection) describes. Repository and pull-request overrides are rejected. One watch lasts at most five minutes. A failed or timed-out watch affects only its own pull request or merge request. When checks remain pending, the model runs more useful local tests before checking CI again. Autoimplement does not invent an ETA.
 
-The action abort signal stops active command process groups and prevents queued commands from starting. Accepted outputs use immutable events and content-addressed blobs. An interrupted unaccepted batch runs again because batch commands are read-only or isolated local checks. Progress updates contain metadata only and never control routing. Truncated reviewer or CI output cannot count as clean. See [Run independent commands in bounded batches](plans/2026-08-20-bounded-command-batches-plan.md) for the complete contract and implementation plan.
+A failed batch item's `error` states only its exit status or signal, such as `Command failed: exit 3; its output is in the item's stdout and stderr`. It does not repeat the command's output, which the item keeps in `stdout` and `stderr`, complete up to the item's `maxOutputChars` and marked by the truncation flags. The Autoimplement decide prompt still sees a failed verification check's stderr, through the change-verification evidence view that [Agent prompt budget](#agent-prompt-budget) describes. A timeout, cancellation, or spawn failure keeps its complete error text. The action abort signal stops active command process groups and prevents queued commands from starting. Accepted outputs use immutable events and content-addressed blobs. An interrupted unaccepted batch runs again because batch commands are read-only or isolated local checks. Progress updates contain metadata only and never control routing. Truncated reviewer or CI output cannot count as clean. See [Run independent commands in bounded batches](plans/2026-08-20-bounded-command-batches-plan.md) for the complete contract and implementation plan.
 
 A branch blocker does not end Autoimplement by itself. The controller can repair, retry, redesign, move to another safe branch, or return blocked. A blocked decision requires current evidence and at least one checked alternative. The loop permits at most 40 accepted decisions and removes a route after three consecutive returns with the same stable facts. Changed evidence resets that route count. If the controller itself fails or times out three times without an accepted decision, Autoimplement returns a normal blocked result. These limits prevent blind retries while allowing real progress.
 
@@ -916,29 +973,89 @@ The workflow collects pull request intent and repository diff evidence before mo
 
 Sanity Check creates child sessions directly through the documented Pi SDK. A private built-in runner uses `createAgentSession` with `SessionManager.inMemory`, one independent context per child, and only the verified built-in `read`, `grep`, `find`, and `ls` tools. Child sessions load no skills, prompt templates, themes, or context files. They create no Pi session file.
 
-Revision 7 runs that SDK work in a headless Pi process. The `review` and `verify` actions execute in the plain Node workflow runner, which cannot load the packages that Pi supplies to extensions (see [Host-provided Pi packages](#host-provided-pi-packages)). For each agent group, the runner starts `pi --mode rpc --no-session --no-extensions -e <agent-group-bridge>` with the same `pi` command, server-supplied Pi arguments, environment, process group, and server process registration as a headless agent step. Pi loads the bridge extension with its own module mapping. The runner sends the group as the argument of one bridge command in an RPC `prompt`, which Pi handles without a model turn. The bridge reports lifecycle facts and the final result or error on stderr lines tagged with a random group ID; the runner ignores other output. The runner fails the group if Pi rejects the command or routes it anywhere except the bridge.
+Revision 7 runs that SDK work in a headless Pi process. The `review` and `verify` actions execute in the plain Node workflow runner, which cannot load the packages that Pi supplies to extensions (see [Host-provided Pi packages](#host-provided-pi-packages)). For each agent group, the runner starts `pi --mode rpc --no-session --no-extensions -e <agent-group-bridge>` with the same [pinned pi](WORKFLOW_SERVER.md#headless-pi-command), server-supplied Pi arguments, environment, process group, and server process registration as a headless agent step. Pi loads the bridge extension with its own module mapping. The runner sends the group as the argument of one bridge command in an RPC `prompt`, which Pi handles without a model turn. The bridge reports lifecycle facts and the final result or error on stderr lines tagged with a random group ID; the runner ignores other output. The runner fails the group if Pi rejects the command or routes it anywhere except the bridge.
 
-Cancellation and action timeouts send a cancel command. The bridge aborts each session, disposes its runtime, which runs provider extension shutdown, and reports each session's final state. The runner waits up to 10 seconds for that settlement. Sessions settle concurrently, and the real-Pi end-to-end test settles in under one second, so the bound leaves room for an extension that closes network clients or saves refreshed credentials. A started session that the bridge has not confirmed by then is reported `cancelled` with the phase `cancelled: headless pi did not report that the session settled`, and queued work that never started is reported `cancelled` with the phase `cancelled: the session did not start`. The runner then stops the Pi process group with `SIGTERM` and, after the one-second stop grace, `SIGKILL`. Pi's own shutdown also settles open sessions while it runs. The 10-second wait applies only while the runner keeps running. When the run itself ends or the runner stops, the runner stops each Pi process group at once with the same one-second grace, and settlement relies on the bridge's `session_shutdown` handler during Pi's shutdown. Once the runner settles a group, it ignores later bridge events, so each request has exactly one terminal state and a reported state never changes. Late events are ignored; when the group's stderr log is kept (failures where pi could not run the group), they remain in it. When a timeout or cancellation has already ended the action attempt, the engine accepts no more progress updates for it. The durable tracks then keep the last state recorded before the attempt ended, and the node status records the timeout or cancellation. Follow-up: settling these tracks needs the engine to finalize progress for aborted attempts, because `WorkflowEngine.publishUpdate` rejects updates once the attempt signal aborts (`src/workflows/engine.ts:168-177`) and the engine stops waiting for an aborted action (`src/workflows/engine.ts:1046`).
+Cancellation and action timeouts send a cancel command. The bridge aborts each session, disposes its runtime, which runs provider extension shutdown, and reports each session's final state. The runner waits up to 10 seconds for that settlement. Sessions settle concurrently, and the real-Pi end-to-end test settles in under one second, so the bound leaves room for an extension that closes network clients or saves refreshed credentials. A started session that the bridge has not confirmed by then is reported `cancelled` with the phase `cancelled: headless pi did not report that the session settled`, and queued work that never started is reported `cancelled` with the phase `cancelled: the session did not start`. The runner then stops the Pi process group with `SIGTERM` and, after the one-second stop grace, `SIGKILL`. Pi's own shutdown also settles open sessions while it runs. The 10-second wait applies only while the runner keeps running. When the run itself ends or the runner stops, the runner stops each Pi process group at once with the same one-second grace, and settlement relies on the bridge's `session_shutdown` handler during Pi's shutdown. Once the runner settles a group, it ignores later bridge events, so each request has exactly one terminal state and a reported state never changes. Late events are ignored; when the group's stderr log is kept (failures where pi could not run the group), they remain in it. When a timeout or cancellation has already ended the action attempt, the engine accepts no more progress updates for it, so these late events never reach durable state. The runtime settles the open tracks instead, as [Progress of timed-out and cancelled attempts](#progress-of-timed-out-and-cancelled-attempts) describes: after a timeout, every review or verification track that has not finished shows `failed` with the phase `timed out`, and after a cancellation it shows `cancelled`. Tracks that already finished keep their final state.
 
-If `pi` cannot start, exits before its bridge loads, or exits before the group finishes, the action fails with that cause. Started sessions without a final state are first reported `failed`, and queued ones `cancelled`, so no track stays running. The same applies when Pi rejects the bridge command or the bridge returns without a result. After Pi reports that the bridge command returned, the runner allows five seconds of stderr silence for the final event, and each stderr chunk restarts that wait so a large result in transit still arrives. The failure names a private log file that holds Pi's complete stderr and, when Pi rejects or misroutes the bridge command, Pi's complete RPC response. The error message bounds any text that Pi supplied, then names the full log path after it, so every such failure points to the complete diagnostics. Pi's stderr can contain provider extension output, so Pi Workflows neither copies it into workflow state nor quotes it in the error. The runner deletes the file when the group succeeds, is cancelled, or fails with an error that the bridge reported. A kept log stays at `$TMPDIR/pi-workflows-<runId>-agent-group-XXXXXX/pi-stderr.log` (`0700` directory, `0600` file) until the operator deletes it. A runner that is stopped with `SIGKILL` during a group can also leave its directory behind. Follow-up: Pi Workflows does not prune kept logs (`src/server/agent-group-diagnostics.ts:24`). The action's manual effect never repeats automatically, and the post-workflow model turn can inspect the failure and read the log.
+If the [pinned pi](WORKFLOW_SERVER.md#headless-pi-command) is unavailable, the action fails before any session starts, with the reason and the restart that pins pi again. If `pi` cannot start, exits before its bridge loads, or exits before the group finishes, the action fails with that cause. Started sessions without a final state are first reported `failed`, and queued ones `cancelled`, so no track stays running. The same applies when Pi rejects the bridge command or the bridge returns without a result. After Pi reports that the bridge command returned, the runner allows five seconds of stderr silence for the final event, and each stderr chunk restarts that wait so a large result in transit still arrives. Such a failure keeps a private log file that holds Pi's complete stderr and, when Pi rejects or misroutes the bridge command, Pi's complete RPC response, beside the group's cause file. The error message quotes no text that Pi supplied and names both files in full, as [Agent group errors](#agent-group-errors) describes. Pi's stderr can contain provider extension output, so Pi Workflows neither copies it into workflow state nor quotes it in the error. The runner deletes the log when the group succeeds, is cancelled, or fails with an error that the bridge reported. A kept log stays at `$TMPDIR/pi-workflows-<runId>-agent-group-XXXXXX/pi-stderr.log` (`0700` directory, `0600` file) for seven days. A runner that is stopped with `SIGKILL` during a group can also leave its directory behind. The action's manual effect never repeats automatically, and the post-workflow model turn can inspect the failure and read both files.
 
-The child runner resolves enabled user extension paths, excludes Pi Workflows and project extensions by default, and preflights the remaining paths without creating a session. It admits only the extension that registers the exact configured provider, plus any behavior extension on an explicit private allowlist. It rejects competing provider owners, workflow tools or commands, and extensions that replace a built-in read-only tool. The admitted paths are frozen for the group, and each child loads only those explicit paths without a second discovery pass.
+Kept and left-behind diagnostics directories, with their stderr logs and cause files, are pruned after seven days. Before a workflow runner starts its first agent group, it deletes each such directory in the same temporary directory when neither the directory nor any file in it has changed for seven days. It deletes only a directory with that name pattern that is not a symbolic link, belongs to the current user, has mode `0700`, and holds nothing except a `pi-stderr.log` and a `cause.txt`, each optional and each a regular file that belongs to the current user and has mode `0600`. It removes those files and then the empty directory, so it never deletes recursively or through a symbolic link, and it leaves every other entry in place. A running group's output keeps its log current, and Sanity Check's agent group actions time out after 20 minutes, so pruning does not remove the log of a group in progress. A pruning failure is written to the runner's stderr and never fails the group. Seven days leaves time to read a failure after a weekend or a paused run. The retention period is fixed; there is no setting.
 
-Each child owns a separate `ModelRuntime`, provider instance, extension runtime, resource loader, and in-memory session. The runner loads validated model and ordinary credential snapshots into per-child in-memory stores without writing them back. A provider extension uses its existing provider-owned credential store in place; Pi Workflows does not copy, print, migrate, or persist those credentials.
+The child runner resolves enabled user extension paths, excludes Pi Workflows and project extensions by default, and preflights the remaining paths without creating a session. It admits only the extension that registers the exact configured provider, plus any behavior extension on an explicit private allowlist. When no extension registers that provider, the provider must be one that Pi defines itself: a provider built into Pi or one configured in `models.json`. Children then load no provider extension and use Pi's own provider, as normal Pi does. A provider that neither an extension nor Pi defines fails the group with `has unknown provider` before any session starts. The runner rejects competing provider owners, workflow tools or commands, and extensions that replace a built-in read-only tool. The admitted paths are frozen for the group, and each child loads only those explicit paths without a second discovery pass. The preflight loads every enabled user extension, so a user extension that fails to load fails the group with `could not load provider extensions`. This also happens when the dispatch provider is one of Pi's own and no extension would be admitted.
 
-Follow-up: an agent group accepts only a provider that a user extension registers, and it needs that provider's entry in `<agentDir>/models-store.json`. Pi writes that entry only after an online model-catalog refresh, so groups fail with `PI_OFFLINE=1` and with built-in providers. This predates revision 7 (`src/builtins/pi-agent-group.ts` at 2cb8ab3: user-scope candidates at line 477, the extension-registered owner check at lines 521-532, and the `models-store.json` snapshot at lines 298 and 400-404).
+Each child owns a separate `ModelRuntime`, provider instance, extension runtime, resource loader, and in-memory session. The runner loads the dispatch provider's validated cached catalog entry and its ordinary stored credential into per-child in-memory stores. Children receive no other provider's stored credential, and a child's store never changes: it rejects every write, so a child cannot refresh, replace, or remove a credential. A provider extension that keeps credentials in its own store uses that store in place; Pi Workflows does not copy, print, migrate, or persist those credentials. Each child's model runtime skips its create-time refresh and refreshes once, offline, after Pi registers the admitted extension. Like normal Pi startup, that pass checks every provider's availability, but other providers can find only ambient authentication such as environment variables, and the pass never refreshes an OAuth token.
 
-A complete explicit provider, model, and thinking override wins. Otherwise, the runner uses the configured process defaults. It passes the exact cached model and thinking level to the child, then verifies the actual provider, model, thinking level, authentication, extension state, active tools, and tool sources before prompting. A missing or different dispatch is terminal. The runner never silently falls back to OpenRouter, Kimi, a local model, or another provider or model. It does not promise to inherit a model selected temporarily in the origin Pi TUI.
+The server's [extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments) reach the group's host process, but its `--provider` and `--model` do not select the group's model, and a provider extension that they load is not admitted to child sessions.
+
+Each child resolves the exact model the way Pi does, without network access. The sources are Pi's bundled catalog, the provider's cached entry in `<agentDir>/models-store.json`, `models.json`, and the admitted provider extension. Only a physical chat model qualifies, so a virtual model cannot route the session to another model. The cached entry is optional, because Pi writes it only after an online catalog refresh. A group therefore runs before any refresh and with `PI_OFFLINE=1` when its model is built into Pi, declared by `models.json` or the provider extension, or already cached. As in normal Pi, `models.json` overrides, such as a provider `baseUrl`, headers, or `modelOverrides`, apply to the provider's models, including the models of an extension-owned provider, so they can change where Sanity Check requests go. A model that no source lists fails the agent with `has no model` before prompting. Built-in providers authenticate as in normal Pi, from the ordinary credential snapshot, a `models.json` key, or the provider's environment variable. A provider without usable authentication fails the agent with `has no provider authentication` before prompting.
+
+A stored OAuth credential of the dispatch provider is refreshed at most once per agent group, before any child session starts, and never inside a child, as [OAuth credentials in agent groups](#oauth-credentials-in-agent-groups) describes.
+
+A complete explicit provider, model, and thinking override wins. Otherwise, the runner uses the configured process defaults. It passes the exact resolved model and thinking level to the child session, then verifies the actual provider, model, thinking level, authentication, extension state, active tools, and tool sources before prompting. A missing or different dispatch is terminal. The runner never silently falls back to OpenRouter, Kimi, a local model, or another provider or model. It does not promise to inherit a model selected temporarily in the origin Pi TUI.
 
 Children do not receive the `workflow` tool, workflow commands, parent run identifiers, update channels, or workflow callbacks. Prompts that invoke extension slash commands are rejected. The parent Sanity Check action remains the only workflow owner. These controls block normal child model and extension bindings from inspecting or changing workflow state. Extensions still run as trusted code in the headless Pi process that runs the group, so this is not an OS sandbox against direct filesystem or network access.
 
-Only bounded final assistant text and safe operational facts leave a live child session. Pi Workflows does not persist child prompts, reasoning, intermediate messages, tool arguments, tool results, message history, credentials, or extension-private state. Timeout and cancellation abort active work and settle each session, within the bounded wait described above, before its runtime is disposed, its extensions shut down, and its provider resources released. An agent error reports at most 2,000 characters of cause text, because only bounded safe operational facts leave a child session. Follow-up: this cap (`MAX_ERROR_CHARS` in `src/builtins/pi-agent-launch.ts:59`, moved from `src/builtins/pi-agent-group.ts:30` at 2cb8ab3) comes from that privacy contract, not from a named external interface, so it should be revisited as a product decision. `PiAgentGroupError.detail` keeps the complete cause in memory.
+Only bounded final assistant text and safe operational facts leave a live child session. Pi Workflows does not persist child prompts, reasoning, intermediate messages, tool arguments, tool results, message history, credentials, or extension-private state. No credential, including one that Pi refreshed for the group, enters workflow state, traces, errors, logs, or cause files; Pi itself saves a refreshed credential in `auth.json`. Timeout and cancellation abort active work and settle each session, within the bounded wait described above, before its runtime is disposed, its extensions shut down, and its provider resources released. An agent error never quotes text from a provider, the Pi SDK, or Pi: its message holds only the error code and safe operational facts, and the complete cause stays in a private file, as [Agent group errors](#agent-group-errors) describes.
 
-The workflow publishes aggregate and per-agent `pi-workflows.progress.v1` tracks under `agents/review/*` and `agents/verification/*`. Progress contains role, the verified actual model when known, state, elapsed facts, and safe phases such as `thinking` or `tool: read`. The Pi widget shows the aggregate plus failed and active children within its ten-line limit. `piw` shows every durable child track and its samples. Both views use existing progress records, so no child workflow run or new persisted schema is needed.
+The workflow publishes aggregate and per-agent `pi-workflows.progress.v1` tracks under `agents/review/*` and `agents/verification/*`. Progress contains role, the verified actual model when known, state, elapsed facts, and safe phases such as `thinking` or `tool: read`. A track's label is its role followed by `·` and the model. The `pi-workflows.progress.v1` schema accepts a label of at most 200 characters, as [Workflow updates](WORKFLOW_UPDATES.md#progress-update-type) specifies and `validateProgressData` enforces. A longer label, which only a long provider or model ID produces, therefore ends with `…` within 200 characters, and a `sanity-check.agent-label` update under the same key keeps the complete label. The Pi widget shows the aggregate plus failed and active children within its ten-line limit. `piw` shows every durable child track and its samples. Both views use the progress records, so no child workflow run is needed.
 
 Serial mode still uses two child sessions, and parallel mode still uses five. Review prompts, review areas, strict result validation, verdicts, and progress stay unchanged. After verification, an assistant-message agent shows the full bounded report verbatim. A mismatch stops before summary generation. The graph then includes `plain-summary`, which shows a short plain-language explanation with the verdict and the most important next action. The detailed response always settles before the summary starts. A final compute node returns the original strict result, so presentation cannot change the verdict. Sanity Check creates no extra terminal model turn.
 
 Each child session is an SDK session inside the headless Pi process that runs its group, not a separate `pi` CLI run. Only the transport between the workflow runner and that process uses an RPC command and JSON events on stderr. Child sessions use no temporary prompt file, standard-output cap, subprocess fallback, shared child runtime, or blanket child-extension ban. See [the Sanity Check plan](plans/2026-08-21-sanity-check-plan.md) for the selected implementation and test boundaries.
+
+#### OAuth credentials in agent groups
+
+A stored OAuth credential of the dispatch provider is refreshed at most once per agent group, before any child session starts, and never inside a child. This covers providers built into Pi or configured in `models.json`, a Pi provider that an admitted extension re-registers, and a provider that only an extension defines, including a legacy provider extension's `oauth` login. All of them keep the credential in `auth.json`, and Pi refreshes it through the provider's OAuth refresh, which an extension can supply. An API key from `auth.json`, `models.json`, or the provider's environment variable needs no refresh and is used as before.
+
+The group first computes how long a child can still make a model request. Each request runs in one of `maxConcurrency` slots and stops at its own `timeoutMs`, so the group's run bound is `ceil(requests / slots) × the longest timeoutMs`. Sanity Check runs one request per slot with a 20-minute timeout, the same as its action timeout, so its bound is 20 minutes. The group adds a 10-minute margin. Five minutes of it cover Pi's own refresh threshold, because Pi refreshes a token in a model request when it expires within five minutes. The other five cover session abort and disposal after a timeout, slot scheduling, and timer delays. A Sanity Check credential must therefore stay valid for 30 more minutes.
+
+Limitation: a Sanity Check agent group cannot use an OAuth credential that is valid for less than about 30 minutes after its single pre-refresh. The group then fails closed before any session starts, with `has OAuth credentials that expire too soon`. The 30 minutes are the 20-minute Sanity Check run bound, Pi's fixed 5-minute refresh threshold, and the 5-minute slack. The threshold cannot be lowered for the children through Pi 1.1.0's public SDK. pi-ai computes it as `Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0)` with a 5-minute default (`auth/resolve.js:46` and `:101`), so a per-call `minOAuthValidityMs` override can only raise it, and a session's own model requests pass none (`ModelRuntime.prepareRequest`, `model-runtime.js:447-455`). A provider whose refreshed tokens last less than that, possibly GitHub Copilot, therefore cannot run an agent group on its OAuth credential; an API key for the provider still works. The figure of about 25 minutes for a GitHub Copilot token is not verified. Lifting the limitation needs a public per-runtime threshold in Pi that may go below five minutes.
+
+When the stored credential expires within that time, the group refreshes it once, in a refresh process of its own. The headless Pi process that runs the group starts that process with the same Node and Pi installation, detached into its own session and process group, and registers it with no supervisor. The refresh process uses only Pi's public SDK. It imports the Pi package's public entry, the module that the package manifest names as `exports["."]` (its `import` condition, else `default`), from the Pi installation that `getPackageDir()` reports. It creates a `ModelRuntime` with `authPath: <agentDir>/auth.json` and no credential store of its own, so the runtime uses Pi's file-backed credential store for that file. It registers the same admitted extensions as the children through `createAgentSessionServices`, and calls `getAuth(provider, { minOAuthValidityMs })` with that minimum validity and no abort signal. Pi takes the file lock, checks again under the lock, skips the refresh when another Pi process already refreshed, and writes the result itself, exactly as in a Pi session. Pi Workflows never writes credentials and imports no file inside the Pi package other than its public entry. The refresh process reports only an exit status, so no credential and no error text leaves it.
+
+No stop that Pi Workflows issues reaches the refresh process: not the agent group launcher, the workflow runner, or the workflow server. Stopping a group stops its headless Pi process: a cancellation or an action timeout sends the bridge a cancel and, after the 10-second settle wait, `SIGTERM` and then `SIGKILL` after the one-second grace; the end of a run and a stopping workflow runner use the same grace; the workflow server stops a runner with `SIGTERM` and `SIGKILL` after two seconds and then kills every headless Pi process that the runner registered; and a stopping server, like a starting server that finds the processes an older server registered, kills every registered process. Each of these signals a process or process group that the refresh process is not part of, so it keeps running and Pi saves the rotated credential. A stop from outside Pi Workflows can still interrupt it, as it would interrupt normal Pi: a cgroup or container stop, such as systemd stopping the user session or `docker stop`, an explicit `SIGKILL`, the out-of-memory killer, or a reboot. A cancelled group starts no refresh, but a cancellation that arrives after the refresh process has started does not prevent the refresh. When the group runs in headless Pi, as in Sanity Check, the workflow runner reports the cancellation or action timeout after its usual settle wait and stops the headless Pi process; the refresh process finishes on its own, and Pi saves the credential. The group itself waits up to three minutes for the refresh to finish before it reports the cancellation or timeout, but only while the process that runs the group is still running.
+
+The refresh process ignores `SIGTERM`, `SIGINT`, and `SIGHUP` once it has called Pi's authentication, and exits on its own. It exits within 60 seconds when it has not called Pi's authentication by then, for example because an extension is stuck loading; that deadline also covers any lock wait while Pi registers the admitted extensions. Pi's public SDK offers no hook at the moment a refresh starts, so the ceiling starts when the process calls `getAuth`, and it covers Pi's wait for the `auth.json` lock as well as the refresh. Pi can wait for that lock twice, up to 30 seconds each: once to read the credential when `auth.json` changed since the runtime loaded it, and once to update it. It normally returns within those two lock waits plus its 15-second refresh timeout, which a provider's refresh receives as its abort signal. A provider refresh that ignores that signal could otherwise run forever while Pi holds the `auth.json` lock, so the refresh process also exits 5 minutes after it called `getAuth`, even with the refresh still in flight. That ceiling is well past Pi's own bounds and the group's three-minute wait. The group waits three minutes for the refresh process because its longest normal run is the 60-second start deadline, Pi's two 30-second lock waits, and Pi's 15-second refresh timeout, 135 seconds, and three minutes adds a 45-second margin for starting Node and Pi under load. A refresh process that takes longer is stuck; the group then stops waiting and fails closed, and the process still ends at its own ceiling. Tests can shorten it only with an explicit test switch; without the switch, the group never passes a test ceiling to the refresh process, and the refresh process never uses a ceiling below 90 seconds: Pi's two lock waits plus its refresh timeout, 75 seconds, with a margin. Exiting releases Pi's lock. A refresh that the ceiling ends can lose a token that the provider rotated after that long, and the group then reports `could not run the OAuth refresh process`.
+
+While it runs, the refresh process keeps a marker, `<pid>.json` (mode `0600`) in `${PI_WORKFLOWS_CONFIG_DIR:-~/.config/pi-workflows}/oauth-refresh/` (mode `0700`), with its process ID, the provider ID, and its start time, and no credential data. It writes the marker under a pending `<pid>.json.tmp` name and renames it into place, so no other process sees it half-written, and it removes the marker when it exits. The marker directory must be a private, writable directory of the user, not a symbolic link: without a marker the refresh process does not refresh, and the group fails as `cannot record the OAuth refresh process`. Reading and pruning the markers skip any other directory and touch only `<pid>.json` files and pending markers older than ten seconds. `pi-workflows server status` lists the markers as `oauthRefreshes`, each with `running: false` once its process is gone or older than any refresh process lives. A marker stays behind only when the process was killed, and the next refresh removes stale markers before it starts. The refresh process needs the Node build of Pi, whose package manifest names its public entry, and a package build of Pi Workflows runs its compiled entry. A source checkout runs the TypeScript source through tsx, a dependency of the package, so it needs no Node type stripping.
+
+The group then reads the stored credential again with Pi's public `readStoredCredential(provider, <agentDir>/auth.json)`, checks its shape, and every child receives that one credential. Pi 1.1.0 exports no locked credential read: its file-backed credential store is internal, and Pi's changelog for 0.80.8 points SDK users to `ModelRuntime` and `readStoredCredential` instead. So this read takes no lock. It reads the whole file at once, and Pi writes `auth.json` only under its lock, so a read that meets a write in progress does not parse and returns nothing, and the group fails closed. `readStoredCredential` also returns nothing for a missing file or any read error, so a lock or IO problem on this read reports as `could not refresh OAuth credentials` and its advice to sign in again. The group never switches to another kind of authentication on its own: when the entry is gone, unreadable, of another shape, or no longer an OAuth credential after the refresh, the group fails as `could not refresh OAuth credentials`, even when an environment variable or `models.json` would provide an API key.
+
+The group fails before any session starts, with no lifecycle event and no model request, when:
+
+- Pi reports that the refresh failed, Pi's authentication returns but leaves the stored credential unchanged, or no readable OAuth credential is left: `Pi agent group could not refresh OAuth credentials: <provider>; sign in to the provider again in Pi, or configure an API key for it`;
+- the refresh process fails before Pi could refresh and leaves the stored credential unchanged: it cannot be started, cannot load Pi or the admitted extensions, crashes, does not start the refresh within 60 seconds, runs into its ceiling, or does not exit while the group waits: `Pi agent group could not run the OAuth refresh process: <provider>; the process could not start, could not load Pi or the admitted extensions, or did not finish in time; retry the agent group`;
+- the refreshed credential still expires within the required time: `Pi agent group has OAuth credentials that expire too soon: <provider>; the refreshed credentials expire before the agent group can finish, which can take <minutes> minutes`;
+- Pi cannot lock, read, or write `auth.json`, which Pi reports with its `auth` error code: `Pi agent group could not lock or update Pi credentials: <provider>; another Pi process may be holding auth.json, or Pi could not write it; retry the agent group`;
+- the Pi package's manifest names no public entry, the entry cannot be loaded, or its API differs, as with a compiled Pi binary: `Pi agent group cannot refresh OAuth credentials: <provider>; this Pi installation does not provide the modules that agent groups use to refresh OAuth credentials; use Pi's Node package, or configure an API key for the provider`;
+- the refresh process cannot write its marker: `Pi agent group cannot record the OAuth refresh process: <provider>; make <config dir>/oauth-refresh a private directory of this user`;
+- neither the compiled refresh entry nor tsx for its source is available: `Pi agent group cannot refresh OAuth credentials: <provider>; this Pi or Node installation cannot run the OAuth refresh process; configure an API key for the provider`.
+
+A refresh error can quote the provider's token response, so Pi Workflows keeps its text nowhere: not in the message, the private cause file, workflow state, or traces. The messages name only the provider and the required minutes.
+
+A child never refreshes through Pi. Its credential store rejects every write before Pi's refresh runs, so Pi cannot send the refresh token from a child. A child that would still need a refresh, for example because the clock moved past the window, fails with `Pi agent <id> would need to refresh OAuth credentials mid-group: <provider>; an agent group refreshes OAuth credentials only once, before it starts`. The children of one group therefore never refresh in parallel through Pi, and none of them races the parent Pi's locked credential file. The guarantee covers Pi's refresh path. An admitted provider extension receives the stored credential, including its refresh token, for example in a legacy `oauth` login's `getApiKey`, and it can use it on its own; such an extension is trusted code, exactly as in normal Pi.
+
+#### Agent group errors
+
+A failed agent group fails its Sanity Check `review` or `verify` action with one `PiAgentGroupError`. Its message reaches run state, the trace, `piw`, the Pi widget, and the post-workflow model turn, so it holds only text that Pi Workflows writes itself:
+
+```text
+Pi agent <agent id> <code>: <facts>. complete cause: <directory>/cause.txt
+```
+
+- `<agent id>` is the request ID, such as `review`, `security`, or `verification`, or `group` for the group as a whole.
+- `<code>` names what failed, for example `stopped with error`, `timed out`, `cancelled`, `failed`, `cleanup failed`, `has an invalid request`, `has no default model`, `has no model`, `has no provider authentication`, or `could not run`.
+- `<facts>` are safe operational facts: fixed text such as `the provider reported an error`, `the session raised an error`, `the session abort failed`, or `pi rejected the agent group command`, Pi Workflows' own validation text such as `Duplicate Pi agent id: review`, and IDs, durations, counts, exit statuses, extension sources, and provider and model IDs.
+
+Text that a provider, the Pi SDK, Pi, or the operating system wrote is private detail and never enters the message. That covers a provider's `errorMessage`, a thrown SDK error, the error of a failed session abort or disposal, Pi's RPC rejection, and a spawn error. Pi Workflows reports its own validation of the requests as `has an invalid request` with that validation text as the facts, so it stays visible. Its own loader failures stay visible too, for example `Pi agent group failed: Could not load Pi credentials for isolated agents`, `Could not load Pi model catalog for isolated agents`, or `Could not resolve Pi child extension path`. The underlying filesystem or parser error is private detail. A parse error of `auth.json` is kept nowhere, because it can quote a credential. Any other error, such as a settings, package manager, or extension failure while the group is prepared, becomes `Pi agent group failed: the agent group raised an error`, and all of its text is private detail. The group runner normalizes every error at its boundary, and the bridge keeps facts only for an instance of the group runner's own error class. It never recognizes an agent error by its name or fields, so a foreign error that copies them stays private too. Pi Workflows shortens neither the message nor the detail.
+
+The workflow runner writes the complete cause to `cause.txt` in the group's private diagnostics directory, `$TMPDIR/pi-workflows-<runId>-agent-group-XXXXXX/`, beside `pi-stderr.log`. The directory has mode `0700` and the file mode `0600`. The file holds `Pi agent <agent id> <code>: <facts>` and, when the error has private detail, a blank line and the complete detail. Every failure of a group that the runner started in headless pi keeps its cause file. A failure that the bridge reported keeps only `cause.txt`. A failure where pi could not run the group also keeps `pi-stderr.log`, which its message names after the cause file, followed by the launch hint:
+
+```text
+Pi agent group could not run: pi rejected the agent group command. complete cause: <directory>/cause.txt; complete pi stderr: <directory>/pi-stderr.log. The workflow runner starts agent groups with the same pinned pi, …
+```
+
+If the runner cannot write the cause file, the message says `complete cause was not saved: <reason>` in place of the path and still quotes no private detail. A cancelled group keeps no file, because its reason comes from the workflow runner. Errors that the runner raises before it starts pi, such as an unavailable pinned pi or a missing bridge, contain only Pi Workflows' text, so their message is their complete cause. When starting pi itself fails, for example because the server refuses to supervise the child, the group fails with `could not run: headless pi could not be started`, and the underlying text is private detail. A lost run claim keeps its own error, because the engine stops on it. If stopping pi or removing diagnostics fails after a group ends, the runner writes that to its stderr, and the group keeps its result or error. Kept directories are pruned after seven days, as described above. The post-workflow model turn receives the message, so it can read the named files to explain the failure.
 
 ### Built-in monitor
 
@@ -1077,12 +1194,26 @@ observation nests a result two levels deeper than a ledger entry does.
 The change-verification view keeps the route, the reason, the prepared workspace, the findings, and
 the fingerprints, and it names each verification command by its id, outcome, exit code, duration, and
 log size. The view drops the log text only, because the durable result keeps it and
-`outputReferences` names it.
+`outputReferences` names it. A failed command is the exception: it also keeps its `stderr` and its
+`outputRef`, such as `candidate:unit`, because its `error` states only the exit status, so the
+stderr is the evidence that explains the failure. A stderr longer than `EVIDENCE_TEXT_CHARS` becomes
+a reference with a head and tail excerpt, its character count, and a digest, under the same prompt
+budget as any other evidence, and the complete stderr stays in the durable result. Successful,
+timed-out, and cancelled commands keep no log text.
 
 Projection shapes a prompt only. `state.steps[].output` keeps every complete result and
 `state.steps[].prompt` keeps every complete prompt, so a recorded run stays readable and resumable.
 The autoimplement decide prompt projects its observation and its recent-attempt list, and then
-measures the assembled prompt. When the projected evidence still does not fit, the oldest ledger
+measures the assembled prompt. When the projected evidence still does not fit, failed-check stderr
+gives way first: `shedFields` removes the `stderr` of failed change-verification checks from the
+observation and the recent-attempt list, largest first, until the prompt fits. Each such check keeps
+`stderrChars`, the size of its stderr, and `outputRef`, which names its complete logs in the durable
+result, so nothing becomes unreachable. Many failed checks with long stderr therefore cost the prompt
+their stderr text, not the route, the reason, the findings, the fingerprints, or the per-command
+metadata. An Autodoc result carries its verification twice, in `documentation.evidence` and
+`verification`, and the prompt keeps both copies: once the stderr has given way, a second copy costs
+only its metadata, and a decide prompt for the most failing checks that a batch allows, failing on
+the base too, still fits with both copies. If the evidence still does not fit, the oldest ledger
 entries collapse to references, and then the largest observation field collapses to one. The order is
 fixed, so the prompt keeps the newest results and the small decisive fields, such as the available
 routes, for as long as it can. `boundLedger` and `boundEvidence` do that work. An overflow that
@@ -1139,8 +1270,9 @@ resume` takes a new generation and reruns only work after the last durable
 - A start is committed as `queued` with its final run ID before the command
   reports success. Cancellation can use that run ID before its scheduled runner
   starts. Active cancellation commits its terminal state and command receipt
-  together before runner shutdown. It cancels effects that have not started and
-  marks applying effects ambiguous for explicit recovery. `workflow status` and
+  together before runner shutdown. It cancels effects that have not started,
+  marks applying effects ambiguous for explicit recovery, and settles the
+  cancelled attempt's open progress tracks. `workflow status` and
   `workflow cancel` can use the run ID immediately.
 - One interactive workflow request is presented per Pi session. Other requests
   remain durable and ordered.
@@ -1153,6 +1285,93 @@ resume` takes a new generation and reruns only work after the last durable
   an operator explicitly resumes or cancels it.
 - Server status reports safe counts and timestamps. It does not report session
   IDs, project paths, prompts, payloads, tokens, process IDs, or credentials.
+
+## Progress of timed-out and cancelled attempts
+
+A progress track belongs to the attempt that published its current record.
+Publishers mark finished tracks with a terminal status. An attempt that times
+out or is cancelled cannot do that any more: once its abort signal fires, the
+engine rejects every update from that attempt, so an action that ignores the
+signal and keeps reporting never changes durable state. The runtime settles
+those tracks instead.
+
+When an attempt ends with the outcome `timed_out` or `cancelled`, when the
+workflow server fails or cancels its run, or when a resume replaces it, every
+`progress` track whose current record belongs to that attempt and whose status
+is not `completed`, `failed`, or `cancelled` receives one more record for the
+same attempt:
+
+| How the attempt ended                  | `status`    | `phase`       |
+| -------------------------------------- | ----------- | ------------- |
+| Outcome `timed_out`                    | `failed`    | `timed out`   |
+| Outcome `cancelled` or run cancelled   | `cancelled` | `cancelled`   |
+| Run failed by the workflow server      | `failed`    | `failed`      |
+| Interrupted attempt replaced on resume | `cancelled` | `interrupted` |
+
+The progress profile has no timed-out status. `failed` keeps a timed-out track
+with the failed tracks that the Pi widget lists first, and the phase says why
+the track ended. The record keeps `label`, `completed`, `total`, `unit`, and
+`sourceUpdatedAt`, and drops `sourceEstimatedFinishAt`, because the finish
+estimate no longer applies.
+
+- Terminal tracks, other update types, and tracks whose current record belongs
+  to another attempt keep their records. A retry runs under a new attempt ID,
+  so settling one attempt never changes a retry's tracks, and a retry that
+  publishes a key again replaces the settled record with its own.
+- Settlement records are ordinary updates. Each one is a `workflow_updates`
+  row and an `update_published` event for the ended attempt, so the run view,
+  the Pi widget, and `piw` show them like any other update. They do not count
+  toward the publication rate limit.
+- The engine waits until every publication that the attempt started before the
+  abort has settled, then writes the settlement records before the attempt's
+  `node_failed` event. A publication that was in flight at the abort can still
+  finish its track, and the engine never overwrites that terminal state.
+- A rejected settlement record never changes the attempt outcome or its route.
+  A lost claim still stops the runner.
+- A workflow server cancellation commits outside the engine and then stops the
+  runner, which has lost its claim. The queue's cancellation transaction
+  therefore writes the `cancelled` settlement records itself, for every
+  attempt it cancels: the active attempt of a running run, and the open
+  attempt of a paused, parked, or expired run. The records, the cancelled
+  attempts, and the cancelled run commit together, or none of them do. Each
+  record advances the run revision once, as
+  [SQLite state](SQLITE_STATE.md#write-contract) describes.
+- A run that the workflow server fails without the engine, through
+  `WorkflowRunQueueStore.failWorkflowRun` when the missing-submission reminders
+  run out or a runner cannot load its workflow source, is settled the same way.
+  The failure transaction writes the `failed` records for every attempt it
+  fails, before its `run.queue_failed` event. The records, the failed attempts,
+  and the failed run commit together.
+- A parked attempt is abandoned for resume, not ended, so its tracks stay open.
+  This includes a runner that the workflow server stops for a pause, a
+  handoff, or a server shutdown. If the run is cancelled or failed while it is
+  parked, that transaction settles them.
+- A resume either keeps the interrupted attempt (a checkpoint, an
+  assistant-message node, or a submitted interaction) or replaces it with a new
+  attempt. A replaced attempt has ended: the resume transaction marks it
+  `cancelled`, records its `finished_at`, and settles its open tracks with the
+  phase `interrupted`, right after the `run_resumed` event. The attempt keeps
+  its `started_at` and has no step record. The new attempt publishes its own
+  tracks; a key that it publishes again replaces the settled record. A kept
+  attempt's tracks stay open.
+- After that transaction, the resumed engine reads the settlement records back
+  and applies them to its own run state, with their revision. Node callbacks,
+  the `onRunStarted` hook, the final run result, and `onEvent` observers, which
+  receive one `update_published` event per record, therefore see the same
+  settled tracks as durable reads.
+- Settlement never reactivates a retired attempt in
+  [`unrecordedAttempts`](#unrecorded-attempts). `WorkflowRunStore.publishUpdate`
+  rejects every update whose attempt is not the run's current attempt
+  ("Workflow update does not match the active attempt"), the queue settles only
+  attempts that are still pending, running, waiting, or interrupted, and a
+  resume writes the replaced attempt's records directly after retiring it.
+  Those writes neither change its `node_attempts` row nor add a `run_steps`
+  row.
+
+Known limitation: `WorkflowRunStore.markRunInterrupted`, which fails an
+abandoned run as interrupted, does not settle its last attempt's open tracks.
+Those tracks keep the last state that their attempt published, while the run
+status shows the failure. Nothing in production calls it at present.
 
 ## Wake recovery
 
@@ -1230,6 +1449,8 @@ The server checks for cleanup after startup recovery and after workflow runners 
 
 Automatic cleanup does not create a backup. The explicit `pi-workflows state prune` apply command still requires a new absolute verified backup. Both paths use the same eligibility, deletion, and blob-reference rules.
 
+An undelivered terminal result is protected work, so its run stays until its session receives it. A terminal message addressed to a session that never connects therefore keeps its run forever. Such a message becomes a notice once it has been pending for an hour and its session has no retained delivery evidence. A real session that closed before its first delivery can match too, and it receives the message when it resumes. `pi-workflows state status` reports only how many there are and the age of the oldest, and `pi-workflows state verify` lists each one. A notice changes nothing and does not fail verification. [SQLite state](SQLITE_STATE.md#undelivered-terminal-messages) describes the rule, the output, and the manual removal procedure for a maintenance window.
+
 Deleting a run tree removes its unreferenced blobs. SQLite can reuse those pages immediately. Automatic `VACUUM` runs only while the server remains idle, at least 64 MiB is reclaimable, and at least 20 percent of pages are free. A failed or skipped compaction does not restore deleted history or make free pages unusable.
 
 Retained runs keep complete resume and viewer behavior through the existing bounded reads. An expired deleted run no longer appears in lists and a direct view returns not found. Pi session history is not changed.
@@ -1263,9 +1484,81 @@ Child workflow completion queues the parent resource again. The global server ru
 
 See [RESOURCE_MANAGERS.md](RESOURCE_MANAGERS.md) for resource manager definitions and the full recovery contract.
 
+## Headless extensions
+
+Headless Pi children start with `--no-extensions` and load only their bridge, so
+a provider that only a user extension registers is unknown there. Set
+`PI_WORKFLOWS_HEADLESS_EXTENSIONS` in the environment of whatever starts the
+workflow server to list the absolute paths of extension files, separated by the
+platform path delimiter. A server that a Pi session starts inherits that session's
+environment:
+
+```bash
+PI_WORKFLOWS_HEADLESS_EXTENSIONS=/abs/path/provider-ext.ts pi
+```
+
+Every headless agent step and Sanity Check agent group host then loads each
+listed extension after its bridge. Select the extension's provider with
+`defaultProvider` and `defaultModel` in the user's settings, or with
+`pi-workflows server run -- --provider <provider> --model <model>`.
+
+- The opt-in is off by default, so headless children keep their default
+  authority.
+- The server reads the list once at start and keeps it until it restarts. After
+  changing the variable, restart the server with `pi-workflows server stop`.
+  `pi-workflows server status` reports it as `headlessExtensions`, with each
+  configured path and the real file behind it.
+- Each entry must be the absolute path of an extension file, such as
+  `<package>/dist/index.js` or `<package>/index.ts`, that is not part of
+  pi-workflows. A directory is refused: Pi would resolve it like a package and
+  could load other extension files, pi-workflows among them, plus the package's
+  skills, prompts, and themes. One bad entry makes the whole list invalid. The
+  server still starts and reports the reason, and every headless child fails
+  with it instead of running without the extension.
+- The server pins the real file behind each entry at start, and children load
+  that file. Before each launch, the runner checks every entry again and fails
+  that launch when the file is gone, no longer passes the checks, or now
+  resolves to another file. The file's contents are not pinned, so an edit to
+  the same file takes effect at the next launch.
+- The whole extension loads, with its tools, hooks, and commands, into every
+  headless child for every run and project that the server handles.
+
+See [Headless extensions](WORKFLOW_SERVER.md#headless-extensions) for the
+complete rules.
+
+## Headless step model
+
+A headless agent step runs in `pi --mode rpc --no-session --no-extensions -e <rpc-bridge>`, followed by `-e` for each of the [headless extensions](#headless-extensions) and the server's [extra Pi arguments](WORKFLOW_SERVER.md#extra-pi-arguments). Headless runs use it, including the runs that resource managers start. Pi chooses the child's model once, when the child starts:
+
+1. `--model`, with or without `--provider`, from the extra Pi arguments. Pi exits with an error when it cannot resolve them, so the step fails with the child's exit.
+2. Otherwise, when a model scope is set, the settings default if the scope holds it, else the first scoped model. The scope comes from `--models` in the extra Pi arguments, or else from the `enabledModels` setting; `--models` replaces `enabledModels` rather than adding to it. Pi matches the scope's patterns only against models it can use, so the scope holds only usable models. When no pattern matches one, Pi warns on stderr, treats the scope as empty, and goes on to step 3.
+3. Otherwise, the settings default: `defaultProvider` and `defaultModel` from the user's `<agent dir>/settings.json`, overridden by the run project's `.pi/settings.json` when Pi trusts that project. Headless pi has no trust prompt, so it trusts a project only from a remembered decision or the `defaultProjectTrust` setting.
+4. Otherwise, Pi's first available model with configured authentication.
+
+Workflow definitions, step contracts, and the RPC executor never choose a model. The executor sends no `set_model`.
+
+Pi moves from step 3 to step 4 without a diagnostic when it cannot use the default, and from step 2 to step 3 with only a warning when no model in the scope is usable. Headless pi loads no extension except the bridge, the [headless extensions](#headless-extensions), and those in the extra Pi arguments, so a default or scope whose provider only a user extension registers would otherwise run the step on another model. The bridge therefore checks the session's model when Pi emits `session_start`, after Pi chose the model and before it reads any RPC command. It compares the session's model with the scope that Pi resolved, the same `--models` or `enabledModels` patterns, and with the effective settings. A `--model` on the command line is never checked further.
+
+With a model scope, the scope is the user's choice. Any model that Pi resolved into it is accepted, even when the settings default is unusable or set to a model outside the scope. The bridge stops pi only when:
+
+- no model that headless pi can use matches the scope, so Pi would fall back to the default or to its first available model, outside the scope; or
+- the session started outside the resolved scope, or on a scoped model whose provider has no configured authentication.
+
+Without a model scope, the bridge stops pi when all of these hold:
+
+- the effective settings set both `defaultProvider` and `defaultModel`;
+- the session did not start on that model; and
+- the child cannot use the default: it has no such provider, the provider has no such model, or the provider has no configured authentication.
+
+The bridge then writes one error line to stderr and exits before any model request. It also stops pi when the check itself fails, because Pi would otherwise carry on after the extension error. The step fails with an error that names the default or the scope's patterns, where they are set (the settings file that sets each default field or `enabledModels`, or `--models` in the server's extra Pi arguments), the reason, the model that Pi would have used, and the fixes: load the provider's extension through `PI_WORKFLOWS_HEADLESS_EXTENSIONS` or with `-e`, name a model with `--provider` and `--model`, or change the default or the scope. It also says that the server reads `PI_WORKFLOWS_HEADLESS_EXTENSIONS` and its extra Pi arguments only when it starts, so a change needs `pi-workflows server stop`, and that `pi-workflows server status` shows the loaded `headlessExtensions`. Every later headless step in that run fails with the same error without starting pi again. The run then fails like any other failed step, and the post-workflow model turn and recovery behave as usual.
+
+With no model scope and no settings default, or with only one of the two default fields, Pi ignores the default, as it does in an interactive session, and the step runs on Pi's first available model. Headless pi may lack the extension providers of an interactive session, so this choice can differ from the interactive one. Name a model with `--provider` and `--model` in the extra Pi arguments when the choice matters. If no model is available at all, Pi itself exits at start and the step fails with that exit.
+
+The [Sanity Check](#built-in-sanity-check) agent group host loads the agent group bridge instead and makes no model request itself. Its child sessions check their own exact model.
+
 ## Host-provided Pi packages
 
-Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox` only to code that Pi loads itself. `pi install` installs this package with npm's legacy peer handling, so those packages are absent from an installed package tree. They resolve only through Pi's extension module mapping.
+Pi supplies `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox` only to code that Pi loads itself. `pi install` installs this package with npm's legacy peer handling, so the four `@earendil-works` packages are absent from an installed package tree, and they resolve only through Pi's extension module mapping. `typebox` is installed anyway, because `@earendil-works/pi-protocol`, a regular dependency of `@earendil-works/pi-server`, depends on it. This package declares `typebox` only as a peer and a development dependency, so that copy belongs to `pi-protocol`, and the rule below applies to `typebox` as well.
 
 The workflow server, workflow runner, resource-manager runner, decision-channel adapter, source resolver, and `piw` CLI are plain Node processes without that mapping. Every module that one of them can load must not value-import a host-provided package. This includes the public `@osolmaz/pi-workflows`, `/builtins`, `/resource-managers`, and `/client` entry points that workflow files load in those processes. Use a declaration-level `import type` for types. An inline `import { type Name }` still loads the module.
 
@@ -1301,10 +1594,23 @@ const { state } = await engine.run(workflow, { task: "..." });
 ## Test the installed package
 
 The installed-package end-to-end test packs this repository and installs the
-archive with production dependencies in a temporary consumer project. It then
-starts the repository-pinned base Pi with only that Pi Workflows installation.
-The test checks command isolation, server startup, widget and status changes,
-pause, resume, completion, and `piw <runId> --once` output.
+archive in a temporary consumer project the way `pi install` installs an npm
+package: production dependencies only, with `--legacy-peer-deps`. Pi installs an
+npm package with `npm install <spec> --prefix <root> --legacy-peer-deps`. The test
+also passes `--omit=dev`, the flag that Pi adds for a git package's dependencies,
+as a safety margin. That changes nothing, because the generated consumer
+`package.json` declares no dependencies. Without peer installation, the four
+`@earendil-works` packages that Pi supplies to extensions are absent, as they are
+for a user, and `assertHostPackagesAbsent` fails the test if Node could resolve any
+of them from the installed package. Pi provides them at run time only to code that
+it loads itself, so a plain Node workflow process that imports one fails in this
+test. `typebox` is present, installed through `@earendil-works/pi-server` and
+`@earendil-works/pi-protocol`, so that check does not cover it. The
+`test/plain-node-entries.test.ts` graph guard, which allows only this package's
+`dependencies`, still fails when a plain Node module imports `typebox`. The test
+then starts the repository-pinned base Pi with only that Pi Workflows installation. It checks
+command isolation, server startup, widget and status changes, pause, resume,
+completion, and `piw <runId> --once` output.
 
 Run the deterministic phase without a model call:
 

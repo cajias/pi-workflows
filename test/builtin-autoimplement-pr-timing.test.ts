@@ -16,7 +16,7 @@ import type {
   WorkflowNodeOutcome,
   WorkflowStepRecord,
 } from "../src/workflows/types.js";
-import { makeStateDatabasePath, makeTempDir } from "./helpers.js";
+import { holdTimers, makeStateDatabasePath, makeTempDir, waitUntil } from "./helpers.js";
 import {
   acceptedOutput,
   autoimplementSettingsValue,
@@ -2260,8 +2260,166 @@ describe.each(["github", "gitlab"] as const)(
       },
       GRAPH_RUN_TIMEOUT_MS,
     );
+
+    it(
+      "still excuses the lost verifyP2 push after the replacement times out with settled progress",
+      async () => {
+        await addBareOrigin(fixture.repository);
+        const databasePath = await makeStateDatabasePath(
+          `autoimplement-${forge}-restart-p2-timeout`,
+        );
+        // Only the replacement, which runs after the resume retired the lost attempt, gets its
+        // own limit. The lost attempt keeps the normal one until it parks. The test holds the
+        // replacement's timer and fires it once the replacement has published, so the limit
+        // cannot run out first.
+        const workflow = withVerifyP2Timeout((context) =>
+          context.state.unrecordedAttempts === undefined ? 30 * 60_000 : HELD_VERIFY_P2_TIMEOUT_MS,
+        );
+        let replacementPublished = false;
+        let engine: WorkflowEngine | undefined;
+        let attempts = 0;
+        let reviewedAgain = false;
+        let repaired = false;
+        let p2Head = "";
+        let localCommits = 0;
+        let pushedSecond = 0;
+        const refused: string[] = [];
+        const progress = (key: string, phase: string) => ({
+          type: "progress",
+          key,
+          data: { schema: "pi-workflows.progress.v1", status: "running", phase },
+        });
+        const scenario = timingScenario({
+          forge,
+          prTiming: "end",
+          reviews: [{ p2: ["tidy"] }, { p2: ["tidy"] }, {}],
+          publish: async (request, local) => {
+            await git(fixture.repository, ["push", "-q", "-u", "origin", "feat/demo"]);
+            return await acceptedOutput(
+              request,
+              published(fixture.repository, local.head, prFor(forge)),
+            );
+          },
+          verifyP2: async (request, local) => {
+            attempts += 1;
+            if (attempts === 1) {
+              await request.publishUpdate?.(progress("verifyP2/lost", "pushing"), "lost-track");
+              p2Head = await local.commit("p2-pushed");
+              pushedSecond = Math.floor(Date.now() / 1000);
+              await pushAt(fixture.repository, new Date(pushedSecond * 1000).toISOString());
+              engine?.park();
+              return await new Promise<AgentStepSubmission>(() => {});
+            }
+            await request.publishUpdate?.(
+              progress("verifyP2/replacement", "verifying"),
+              "replacement-track",
+            );
+            replacementPublished = true;
+            return await new Promise<AgentStepSubmission>(() => {});
+          },
+          commitLocal: async (request, local) => {
+            localCommits += 1;
+            const result = await request.accept({
+              repositories: [localRecord(await local.commit(`local-${localCommits}`))],
+            });
+            if (!result.ok) {
+              refused.push(result.error);
+              throw new Error(result.error);
+            }
+            return { output: result.value };
+          },
+          decide: (request) => {
+            const observation = observationOf(request);
+            const latest = observation.latestAttempt;
+            if (latest?.nodeId === "commitLocal" && latest.outcome === "failed") {
+              return controlDecision("blocked", "The local commit was rejected.");
+            }
+            if (latest?.nodeId === "verifyP2" && latest.outcome === "timed_out" && !repaired) {
+              repaired = true;
+              return controlDecision("repair", "Repair after the timed-out P2 verification.");
+            }
+            if (
+              !reviewedAgain &&
+              observation.availableRoutes.includes("comments") &&
+              observation.availableRoutes.includes("review")
+            ) {
+              reviewedAgain = true;
+              return controlDecision("review", "Review the published P2 head.");
+            }
+            return chooseFirstControlRoute(request);
+          },
+        });
+        engine = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const parked = await engine.run(workflow, scenario.input);
+        expect(parked.state.status).toBe("running");
+        const lostAttemptId = parked.state.currentAttemptId;
+        expect(await git(fixture.repository, ["rev-parse", "origin/feat/demo"])).toBe(p2Head);
+        // Restart in a later second, so the replacement attempt's window cannot cover the push.
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, (pushedSecond + 2) * 1000 - Date.now())),
+        );
+        const resumed = new WorkflowEngine({ executor: scenario.executor, databasePath });
+        const timers = holdTimers(HELD_VERIFY_P2_TIMEOUT_MS);
+        let state: Awaited<ReturnType<WorkflowEngine["resumeRun"]>>["state"];
+        try {
+          const resuming = resumed.resumeRun(workflow, parked.runId);
+          await waitUntil(() => replacementPublished, GRAPH_RUN_TIMEOUT_MS);
+          expect(timers.held()).toBe(1);
+          timers.fire();
+          ({ state } = await resuming);
+        } finally {
+          timers.restore();
+        }
+        expect(refused).toEqual([]);
+        expect(state.status, state.error).toBe("completed");
+        expect(attempts).toBe(2);
+        const verifications = state.steps.filter((entry) => entry.nodeId === "verifyP2");
+        expect(verifications.map((entry) => entry.outcome)).toEqual(["timed_out"]);
+        // The lost attempt stays a retired, unrecorded attempt. The resume settled its track as
+        // interrupted, and the timeout settled only the replacement's track.
+        expect(state.unrecordedAttempts).toEqual([
+          expect.objectContaining({ attemptId: lostAttemptId, nodeId: "verifyP2" }),
+        ]);
+        const store = new WorkflowRunStore(databasePath);
+        const stored = store.readRunState(parked.runId);
+        store.close();
+        expect(stored?.unrecordedAttempts).toEqual(state.unrecordedAttempts);
+        const tracks = new Map((stored?.updates ?? []).map((update) => [update.key, update]));
+        expect(tracks.get("verifyP2/lost")).toMatchObject({
+          attemptId: lostAttemptId,
+          data: { status: "cancelled", phase: "interrupted" },
+        });
+        expect(tracks.get("verifyP2/replacement")).toMatchObject({
+          attemptId: verifications[0]?.attemptId,
+          data: { status: "failed", phase: "timed out" },
+        });
+        const commits = state.steps.filter((entry) => entry.nodeId === "commitLocal");
+        expect(commits.map((entry) => entry.outcome)).toEqual(["ok", "ok"]);
+        expect(okSteps(state, "publish").map(headsOf).at(-1)).toEqual([scenario.work.head]);
+      },
+      GRAPH_RUN_TIMEOUT_MS,
+    );
   },
 );
+
+/** A `verifyP2` limit that only a held test timer reaches; no other timer in this file uses it. */
+const HELD_VERIFY_P2_TIMEOUT_MS = 3_600_017;
+
+/**
+ * Autoimplement with another `verifyP2` time limit. The copy keeps the compiled definition's
+ * hidden composition properties, so the engine runs it like the built-in.
+ */
+function withVerifyP2Timeout(
+  timeoutMs: (context: WorkflowNodeContext) => number,
+): typeof autoimplementWorkflow {
+  const descriptors = Object.getOwnPropertyDescriptors(autoimplementWorkflow);
+  const nodes = autoimplementWorkflow.nodes;
+  descriptors.nodes = {
+    ...descriptors.nodes,
+    value: { ...nodes, verifyP2: { ...nodes.verifyP2!, timeoutMs } },
+  };
+  return Object.defineProperties({}, descriptors) as typeof autoimplementWorkflow;
+}
 
 describe("autoimplement end repair after a publish that pushed and then failed", () => {
   it(

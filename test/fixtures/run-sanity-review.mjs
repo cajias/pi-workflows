@@ -1,12 +1,17 @@
 // Runs Sanity Check's review action in a plain Node process, the way the workflow runner
 // does, with the headless pi agent group launcher. The test selects the source or built form,
-// the pi binary, and an optional cancellation point through the environment.
+// the pi CLI script that this Node pins, and an optional cancellation point through the
+// environment.
+import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const root = process.env.PI_WORKFLOWS_TEST_FORM_ROOT;
 const extension = process.env.PI_WORKFLOWS_TEST_FORM_EXTENSION;
 const cancelWhenRunning = process.env.PI_WORKFLOWS_TEST_CANCEL_WHEN_RUNNING === "1";
+// Cancel as soon as this file exists, for example once an OAuth refresh has started.
+const cancelWhenFile = process.env.PI_WORKFLOWS_TEST_CANCEL_WHEN_FILE;
+const cancelSettleMs = process.env.PI_WORKFLOWS_TEST_CANCEL_SETTLE_MS;
 const load = async (name) =>
   await import(pathToFileURL(path.join(root, `${name}${extension}`)).href);
 
@@ -18,11 +23,14 @@ const pids = [];
 const launcher = new HeadlessPiAgentGroupLauncher(
   {
     cwd: process.cwd(),
-    piBin: process.env.FAKE_PI_BIN,
+    pi: { kind: "node", node: process.execPath, cli: process.env.PI_WORKFLOWS_TEST_PI_CLI },
     abortGraceMs: 1_000,
     registry: { register: (pid) => pids.push(pid), unregister: () => undefined },
   },
-  { diagnosticsDirectory: process.env.PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR },
+  {
+    diagnosticsDirectory: process.env.PI_WORKFLOWS_TEST_DIAGNOSTICS_DIR,
+    ...(cancelSettleMs === undefined ? {} : { cancelSettleMs: Number(cancelSettleMs) }),
+  },
 );
 setPiAgentGroupLauncher(launcher.run);
 
@@ -36,6 +44,14 @@ const evidence = {
   workingTree: { status: text, stat: text, files: text, diff: text, untracked: text },
 };
 const controller = new AbortController();
+if (cancelWhenFile !== undefined) {
+  const poll = setInterval(() => {
+    if (!fs.existsSync(cancelWhenFile)) return;
+    clearInterval(poll);
+    controller.abort(new Error("test cancellation"));
+  }, 20);
+  poll.unref();
+}
 const updates = [];
 const output = { updates, pids };
 try {

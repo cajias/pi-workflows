@@ -9,7 +9,6 @@ export const MAX_COMMAND_BATCH_CONCURRENCY = 8;
 export const MAX_COMMAND_BATCH_TIMEOUT_MS = 60 * 60_000;
 export const MAX_COMMAND_BATCH_OUTPUT_CHARS = 1_000_000;
 
-const MAX_ERROR_CHARS = 2_000;
 const ITEM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
 export type CommandBatchItem = {
@@ -189,7 +188,7 @@ async function runItem(
         : error instanceof CancelledError || isAbortLikeError(error)
           ? "cancelled"
           : "failed";
-    return itemResult(item.id, outcome, result, boundedError(error));
+    return itemResult(item.id, outcome, result, itemError(error, outcome, result));
   }
 }
 
@@ -227,9 +226,23 @@ function emptyShellResult(item: CommandBatchItem): ShellActionResult {
   };
 }
 
-function boundedError(error: unknown): string {
-  const message = errorMessage(error);
-  return message.length <= MAX_ERROR_CHARS ? message : `${message.slice(0, MAX_ERROR_CHARS)}…`;
+/**
+ * The item's error. A command that exits nonzero or is stopped by a signal fails with an error
+ * that quotes its stderr. The item already keeps that output, complete up to its own
+ * `maxOutputChars`, in `stderr`, so the error states only the exit status and does not copy the
+ * output a second time. Every other error is short operational text and stays whole.
+ */
+function itemError(
+  error: unknown,
+  outcome: CommandBatchItemOutcome,
+  result: ShellActionResult,
+): string {
+  if (outcome === "failed" && (result.signal != null || (result.exitCode ?? 0) !== 0)) {
+    const status =
+      result.signal != null ? `signal ${result.signal}` : `exit ${String(result.exitCode)}`;
+    return `Command failed: ${status}; its output is in the item's stdout and stderr`;
+  }
+  return errorMessage(error);
 }
 
 function positiveInteger(value: unknown, label: string, maximum: number): number {

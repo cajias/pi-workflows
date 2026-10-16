@@ -18,7 +18,7 @@ import {
 import { serverLockPath, stopRecordedServer } from "../src/server/lock.js";
 import { WorkflowServer } from "../src/server/server.js";
 import type { JsonValue } from "../src/state/json.js";
-import { makeTempDir, waitUntil } from "./helpers.js";
+import { makeStateDatabasePath, makeTempDir, waitUntil } from "./helpers.js";
 
 describe("WorkflowClient", () => {
   it("reports a socket path above the operating system limit as a blocker", async () => {
@@ -123,6 +123,41 @@ describe("WorkflowClient", () => {
     } finally {
       await client.close();
     }
+  });
+
+  it("hands only a supplied headless pi pin to the server process it starts", async () => {
+    const directory = await makeTempDir("client-headless-pi-args");
+    const databasePath = path.join(directory, "state.sqlite");
+    const serverEntryPath = path.join(directory, "report-args.mjs");
+    await fs.writeFile(
+      serverEntryPath,
+      'import fs from "node:fs"; fs.writeSync(3, JSON.stringify(process.argv.slice(2))); process.exit(1);',
+    );
+    const startArgs = async (client: WorkflowClient): Promise<string[]> => {
+      try {
+        const failure = await (
+          client as unknown as { startDetached: () => Promise<Error> }
+        ).startDetached();
+        return JSON.parse(failure.message) as string[];
+      } finally {
+        await client.close();
+      }
+    };
+    const pin = { kind: "node", node: "/opt/node/bin/node", cli: "/opt/pi/dist/cli.js" } as const;
+    expect(
+      await startArgs(new WorkflowClient({ databasePath, serverEntryPath, headlessPi: pin })),
+    ).toEqual([
+      "--database",
+      databasePath,
+      "--headless-pi-node",
+      pin.node,
+      "--headless-pi-cli",
+      pin.cli,
+    ]);
+    expect(await startArgs(new WorkflowClient({ databasePath, serverEntryPath }))).toEqual([
+      "--database",
+      databasePath,
+    ]);
   });
 
   it("prefers the detached server error when startup never becomes available", async () => {
@@ -932,7 +967,9 @@ describe("WorkflowClient", () => {
   });
 
   it("hydrates repeated content references once and preserves escaped user values", async () => {
-    const client = new WorkflowClient();
+    const client = new WorkflowClient({
+      databasePath: await makeStateDatabasePath("client-content-hydration"),
+    });
     const content = Buffer.from('{"answer":"complete"}', "utf8");
     const opaqueContent = Buffer.from(
       '{"$artifact":{"path":"user-path","mediaType":"user-type","bytes":1,"sha256":"user-digest"}}',
@@ -1041,7 +1078,9 @@ describe("WorkflowClient", () => {
   });
 
   it("rejects invalid and failed exact run responses", async () => {
-    const client = new WorkflowClient();
+    const client = new WorkflowClient({
+      databasePath: await makeStateDatabasePath("client-exact-run-errors"),
+    });
     const request = vi.spyOn(client, "request");
     request.mockResolvedValueOnce({
       schema: CLIENT_PROTOCOL_SCHEMA,

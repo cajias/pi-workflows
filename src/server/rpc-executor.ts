@@ -10,9 +10,14 @@ import {
   packagedExtensionPath,
   type HeadlessPiOptions,
 } from "./headless-pi.js";
-import { RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
+import { decodeRpcModelError, RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
 
 const BRIDGE_PATH = packagedExtensionPath(import.meta.url, "rpc-bridge");
+/**
+ * How long an exited child's stderr may take to deliver its last lines, such as the bridge's
+ * model error. The bound covers a descendant that keeps the pipe open after the child exits.
+ */
+const STDERR_DRAIN_MS = 1_000;
 
 type StepSubmission = {
   action: "submit";
@@ -48,6 +53,9 @@ export class RpcStepExecutor implements AgentStepExecutor {
   private actions: StepAction[] = [];
   private submissionWaiters: Array<() => void> = [];
   private closePromise: Promise<void> | null = null;
+  /** Why the bridge stopped the child before any model request, when it did. */
+  private modelError: string | null = null;
+  private stderrDrain: Promise<void> | null = null;
 
   constructor(options: RpcStepExecutorOptions) {
     this.options = options;
@@ -87,10 +95,14 @@ export class RpcStepExecutor implements AgentStepExecutor {
 
   private async ensureStarted(): Promise<void> {
     if (this.closePromise !== null) throw new Error("Headless pi session is closed");
+    if (this.modelError !== null) throw new Error(this.modelError);
     if (this.child !== null) {
       const exited = this.child.currentExit();
       if (exited !== null) {
-        throw new Error(`Headless pi session exited (${describeHeadlessPiExit(exited)})`);
+        throw await this.exitError(
+          this.child,
+          `Headless pi session exited (${describeHeadlessPiExit(exited)})`,
+        );
       }
       return;
     }
@@ -98,7 +110,7 @@ export class RpcStepExecutor implements AgentStepExecutor {
       throw new Error("The pi-workflows rpc-bridge extension is missing from this installation");
     }
     const child = new HeadlessPiProcess(BRIDGE_PATH, this.options, {
-      onStderrLine: (line) => this.acceptSubmissionLine(line),
+      onStderrLine: (line) => this.acceptStderrLine(line),
       onExit: () => this.wakeSubmissionWaiters(),
     });
     this.child = child;
@@ -108,6 +120,23 @@ export class RpcStepExecutor implements AgentStepExecutor {
       this.child = null;
       throw error;
     }
+  }
+
+  /** The bridge's model error, or the exit itself, once stderr has delivered its last line. */
+  private async exitError(child: HeadlessPiProcess, exitMessage: string): Promise<Error> {
+    this.stderrDrain ??= child.stderrDrained(STDERR_DRAIN_MS);
+    await this.stderrDrain;
+    return new Error(this.modelError ?? exitMessage);
+  }
+
+  private acceptStderrLine(line: string): void {
+    const modelError = decodeRpcModelError(line);
+    if (modelError !== undefined) {
+      this.modelError ??= modelError;
+      this.wakeSubmissionWaiters();
+      return;
+    }
+    this.acceptSubmissionLine(line);
   }
 
   private acceptSubmissionLine(line: string): void {
@@ -138,9 +167,13 @@ export class RpcStepExecutor implements AgentStepExecutor {
     child.write({ type: "prompt", message: prompt });
     for (;;) {
       throwIfAborted(signal);
+      if (this.modelError !== null) throw new Error(this.modelError);
       const exited = child.currentExit();
       if (exited !== null) {
-        throw new Error(`Headless pi session exited mid-step (code ${exited.code})`);
+        throw await this.exitError(
+          child,
+          `Headless pi session exited mid-step (code ${exited.code})`,
+        );
       }
       const found = this.takeMatchingAction(request);
       if (found?.action === "submit") return found;
