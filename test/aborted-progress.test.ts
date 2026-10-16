@@ -396,6 +396,7 @@ describe("progress of aborted attempts", () => {
     const responseGate = new Promise<void>((resolve) => {
       releaseResponse = resolve;
     });
+    let completedCommitted = false;
     class DelayedResponseStore extends WorkflowRunStore {
       override async publishUpdate(
         ...args: Parameters<WorkflowRunStore["publishUpdate"]>
@@ -403,21 +404,26 @@ describe("progress of aborted attempts", () => {
         const result = await super.publishUpdate(...args);
         // A server-backed runner can receive the receipt of an accepted
         // update after its attempt has already timed out.
-        if (args[3].data.status === "completed") await responseGate;
+        if (args[3].data.status === "completed") {
+          completedCommitted = true;
+          await responseGate;
+        }
         return result;
       }
     }
     const store = new DelayedResponseStore(await makeStateDatabasePath("in-flight-update"));
     const { engine } = await makeEngine({ store });
     let started = false;
+    let attemptSignal: AbortSignal | undefined;
     const workflow = defineWorkflow({
       name: "in-flight-update",
       startAt: "work",
       nodes: {
         work: action({
           effect: idempotentEffect("test.in-flight-update"),
-          timeoutMs: 50,
-          run: async ({ publishUpdate }) => {
+          timeoutMs: HELD_TIMEOUT_MS,
+          run: async ({ publishUpdate, signal }) => {
+            attemptSignal = signal;
             await publishUpdate(track("a", "running"));
             await publishUpdate(track("b", "running"));
             void publishUpdate(track("a", "completed")).catch(() => undefined);
@@ -429,11 +435,27 @@ describe("progress of aborted attempts", () => {
       edges: [],
     });
 
-    const running = engine.run(workflow, {});
-    await waitUntil(() => started);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    releaseResponse();
-    const { runId, state } = await running;
+    // The timeout fires only after "a completed" has committed and while its receipt is
+    // still held, so the publication is always in flight at the abort.
+    const timers = holdTimers(HELD_TIMEOUT_MS);
+    let result: Awaited<ReturnType<typeof engine.run>>;
+    try {
+      const running = engine.run(workflow, {});
+      await waitUntil(() => started && completedCommitted, 30_000);
+      expect(timers.held()).toBe(1);
+      timers.fire();
+      expect(attemptSignal?.aborted).toBe(true);
+      // Give an engine that did not wait for the publication the turns it would need to
+      // settle "a" from its stale record, then release the receipt.
+      for (let turn = 0; turn < 20; turn += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      releaseResponse();
+      result = await running;
+    } finally {
+      timers.restore();
+    }
+    const { runId, state } = result;
 
     expect(state.status).toBe("timed_out");
     const durable = byKey(store.readRun(runId)?.state.updates);

@@ -276,8 +276,10 @@ describe("workflow server progress settlement", () => {
 
       const verified = await client.request({ operation: "state.verify" });
       expect(verified).toMatchObject({ outcome: "accepted", receipt: { valid: true } });
-      // The stopped runner cannot change the settled tracks afterwards.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // The stopped runner cannot change the settled tracks afterwards. The server drops
+      // its active entry only after the runner process exits.
+      const activeRuns = (server as unknown as { activeRuns: Map<string, unknown> }).activeRuns;
+      await waitUntil(() => !activeRuns.has(runId), 30_000);
       expect(readRun(databasePath, runId).revision).toBe(after.revision);
     } finally {
       await client.close();
