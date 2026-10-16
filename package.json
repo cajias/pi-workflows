@@ -95,6 +95,9 @@
     "@earendil-works/pi-tui": ">=0.99.0",
     "typebox": "*"
   },
+  "overrides": {
+    "tinypool": "2.1.2"
+  },
   "engines": {
     "node": ">=22"
   },
