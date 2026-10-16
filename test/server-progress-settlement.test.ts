@@ -68,6 +68,21 @@ function queueStatus(databasePath: string, runId: string): string | undefined {
   }
 }
 
+function liveRunners(databasePath: string, runId: string): number {
+  const queue = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
+  try {
+    const row = queue.state.connection
+      .prepare(
+        `SELECT count(*) AS count FROM run_runners
+         WHERE run_id = ? AND status IN ('starting', 'ready', 'running')`,
+      )
+      .get(runId) as { count: number };
+    return row.count;
+  } finally {
+    queue.close();
+  }
+}
+
 function statuses(updates: readonly { key: string; type?: string; data: unknown }[] | undefined) {
   return Object.fromEntries(
     (updates ?? [])
@@ -100,6 +115,79 @@ async function startTrackRun(
     },
   });
   expect(started.outcome).toBe("accepted");
+}
+
+const RESUMED_TRACKS = ["agents/review", "agents/review/a"];
+
+/**
+ * An action whose first attempt publishes two open tracks and a finished one,
+ * then waits until a pause stops it. A later attempt finds the marker file,
+ * publishes one more track, and completes.
+ */
+async function writeResumableTrackWorkflow(cwd: string): Promise<string> {
+  const workflowPath = path.join(cwd, "resumable-tracks.workflow.ts");
+  const markerPath = path.join(cwd, "first-attempt.marker");
+  await fs.writeFile(
+    workflowPath,
+    `import fs from "node:fs";
+import { action, defineWorkflow, idempotentEffect } from ${JSON.stringify(
+      path.resolve("src/workflows/index.ts"),
+    )};
+const progress = (status, extra = {}) => ({ schema: "pi-workflows.progress.v1", status, ...extra });
+const marker = ${JSON.stringify(markerPath)};
+export default defineWorkflow({
+  name: "server-resume-progress",
+  startAt: "review",
+  nodes: {
+    review: action({
+      effect: idempotentEffect("test.server-resume-progress"),
+      run: async ({ publishUpdate }) => {
+        if (fs.existsSync(marker)) {
+          await publishUpdate({ type: "progress", key: "agents/resumed", data: progress("completed", { phase: "completed" }) });
+          return { resumed: true };
+        }
+        await publishUpdate({ type: "progress", key: "agents/review", data: progress("running", { phase: "review" }) });
+        await publishUpdate({ type: "progress", key: "agents/review/a", data: progress("running", { phase: "thinking" }) });
+        await publishUpdate({ type: "progress", key: "agents/review/c", data: progress("completed", { phase: "completed" }) });
+        fs.writeFileSync(marker, "first");
+        return await new Promise(() => undefined);
+      },
+    }),
+  },
+  edges: [],
+});\n`,
+  );
+  return workflowPath;
+}
+
+/** Start the resumable run, wait for its open tracks, and pause it until its runner exits. */
+async function startAndPauseResumableRun(
+  client: WorkflowClient,
+  databasePath: string,
+  cwd: string,
+  workflowPath: string,
+  runId: string,
+): Promise<{ revision: number; attemptId: string }> {
+  await startTrackRun(client, cwd, workflowPath, runId);
+  await waitUntil(
+    () => (readRun(databasePath, runId).loaded?.state.updates?.length ?? 0) === 3,
+    30_000,
+  );
+  expect(await client.request({ operation: "run.pause", runId })).toMatchObject({
+    outcome: "accepted",
+    receipt: { paused: true },
+  });
+  await waitUntil(() => liveRunners(databasePath, runId) === 0, 30_000);
+  const paused = readRun(databasePath, runId);
+  const attemptId = paused.loaded?.state.currentAttemptId;
+  if (attemptId === undefined) throw new Error("paused attempt missing");
+  expect(queueStatus(databasePath, runId)).toBe("parked");
+  expect(statuses(paused.loaded?.state.updates)).toEqual({
+    "agents/review": "running",
+    "agents/review/a": "running",
+    "agents/review/c": "completed",
+  });
+  return { revision: paused.revision, attemptId };
 }
 
 describe("workflow server progress settlement", () => {
@@ -255,6 +343,189 @@ describe("workflow server progress settlement", () => {
         "agents/review": "failed",
         "agents/review/a": "failed",
         "agents/review/b": "failed",
+        "agents/review/c": "completed",
+      });
+      const verified = await client.request({ operation: "state.verify" });
+      expect(verified).toMatchObject({ outcome: "accepted", receipt: { valid: true } });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  }, 90_000);
+
+  it("adopts the server revision after a resume settles the replaced attempt's tracks", async () => {
+    const cwd = await makeTempDir("server-resume-progress-project");
+    const databasePath = path.join(
+      await makeTempDir("server-resume-progress-state"),
+      "state.sqlite",
+    );
+    const workflowPath = await writeResumableTrackWorkflow(cwd);
+    const server = new WorkflowServer({ databasePath, claimPollMs: 10 });
+    const client = new WorkflowClient({ databasePath, clientId: "resume-progress-client" });
+    const runId = "server-resume-progress-run";
+    await server.start();
+    try {
+      const paused = await startAndPauseResumableRun(
+        client,
+        databasePath,
+        cwd,
+        workflowPath,
+        runId,
+      );
+
+      expect(await client.request({ operation: "run.resume", runId })).toMatchObject({
+        outcome: "accepted",
+      });
+      await waitUntil(() => queueStatus(databasePath, runId) === "done", 45_000);
+
+      const after = readRun(databasePath, runId);
+      const state = after.loaded?.state;
+      expect(state?.status).toBe("completed");
+      const resumedAttemptId = state?.results.review?.attemptId;
+      expect(resumedAttemptId).toBeDefined();
+      expect(resumedAttemptId).not.toBe(paused.attemptId);
+      const trace: WorkflowTraceEvent[] = after.loaded?.traceEvents ?? [];
+      // Every revision has one event, so no runner write was rejected or skipped.
+      expect(trace.map((event) => event.seq)).toEqual(
+        Array.from({ length: trace.length }, (_, index) => index + 1),
+      );
+      expect(after.revision).toBe(trace.at(-1)?.seq);
+
+      // The runner's run_resumed proposal returns revision R + N: run_resumed at R,
+      // then one settlement record for each of the replaced attempt's open tracks.
+      const resumedAt = trace.findIndex((event) => event.type === "run_resumed");
+      expect(resumedAt).toBeGreaterThan(-1);
+      const resumed = trace[resumedAt]!;
+      const settlement = trace.slice(resumedAt + 1, resumedAt + 1 + RESUMED_TRACKS.length);
+      expect(settlement.map((event) => [event.seq, event.type, event.attemptId])).toEqual(
+        RESUMED_TRACKS.map((_, index) => [
+          resumed.seq + index + 1,
+          "update_published",
+          paused.attemptId,
+        ]),
+      );
+      expect(settlement.map((event) => event.payload.key)).toEqual(RESUMED_TRACKS);
+      // The runner's next write carries the adopted revision R + N and commits at R + N + 1.
+      const next = trace[resumedAt + 1 + RESUMED_TRACKS.length];
+      expect(next).toMatchObject({
+        seq: resumed.seq + RESUMED_TRACKS.length + 1,
+        type: "node_started",
+        attemptId: resumedAttemptId,
+      });
+      expect(
+        trace
+          .slice(resumedAt + 1 + RESUMED_TRACKS.length)
+          .filter((event) => event.attemptId === resumedAttemptId)
+          .map((event) => event.type),
+      ).toEqual(["node_started", "update_published", "node_finished"]);
+
+      const interrupted = { status: "cancelled", phase: "interrupted" };
+      const updates = state?.updates ?? [];
+      expect(
+        Object.fromEntries(
+          updates.map((update) => [
+            update.key,
+            { status: update.data.status, phase: update.data.phase, attemptId: update.attemptId },
+          ]),
+        ),
+      ).toEqual({
+        "agents/review": { ...interrupted, attemptId: paused.attemptId },
+        "agents/review/a": { ...interrupted, attemptId: paused.attemptId },
+        "agents/review/c": {
+          status: "completed",
+          phase: "completed",
+          attemptId: paused.attemptId,
+        },
+        "agents/resumed": {
+          status: "completed",
+          phase: "completed",
+          attemptId: resumedAttemptId,
+        },
+      });
+      for (const event of settlement) {
+        const record = updates.find((update) => update.key === event.payload.key);
+        expect(record).toMatchObject({ seq: event.seq, data: event.payload.data });
+      }
+      const view = await client.getRun(runId);
+      expect(view?.runRevision).toBe(after.revision);
+      const verified = await client.request({ operation: "state.verify" });
+      expect(verified).toMatchObject({ outcome: "accepted", receipt: { valid: true } });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  }, 90_000);
+
+  it("settles open tracks as failed when the server fails a run whose source cannot load", async () => {
+    const cwd = await makeTempDir("server-load-fail-progress-project");
+    const databasePath = path.join(
+      await makeTempDir("server-load-fail-progress-state"),
+      "state.sqlite",
+    );
+    const workflowPath = await writeResumableTrackWorkflow(cwd);
+    const server = new WorkflowServer({ databasePath, claimPollMs: 10 });
+    const client = new WorkflowClient({ databasePath, clientId: "load-fail-progress-client" });
+    const runId = "server-load-fail-progress-run";
+    await server.start();
+    try {
+      const paused = await startAndPauseResumableRun(
+        client,
+        databasePath,
+        cwd,
+        workflowPath,
+        runId,
+      );
+      // The saved source no longer matches, so the resumed runner reports a load failure.
+      await fs.appendFile(workflowPath, "\n// changed while paused\n");
+
+      expect(await client.request({ operation: "run.resume", runId })).toMatchObject({
+        outcome: "accepted",
+      });
+      await waitUntil(() => queueStatus(databasePath, runId) === "failed", 45_000);
+
+      const queue = new WorkflowRunQueueStore(databasePath, { readOnly: true, global: true });
+      try {
+        expect(queue.getWorkflowRun(runId)?.errorCode).toBe("workflowLoadFailed");
+        expect(
+          queue.state.connection
+            .prepare("SELECT status FROM node_attempts WHERE attempt_id = ?")
+            .get(paused.attemptId),
+        ).toEqual({ status: "failed" });
+      } finally {
+        queue.close();
+      }
+      const after = readRun(databasePath, runId);
+      expect(after.loaded?.state.status).toBe("failed");
+      const failed = { status: "failed", phase: "failed" };
+      const updates = after.loaded?.state.updates ?? [];
+      expect(
+        Object.fromEntries(
+          updates.map((update) => [
+            update.key,
+            { status: update.data.status, phase: update.data.phase },
+          ]),
+        ),
+      ).toEqual({
+        "agents/review": failed,
+        "agents/review/a": failed,
+        "agents/review/c": { status: "completed", phase: "completed" },
+      });
+      expect(updates.every((update) => update.attemptId === paused.attemptId)).toBe(true);
+      // The failure transaction settles each open track, then records run.queue_failed.
+      const trace: WorkflowTraceEvent[] = after.loaded?.traceEvents ?? [];
+      const tail = trace.slice(-(RESUMED_TRACKS.length + 1));
+      expect(tail.map((event) => [event.seq, event.type])).toEqual([
+        [after.revision - 2, "update_published"],
+        [after.revision - 1, "update_published"],
+        [after.revision, "run.queue_failed"],
+      ]);
+      expect(tail.slice(0, -1).map((event) => event.payload.key)).toEqual(RESUMED_TRACKS);
+      expect(tail.slice(0, -1).every((event) => event.attemptId === paused.attemptId)).toBe(true);
+      const view = await client.getRun(runId);
+      expect(view?.runRevision).toBe(after.revision);
+      expect(statuses(view?.updates as WorkflowUpdateRecord[] | undefined)).toEqual({
+        "agents/review": "failed",
+        "agents/review/a": "failed",
         "agents/review/c": "completed",
       });
       const verified = await client.request({ operation: "state.verify" });

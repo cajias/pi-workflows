@@ -364,6 +364,62 @@ describe("progress of a cancelled run", () => {
     run.state.close();
   }, 60_000);
 
+  it("rolls back the settlement with the server's run failure", async () => {
+    const run = await startRun("rolled-back-fail");
+    const before = run.runs.runRevision(run.runId);
+    const attemptId = run.runs.readRunState(run.runId)?.currentAttemptId;
+    if (attemptId === undefined) throw new Error("active attempt missing");
+    const updates = run.state.connection.prepare("SELECT count(*) AS count FROM workflow_updates");
+    const count = updates.get();
+    const queued = run.queue.getWorkflowRun(run.runId);
+    const attemptStatus = run.state.connection.prepare(
+      "SELECT status FROM node_attempts WHERE attempt_id = ?",
+    );
+    run.state.connection.exec(
+      `CREATE TEMP TRIGGER reject_settlement BEFORE INSERT ON workflow_updates
+       BEGIN SELECT RAISE(ABORT, 'settlement rejected'); END`,
+    );
+
+    expect(() =>
+      run.queue.failWorkflowRun({
+        runId: run.runId,
+        claimToken: run.claimToken,
+        errorCode: "missingSubmission",
+        errorMessage: "Workflow step ended without its required result",
+      }),
+    ).toThrow(/settlement rejected/);
+
+    // Nothing from the failure transaction committed: revision, statuses, and tracks.
+    expect(run.runs.runRevision(run.runId)).toBe(before);
+    expect(updates.get()).toEqual(count);
+    expect(run.queue.getWorkflowRun(run.runId)).toEqual(queued);
+    expect(queued?.errorCode).toBeNull();
+    expect(run.runs.readRunState(run.runId)?.status).toBe("running");
+    expect(attemptStatus.get(attemptId)).toEqual({ status: "running" });
+    const current = byKey(run.runs.readRunState(run.runId)?.updates);
+    for (const key of open) {
+      expect(current.get(`progress:${key}`)).toMatchObject({ attemptId });
+      expect(current.get(`progress:${key}`)?.data.status).not.toBe("failed");
+    }
+    expect(workflowStateViolations(run.state)).toEqual([]);
+
+    // The claim survived, so the failure succeeds once settlement can write.
+    run.state.connection.exec("DROP TRIGGER reject_settlement");
+    expect(
+      run.queue.failWorkflowRun({
+        runId: run.runId,
+        claimToken: run.claimToken,
+        errorCode: "missingSubmission",
+        errorMessage: "Workflow step ended without its required result",
+      }),
+    ).toBe(true);
+    expect(run.runs.runRevision(run.runId)).toBe(before + open.length + 1);
+    expectSettled(run.runs.readRunState(run.runId)?.updates, attemptId, "failed");
+    run.engine.cancel();
+    await expect(run.running).rejects.toThrow(/claim lost/);
+    run.state.close();
+  }, 60_000);
+
   it("rolls back the settlement with the cancellation", async () => {
     const run = await startRun("rolled-back-cancel");
     const before = run.runs.runRevision(run.runId);
