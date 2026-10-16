@@ -1859,6 +1859,10 @@ These are out of scope for this plan.
     herdr-package e2e `npm pack` builds into the repo's `dist/`; the default macOS TMPDIR may
     exceed the socket path limit; and npm's own cache from the gates' `npm ci` and `npx` is
     tooling, not test state.
+  - Git env fix in `9dae37a`: the setup also unsets the Git variables that select a repository or
+    add configuration (the `git rev-parse --local-env-vars` list and every
+    `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pair), so a test's git child resolves its own
+    temporary repository. The guard test checks this.
 - F37: Settle progress tracks left open when the server fails a run without the engine
   (`failWorkflowRun`) or discards an attempt on resume. _(done)_
   - Done in `7ec8c03`, `cf0bb86`, `fe462e8`, and `cdbc8a2`, with test assertions updated in
@@ -1874,6 +1878,11 @@ These are out of scope for this plan.
     `fe462e8`, so neither is a follow-up.
   - Residual: `WorkflowRunStore.markRunInterrupted` still leaves its last attempt's tracks open;
     nothing in production calls it (F51).
+  - Engine projection fix in `e572b8d`, with event-driven checks in `3da754d`: after a replacing
+    resume, the engine reads the resume's settlement records back from durable state, so node
+    callbacks, `onRunStarted`, the final result, and `onEvent` see the replaced attempt's tracks
+    as settled, in local and server mode. The in-flight-publication and stopped-runner checks now
+    wait for events instead of fixed sleeps.
   - Live E2E: waived. The human's rule for F35-F41 allows no live or billable model calls, as with
     the F11-F14 waiver in the Validation section.
 - F38: Report Pi's own reason when no model exists at all; headless steps now show only
@@ -1988,17 +1997,17 @@ These are out of scope for this plan.
   - Fix: inject or control the attempt timestamps instead.
 - F50: End an unrecorded `verifyP2` attempt's excuse window at its last proven-live time
   (code-review completeness critic and re-review, medium).
-  - The gap: the window runs until the resume retires the attempt (`src/workflows/store.ts:1747`),
+  - The gap: the window runs until the resume retires the attempt (`src/workflows/store.ts:1723-1730`),
     so it covers all runner downtime, and any push from this clone in that window is excused
     whatever the head is.
   - Fix: end the window at the last proven-live time: `MAX(COALESCE(ended_at, observed_at))` from
     `attempt_active_intervals` for the attempt, or the interrupt write's `updated_at`
-    (`src/workflows/store.ts:1507`). Fall back to the resume time only when neither exists.
+    (`src/workflows/store.ts:1513`). Fall back to the resume time only when neither exists.
   - Trade-off: a push between the last sample and a crash is then rejected (fail closed),
     consistent with `src/state/attempt-time.ts:71`.
   - When this is fixed, update the `docs/WORKFLOWS.md` sentence that excuses downtime pushes.
 - F51: Settle the progress tracks that `markRunInterrupted` leaves open.
-  - `WorkflowRunStore.markRunInterrupted` (`src/workflows/store.ts:1532`) fails an abandoned run
+  - `WorkflowRunStore.markRunInterrupted` (`src/workflows/store.ts:1537`) fails an abandoned run
     as interrupted without settling the open tracks of its last attempt. Nothing in production
     calls it today.
 - F52: Replace the direct-SQL setup in the F37 tests.
@@ -2008,11 +2017,11 @@ These are out of scope for this plan.
   - The heading is deliberately kept as it is, so its link anchor stays stable. It was at line
     1248 before the rebase onto `origin/main`, and at 1280 before F37.
 - F54: Resolve the old pi-lens SQL flags in `src/workflows/store.ts`, and add the missing SAFETY
-  comment for the `as unknown as HumanDecisionRequest` cast at `src/workflows/store.ts:1677`.
+  comment for the `as unknown as HumanDecisionRequest` cast at `src/workflows/store.ts:1682`.
 - F56: Forward failed checks' stdout to the Autoimplement decide prompt.
   - Some tools, such as `tsc`, print their failures to stdout. `4873e95` forwards only stderr,
     as before F21, so this is not a regression. Found during the fix pass.
-- F57: Speed up run-state reads. `materializeRunState` (`src/workflows/store.ts:3537`) re-reads
+- F57: Speed up run-state reads. `materializeRunState` (`src/workflows/store.ts:3542`) re-reads
   every step on each commit, and `readBlob` (`src/state/database.ts:176`) prepares its statement
   again on every call.
   - The slowest server-view tests take 17-23 s against their 60 s limit.
@@ -2023,3 +2032,26 @@ These are out of scope for this plan.
   past the patched minimum.
 - F62: Keep the `npm ci` log for the deps PR (PR #2 follow-up). _(closed)_
   - No `npm ci` log was saved for PR #2. Closed: a later clean reinstall confirmed it.
+- F63: Name the refresh-process failure when the credential cannot be read after it.
+  - When the refresh process failed or did not finish and the stored credential cannot be read
+    afterwards, `readRefreshedCredential` (`src/builtins/pi-agent-group.ts:691`) still reports
+    `could not refresh OAuth credentials` and asks the user to sign in again. Only the
+    unchanged-credential branch checks `oauthRefreshProcessFailed`. It fails closed. PR review P3.
+- F64: Check the field types in `decodeOAuthRefreshRequest`
+  (`src/builtins/pi-oauth-refresh-contract.ts:94-102`), which checks only the schema.
+  - A malformed request fails later inside Pi with a generic exit instead of before the marker is
+    written. The parent is trusted, so this is defensive only. PR review P3.
+- F65: Keep a definite stale-authority rejection apart from an uncertain start.
+  - `sendInteractiveStart` (`src/extension/index.ts:1529-1532`) marks a rejected start with a
+    stale-authority error as uncertain, so an exhausted retry says the run "may have been
+    created" although the server committed nothing. A branch-unreported retry waits for a new
+    epoch instead of the same one. PR review P3.
+- F66: Skip relative `PATH` entries when the server pins pi.
+  - `findOnPath` (`src/server/headless-pi-resolution.ts:77-83`) resolves relative entries such as
+    `.` against the cwd of the process that started the shared server. PR review P3.
+- F67: Index the undelivered-message notice's `session_segments` lookup.
+  - The notice query (`src/workflows/diagnostics.ts:142-143`) looks up `session_segments` by
+    `session_id`, which has no index, so each candidate message scans the table. PR review P3.
+- F68: Move `npm_config_logs_dir` in the test global setup.
+  - `test/global-setup.ts` moves npm's cache and user config but not its logs dir, so a gate that
+    exports a logs dir receives the tests' npm logs.
