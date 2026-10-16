@@ -485,7 +485,7 @@ describe("progress of aborted attempts", () => {
     });
   });
 
-  it("leaves tracks open when the engine parks and lets the resumed attempt replace them", async () => {
+  it("settles a replaced attempt's own tracks as interrupted and lets the resumed attempt replace shared ones", async () => {
     const databasePath = await makeStateDatabasePath("parked-tracks");
     let started = false;
     const workflow = defineWorkflow({
@@ -520,11 +520,11 @@ describe("progress of aborted attempts", () => {
     const overall = updates.get("overall");
     expect(overall?.data).toEqual(progress("completed"));
     expect(overall?.attemptId).toBe(resumed.state.results.work?.attemptId);
-    // The resume retired the parked attempt without a step. Nothing settled it, so the track
-    // that only it published stays open, and its attempt stays retired.
+    // The resume retired the parked attempt without a step and settled the track that only it
+    // published as interrupted. The attempt stays retired and unrecorded.
     expect(updates.get("retired-only")).toMatchObject({
       attemptId: retiredAttemptId,
-      data: progress("running"),
+      data: progress("cancelled", { phase: "interrupted" }),
     });
     const stored = readWorkflowRun(parked.runId, { databasePath })?.state;
     expect(stored?.unrecordedAttempts).toEqual([
@@ -619,11 +619,12 @@ describe("progress of aborted attempts", () => {
     ).toEqual(["timed_out"]);
     expect(stored?.state.steps.at(-1)?.attemptId).toBe(replacementAttemptId);
     expect(attemptRow(databasePath, replacementAttemptId)).toMatchObject({ status: "timed_out" });
-    // Only the replacement's open tracks settle; the retired attempt's own track stays open.
+    // The timeout settles only the replacement's open tracks. The retired attempt's own track
+    // keeps the interrupted record that the resume wrote for it.
     const updates = byKey(stored?.state.updates);
     expect(updates.get("retired-only")).toMatchObject({
       attemptId: retiredAttemptId,
-      data: progress("running"),
+      data: progress("cancelled", { phase: "interrupted" }),
     });
     expect(updates.get("shared")).toMatchObject({
       attemptId: replacementAttemptId,
@@ -642,6 +643,16 @@ describe("progress of aborted attempts", () => {
     expect(settlement.map((event) => event.attemptId)).toEqual([
       replacementAttemptId,
       replacementAttemptId,
+    ]);
+    // The resume wrote one interrupted record for each track that the retired attempt left open.
+    const interrupted = (stored?.traceEvents ?? []).filter(
+      (event) =>
+        event.type === "update_published" &&
+        (event.payload.data as { phase?: unknown } | undefined)?.phase === "interrupted",
+    );
+    expect(interrupted.map((event) => [event.attemptId, event.payload.key])).toEqual([
+      [retiredAttemptId, "shared"],
+      [retiredAttemptId, "retired-only"],
     ]);
   });
 

@@ -538,7 +538,7 @@ async function resumedVerifyP2(name: string) {
 }
 
 describe("progress settlement and retired attempts", () => {
-  it("lists a retired and a cancelled verifyP2 attempt and settles only the active one's tracks", async () => {
+  it("lists a retired and a cancelled verifyP2 attempt and cancels only the active one's tracks", async () => {
     const run = await resumedVerifyP2("verify-p2-cancel");
     expect(run.retiredUnrecorded).toEqual([
       expect.objectContaining({ attemptId: run.retiredAttemptId, nodeId: "verifyP2" }),
@@ -567,11 +567,11 @@ describe("progress settlement and retired attempts", () => {
     expect(attemptRow(run.state, run.retiredAttemptId)).toEqual(run.retiredRow);
     expect(attemptRow(run.state, run.replacementAttemptId)).toMatchObject({ status: "cancelled" });
     // The cancellation settled the active attempt's tracks. The track that only the retired
-    // attempt published was never settled.
+    // attempt published keeps the interrupted record that the resume wrote for it.
     const updates = byKey(state?.updates);
     expect(updates.get("progress:agents/verifyP2/lost")).toMatchObject({
       attemptId: run.retiredAttemptId,
-      data: progress("running"),
+      data: progress("cancelled", { phase: "interrupted" }),
     });
     expect(updates.get("progress:agents/verifyP2")).toMatchObject({
       attemptId: run.replacementAttemptId,
@@ -613,9 +613,13 @@ describe("progress settlement and retired attempts", () => {
     ).rejects.toThrow(/does not match the active attempt/);
     expect(attemptRow(run.state, run.retiredAttemptId)).toEqual(run.retiredRow);
     expect(run.runs.runRevision(run.runId)).toBe(cancelled);
+    // The retired attempt's track still holds the interrupted record from the resume.
     expect(
       byKey(run.runs.readRunState(run.runId)?.updates).get("progress:agents/verifyP2/lost"),
-    ).toMatchObject({ attemptId: run.retiredAttemptId, data: progress("running") });
+    ).toMatchObject({
+      attemptId: run.retiredAttemptId,
+      data: progress("cancelled", { phase: "interrupted" }),
+    });
     run.state.close();
   }, 60_000);
 });

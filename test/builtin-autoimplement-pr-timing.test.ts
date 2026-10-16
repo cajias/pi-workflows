@@ -2375,8 +2375,8 @@ describe.each(["github", "gitlab"] as const)(
         expect(attempts).toBe(2);
         const verifications = state.steps.filter((entry) => entry.nodeId === "verifyP2");
         expect(verifications.map((entry) => entry.outcome)).toEqual(["timed_out"]);
-        // The lost attempt stays a retired, unrecorded attempt. Settlement changed only the
-        // timed-out replacement's track and left the lost attempt's track as it published it.
+        // The lost attempt stays a retired, unrecorded attempt. The resume settled its track as
+        // interrupted, and the timeout settled only the replacement's track.
         expect(state.unrecordedAttempts).toEqual([
           expect.objectContaining({ attemptId: lostAttemptId, nodeId: "verifyP2" }),
         ]);
@@ -2387,7 +2387,7 @@ describe.each(["github", "gitlab"] as const)(
         const tracks = new Map((stored?.updates ?? []).map((update) => [update.key, update]));
         expect(tracks.get("verifyP2/lost")).toMatchObject({
           attemptId: lostAttemptId,
-          data: { status: "running", phase: "pushing" },
+          data: { status: "cancelled", phase: "interrupted" },
         });
         expect(tracks.get("verifyP2/replacement")).toMatchObject({
           attemptId: verifications[0]?.attemptId,
