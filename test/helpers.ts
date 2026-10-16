@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { vi } from "vitest";
 import { WorkflowClient } from "../src/client/client.js";
 import type { ClientResponse } from "../src/client/protocol.js";
 import { canonicalJson, type JsonObject } from "../src/state/json.js";
@@ -15,6 +16,40 @@ import type {
   HumanDecisionRequest,
 } from "../src/workflows/types.js";
 import { TEST_TEMP_ROOT_ENV } from "./global-setup.js";
+
+/**
+ * Hold back every timer started with exactly `delayMs`, such as the engine's timer for a node
+ * limit of that length. A held timer fires only when the test calls `fire()`, so the limit runs
+ * out after the test's own setup is done, however loaded the machine is. Other timers run
+ * normally. Use a delay that no other code in the test uses, and call `restore()` afterwards.
+ */
+export function holdTimers(delayMs: number): {
+  held: () => number;
+  fire: () => void;
+  restore: () => void;
+} {
+  const realSetTimeout = globalThis.setTimeout;
+  const held: Array<() => void> = [];
+  const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+    handler: (...values: unknown[]) => void,
+    delay?: number,
+    ...values: unknown[]
+  ) => {
+    if (delay !== delayMs || typeof handler !== "function") {
+      return realSetTimeout(handler, delay, ...values);
+    }
+    held.push(() => handler(...values));
+    // The caller still gets a real handle to clear. It never runs the held handler.
+    return realSetTimeout(() => undefined, delayMs).unref();
+  }) as typeof setTimeout);
+  return {
+    held: () => held.length,
+    fire: () => {
+      for (const run of held.splice(0)) run();
+    },
+    restore: () => spy.mockRestore(),
+  };
+}
 
 export async function makeTempDir(prefix: string): Promise<string> {
   const root = process.env[TEST_TEMP_ROOT_ENV];

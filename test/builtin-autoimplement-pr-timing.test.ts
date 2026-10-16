@@ -16,7 +16,7 @@ import type {
   WorkflowNodeOutcome,
   WorkflowStepRecord,
 } from "../src/workflows/types.js";
-import { makeStateDatabasePath, makeTempDir } from "./helpers.js";
+import { holdTimers, makeStateDatabasePath, makeTempDir, waitUntil } from "./helpers.js";
 import {
   acceptedOutput,
   autoimplementSettingsValue,
@@ -2268,11 +2268,14 @@ describe.each(["github", "gitlab"] as const)(
         const databasePath = await makeStateDatabasePath(
           `autoimplement-${forge}-restart-p2-timeout`,
         );
-        // Only the replacement, which runs after the resume retired the lost attempt, gets a
-        // short limit. The lost attempt keeps the normal one until it parks.
+        // Only the replacement, which runs after the resume retired the lost attempt, gets its
+        // own limit. The lost attempt keeps the normal one until it parks. The test holds the
+        // replacement's timer and fires it once the replacement has published, so the limit
+        // cannot run out first.
         const workflow = withVerifyP2Timeout((context) =>
-          context.state.unrecordedAttempts === undefined ? 30 * 60_000 : 1_000,
+          context.state.unrecordedAttempts === undefined ? 30 * 60_000 : HELD_VERIFY_P2_TIMEOUT_MS,
         );
+        let replacementPublished = false;
         let engine: WorkflowEngine | undefined;
         let attempts = 0;
         let reviewedAgain = false;
@@ -2311,6 +2314,7 @@ describe.each(["github", "gitlab"] as const)(
               progress("verifyP2/replacement", "verifying"),
               "replacement-track",
             );
+            replacementPublished = true;
             return await new Promise<AgentStepSubmission>(() => {});
           },
           commitLocal: async (request, local) => {
@@ -2355,7 +2359,17 @@ describe.each(["github", "gitlab"] as const)(
           setTimeout(resolve, Math.max(0, (pushedSecond + 2) * 1000 - Date.now())),
         );
         const resumed = new WorkflowEngine({ executor: scenario.executor, databasePath });
-        const { state } = await resumed.resumeRun(workflow, parked.runId);
+        const timers = holdTimers(HELD_VERIFY_P2_TIMEOUT_MS);
+        let state: Awaited<ReturnType<WorkflowEngine["resumeRun"]>>["state"];
+        try {
+          const resuming = resumed.resumeRun(workflow, parked.runId);
+          await waitUntil(() => replacementPublished, GRAPH_RUN_TIMEOUT_MS);
+          expect(timers.held()).toBe(1);
+          timers.fire();
+          ({ state } = await resuming);
+        } finally {
+          timers.restore();
+        }
         expect(refused).toEqual([]);
         expect(state.status, state.error).toBe("completed");
         expect(attempts).toBe(2);
@@ -2387,6 +2401,9 @@ describe.each(["github", "gitlab"] as const)(
     );
   },
 );
+
+/** A `verifyP2` limit that only a held test timer reaches; no other timer in this file uses it. */
+const HELD_VERIFY_P2_TIMEOUT_MS = 3_600_017;
 
 /**
  * Autoimplement with another `verifyP2` time limit. The copy keeps the compiled definition's

@@ -16,9 +16,12 @@ import type {
   WorkflowUpdateInput,
   WorkflowUpdateRecord,
 } from "../src/workflows/types.js";
-import { makeStateDatabasePath, ScriptedExecutor, waitUntil } from "./helpers.js";
+import { holdTimers, makeStateDatabasePath, ScriptedExecutor, waitUntil } from "./helpers.js";
 
 type Publish = WorkflowActionContext["publishUpdate"];
+
+/** A node limit that only a held test timer reaches; no other timer in these tests uses it. */
+const HELD_TIMEOUT_MS = 3_600_017;
 
 function progress(status: string, extra: Record<string, unknown> = {}) {
   return { schema: "pi-workflows.progress.v1", status, ...extra };
@@ -72,6 +75,7 @@ async function parkThenResume(
   workflow: ReturnType<typeof defineWorkflow>,
   started: () => boolean,
   databasePath: string,
+  whileResuming: () => Promise<void> = async () => undefined,
 ) {
   const first = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
   const running = first.run(workflow, {});
@@ -84,7 +88,9 @@ async function parkThenResume(
   const retiredAttemptId = recovery.readRunState(parked.runId)?.currentAttemptId;
   recovery.close();
   const second = new WorkflowEngine({ databasePath, executor: new ScriptedExecutor() });
-  return { parked, retiredAttemptId, resumed: await second.resumeRun(workflow, parked.runId) };
+  const resuming = second.resumeRun(workflow, parked.runId);
+  await whileResuming();
+  return { parked, retiredAttemptId, resumed: await resuming };
 }
 
 async function makeEngine(options: { executor?: ScriptedExecutor; store?: WorkflowRunStore } = {}) {
@@ -498,8 +504,10 @@ describe("progress of aborted attempts", () => {
         work: action({
           effect: idempotentEffect("test.retired-and-timed-out"),
           // Only the replacement, which runs after a resume retired the parked attempt, has a
-          // limit. It is long enough for the replacement to publish and record what it saw first.
-          timeoutMs: ({ state }) => (state.unrecordedAttempts === undefined ? null : 1_000),
+          // limit. The test holds that timer and fires it once the replacement has published
+          // and recorded what it saw, so the limit cannot run out first.
+          timeoutMs: ({ state }) =>
+            state.unrecordedAttempts === undefined ? null : HELD_TIMEOUT_MS,
           run: async ({ publishUpdate, state }) => {
             if (!started) {
               await publishUpdate(track("shared", "running", { phase: "first" }));
@@ -522,11 +530,23 @@ describe("progress of aborted attempts", () => {
       edges: [],
     });
 
-    const { parked, retiredAttemptId, resumed } = await parkThenResume(
-      workflow,
-      () => started,
-      databasePath,
-    );
+    const timers = holdTimers(HELD_TIMEOUT_MS);
+    let result: Awaited<ReturnType<typeof parkThenResume>>;
+    try {
+      result = await parkThenResume(
+        workflow,
+        () => started,
+        databasePath,
+        async () => {
+          await waitUntil(() => duringReplacement !== undefined, 30_000);
+          expect(timers.held()).toBe(1);
+          timers.fire();
+        },
+      );
+    } finally {
+      timers.restore();
+    }
+    const { parked, retiredAttemptId, resumed } = result;
 
     expect(resumed.state.status).toBe("timed_out");
     const replacementAttemptId = duringReplacement?.replacementAttemptId;
