@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -118,6 +119,7 @@ async function startTrackRun(
 }
 
 const RESUMED_TRACKS = ["agents/review", "agents/review/a"];
+const FIRST_ATTEMPT_MARKER = "first-attempt.marker";
 
 /**
  * An action whose first attempt publishes two open tracks and a finished one,
@@ -126,7 +128,7 @@ const RESUMED_TRACKS = ["agents/review", "agents/review/a"];
  */
 async function writeResumableTrackWorkflow(cwd: string): Promise<string> {
   const workflowPath = path.join(cwd, "resumable-tracks.workflow.ts");
-  const markerPath = path.join(cwd, "first-attempt.marker");
+  const markerPath = path.join(cwd, FIRST_ATTEMPT_MARKER);
   await fs.writeFile(
     workflowPath,
     `import fs from "node:fs";
@@ -169,8 +171,14 @@ async function startAndPauseResumableRun(
   runId: string,
 ): Promise<{ revision: number; attemptId: string }> {
   await startTrackRun(client, cwd, workflowPath, runId);
+  // The first attempt writes its marker after its third update, so pause only once
+  // the marker exists. Otherwise a stop in between would let the resumed attempt
+  // repeat the first attempt's work instead of completing.
+  const markerPath = path.join(cwd, FIRST_ATTEMPT_MARKER);
   await waitUntil(
-    () => (readRun(databasePath, runId).loaded?.state.updates?.length ?? 0) === 3,
+    () =>
+      (readRun(databasePath, runId).loaded?.state.updates?.length ?? 0) === 3 &&
+      existsSync(markerPath),
     30_000,
   );
   expect(await client.request({ operation: "run.pause", runId })).toMatchObject({
@@ -385,7 +393,9 @@ describe("workflow server progress settlement", () => {
       expect(resumedAttemptId).toBeDefined();
       expect(resumedAttemptId).not.toBe(paused.attemptId);
       const trace: WorkflowTraceEvent[] = after.loaded?.traceEvents ?? [];
-      // Every revision has one event, so no runner write was rejected or skipped.
+      // Every revision has exactly one event. A rejected write takes no revision, so
+      // this alone cannot show that none was rejected: node_started at R + N + 1 and
+      // the completed run below prove the runner's next write was accepted.
       expect(trace.map((event) => event.seq)).toEqual(
         Array.from({ length: trace.length }, (_, index) => index + 1),
       );
