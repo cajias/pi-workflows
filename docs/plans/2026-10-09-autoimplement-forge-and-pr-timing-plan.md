@@ -2085,3 +2085,17 @@ These are out of scope for this plan.
     to the built-ins entry, but the bare `pi-workflows` alias (line 91) has no `/builtins`
     sibling. A prefix match may therefore resolve `pi-workflows/builtins` under the workflow API
     entry instead of the built-ins. The F39 reviewer flagged this.
+- F71: Point F65 at `sendSessionCommand` and widen its scope (F35 integration review P3).
+  - F65 cites `sendInteractiveStart` (`src/extension/index.ts:1529-1532`), which no longer
+    exists. After F35 the logic is the shared `sendSessionCommand`, which counts a stale-authority
+    rejection as uncertain (`src/extension/index.ts:1568-1571`).
+  - `run.start`, `run.changeSettings`, and `followUp.queue` all send through that path
+    (`src/extension/index.ts:1000`, `:1082`, `:1108`), so F65 applies to all three commands.
+  - Fix: update F65's reference and scope.
+- F72: Refresh the `src/workflows/store.ts` line numbers that F40 shifted in F50, F51, F54, and
+  F57 (F35-F40 integration review P3).
+  - F51 `markRunInterrupted`: `:1537` is now `:1552`.
+  - F54 `as unknown as HumanDecisionRequest` cast: `:1682` is now `:1697`.
+  - F57 `materializeRunState`: `:3542` is now `:3669`.
+  - F50 resume retire block: `:1723-1730` is now `:1738-1745`.
+  - Fix: refresh the numbers, or cite symbols instead of line numbers.
