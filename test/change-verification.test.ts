@@ -5,10 +5,12 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { VERIFICATION_PLANNING_TIMEOUT_MS } from "../src/builtins/agent-timeouts.js";
 import {
+  changeVerificationEvidence,
   changeVerificationWorkflow,
   classifyVerification,
   parseChangeVerificationInput,
   type ChangeVerificationInput,
+  type ChangeVerificationResult,
   type VerificationCheck,
 } from "../src/builtins/change-verification.workflow.js";
 import {
@@ -1032,6 +1034,41 @@ describe("change verification", () => {
     await expect(fs.access(path.join(repository, "created.txt"))).rejects.toThrow();
     await expect(fs.access(path.join(repository, "deleted.txt"))).rejects.toThrow();
     await expect(fs.readFile(path.join(repository, "doc.txt"), "utf8")).resolves.toBe("good\n");
+  });
+
+  it("gives prompt evidence the complete stderr of failed checks only", () => {
+    const longStderr = `FAILED-STDERR ${"x".repeat(20_000)} END`;
+    const failed = { ...result("unit", "failed", ""), stderr: longStderr };
+    const timedOut = { ...result("slow", "timedOut", ""), stderr: "TIMEOUT-STDERR" };
+    const succeeded = { ...result("lint", "succeeded", ""), stderr: "OK-STDERR" };
+    const evidence = changeVerificationEvidence({
+      candidateCommands: batch([failed, timedOut, succeeded]),
+      baseCommands: batch([{ ...result("unit", "failed", "", "/base"), stderr: "BASE-STDERR" }]),
+      relatedFailures: [],
+      unrelatedFailures: [],
+      fixedBaselineFailures: [],
+      unknownFailures: [],
+      untestedChecks: [],
+      repairAttempts: [],
+    } as unknown as ChangeVerificationResult) as {
+      candidateCommands: { items: Array<Record<string, unknown>> };
+      baseCommands: { items: Array<Record<string, unknown>> };
+    };
+    // The view keeps every character; the prompt projection bounds it with a reference.
+    expect(evidence.candidateCommands.items[0]).toMatchObject({
+      id: "unit",
+      stderr: longStderr,
+      stderrChars: longStderr.length,
+      outputRef: "candidate:unit",
+    });
+    for (const item of evidence.candidateCommands.items.slice(1)) {
+      expect(item).not.toHaveProperty("stderr");
+      expect(item).not.toHaveProperty("outputRef");
+    }
+    expect(evidence.baseCommands.items[0]).toMatchObject({
+      stderr: "BASE-STDERR",
+      outputRef: "base:unit",
+    });
   });
 
   it("classifies complete direct evidence across related and unknown routes", () => {
