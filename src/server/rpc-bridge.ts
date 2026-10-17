@@ -18,7 +18,11 @@ import {
   findHeadlessModelProblem,
   type ModelSettingSources,
 } from "./headless-step-model.js";
-import { encodeRpcModelError, RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
+import {
+  encodeRpcModelError,
+  encodeRpcSessionStarted,
+  RPC_SUBMISSION_PREFIX,
+} from "./rpc-protocol.js";
 
 /** The part of the session context that the model check reads. */
 export type RpcBridgeSessionContext = Pick<
@@ -41,6 +45,8 @@ export type RpcBridgeRuntime = {
   agentDir: string;
   /** Report a model error on stderr and stop Pi before it reads any prompt. */
   stop(error: string): void;
+  /** Report that the session started on a checked model, so later stderr is not startup output. */
+  started(): void;
 };
 
 /**
@@ -61,6 +67,13 @@ export default function piWorkflowsRpcBridge(pi: ExtensionAPI) {
         // stderr is gone; the runner reports the exit instead.
       }
       process.exit(1);
+    },
+    started: () => {
+      try {
+        fs.writeSync(2, encodeRpcSessionStarted());
+      } catch {
+        // stderr is gone; the runner reports any later exit without startup output.
+      }
     },
   });
 }
@@ -105,7 +118,8 @@ export function registerRpcBridge(pi: RpcBridgeApi, runtime: RpcBridgeRuntime): 
     } catch (cause) {
       error = `Headless pi could not check the model that it chose for workflow steps: ${errorMessage(cause)}`;
     }
-    if (error !== undefined) runtime.stop(error);
+    if (error === undefined) runtime.started();
+    else runtime.stop(error);
   });
 }
 

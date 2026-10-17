@@ -168,6 +168,8 @@ Readers derive `steps`, `outputs`, `results`, current-node fields, waiting state
 
 The run store reads each independent value through its declared media type. Input and final output use JSON readers. Run errors and presentation instructions use text readers. Terminal-message construction uses one typed terminal-data result instead of guessing the blob type. A missing or wrong media type fails presentation after the terminal state commits; it cannot roll back that state.
 
+Each run transition writes only new attempts and the recorded attempts whose prompt or entry links a newer `session_entries` row can change. One statement closes recorded attempts' open intervals and one refreshes their `updated_at`, so a transition's statements and blob writes do not grow with the run's step count. The store keeps this cursor in memory after the transaction commits. A failed transaction, a revision resynchronization, or a new store rewrites every recorded attempt on its next transition. A recorded attempt whose output is served from its response entry no longer re-creates its unreferenced output blob on transitions that do not rewrite that attempt. A relink or a full rewrite still re-creates it.
+
 ### State verification
 
 `state status` reports invariant violations with the affected run IDs. `state verify`

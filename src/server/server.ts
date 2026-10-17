@@ -989,10 +989,11 @@ export class WorkflowServer {
           );
         }
         case "run.start":
-          // Checked before receipt adoption, like every other session command.
+          // Checked before receipt adoption, like the session commands below.
           this.requireInteractiveStartSession(connection, request);
           return this.handleRequest(request, connection);
         case "run.restart":
+        case "followUp.queue":
         case "interaction.update":
         case "checkpoint.answer":
         case "decision.answer":

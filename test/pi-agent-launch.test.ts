@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   PiAgentGroupError,
@@ -6,6 +8,8 @@ import {
   type PiAgentGroupLaunchOptions,
   type PiAgentRequest,
 } from "../src/builtins/pi-agent-launch.js";
+import { loadWorkflowFile } from "../src/workflows/loader.js";
+import { makeTempDir } from "./helpers.js";
 
 const request: PiAgentRequest = {
   id: "review",
@@ -67,5 +71,63 @@ describe("Pi agent group launcher", () => {
     );
     expect(located.notice).toBe("complete cause: /tmp/cause.txt");
     expect(new PiAgentGroupError("review", "failed", "fixed").detail).toBeUndefined();
+  });
+});
+
+describe("Pi agent group launcher in user workflows", () => {
+  it("reaches the installed launcher from built-in Sanity Check nodes in a user workflow file", async () => {
+    const dir = await makeTempDir("pi-workflows-f39");
+    const file = path.join(dir, "reuse-sanity.workflow.ts");
+    await fs.writeFile(
+      file,
+      [
+        `import { compute, defineWorkflow } from "@osolmaz/pi-workflows";`,
+        `import { sanityCheckWorkflow } from "@osolmaz/pi-workflows/builtins";`,
+        `export default defineWorkflow({`,
+        `  name: "reuse-sanity",`,
+        `  startAt: "prepare",`,
+        `  nodes: {`,
+        `    prepare: compute({ run: () => ({ mode: "serial" }) }),`,
+        `    review: sanityCheckWorkflow.nodes.review,`,
+        `  },`,
+        `  edges: [{ from: "prepare", to: "review" }],`,
+        `});`,
+        ``,
+      ].join("\n"),
+      "utf8",
+    );
+    const workflow = await loadWorkflowFile(file);
+    const calls: PiAgentRequest[][] = [];
+    setPiAgentGroupLauncher(async (requests) => {
+      calls.push(requests);
+      throw new PiAgentGroupError("group", "failed", "fixture launcher");
+    });
+    const text = { text: "", truncated: false };
+    const review = workflow.nodes.review;
+    if (review?.nodeType !== "action" || !("run" in review)) {
+      throw new Error("review must be a function action node");
+    }
+    const context = {
+      input: {},
+      outputs: {
+        prepare: { mode: "serial" },
+        collectEvidence: {
+          repository: dir,
+          baseRef: "HEAD",
+          headRevision: "abc",
+          pullRequest: { available: false },
+          committed: { stat: text, files: text, diff: text },
+          workingTree: { status: text, stat: text, files: text, diff: text, untracked: text },
+        },
+      },
+      results: {},
+      state: {},
+      signal: new AbortController().signal,
+      effect: { type: "pi-workflows.sanity-check.review", idempotencyKey: "r", recovery: "manual" },
+      publishUpdate: async () => ({ updateId: "u", seq: 1, at: "", type: "t", key: "k" }),
+    } as unknown as Parameters<NonNullable<typeof review.run>>[0];
+
+    await expect(review.run(context)).rejects.toThrow("Pi agent group failed: fixture launcher");
+    expect(calls).toHaveLength(1);
   });
 });

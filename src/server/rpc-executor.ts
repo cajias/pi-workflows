@@ -1,4 +1,5 @@
 import { errorMessage } from "../workflows/errors.js";
+import { stripAnsi } from "../workflows/text.js";
 import type {
   AgentStepExecutor,
   AgentStepRequest,
@@ -10,7 +11,11 @@ import {
   packagedExtensionPath,
   type HeadlessPiOptions,
 } from "./headless-pi.js";
-import { decodeRpcModelError, RPC_SUBMISSION_PREFIX } from "./rpc-protocol.js";
+import {
+  decodeRpcModelError,
+  RPC_SESSION_STARTED_LINE,
+  RPC_SUBMISSION_PREFIX,
+} from "./rpc-protocol.js";
 
 const BRIDGE_PATH = packagedExtensionPath(import.meta.url, "rpc-bridge");
 /**
@@ -56,6 +61,15 @@ export class RpcStepExecutor implements AgentStepExecutor {
   /** Why the bridge stopped the child before any model request, when it did. */
   private modelError: string | null = null;
   private stderrDrain: Promise<void> | null = null;
+  /**
+   * The child's other stderr lines during startup. Pi prints why it exits during startup
+   * there, for example when no model is available at all. The window ends, and the kept lines
+   * are dropped, at the bridge's session-started line or at Pi's first stdout, whichever comes
+   * first: Pi writes RPC events on stdout only after its session started, and the executor's
+   * prompt draws a response. So only startup output is held, however long the run, even when
+   * the bridge's line is lost.
+   */
+  private startupStderr: string[] | null = [];
 
   constructor(options: RpcStepExecutorOptions) {
     this.options = options;
@@ -111,6 +125,7 @@ export class RpcStepExecutor implements AgentStepExecutor {
     }
     const child = new HeadlessPiProcess(BRIDGE_PATH, this.options, {
       onStderrLine: (line) => this.acceptStderrLine(line),
+      onStdoutChunk: () => this.endStartupWindow(),
       onExit: () => this.wakeSubmissionWaiters(),
     });
     this.child = child;
@@ -122,14 +137,31 @@ export class RpcStepExecutor implements AgentStepExecutor {
     }
   }
 
-  /** The bridge's model error, or the exit itself, once stderr has delivered its last line. */
+  /**
+   * The bridge's model error, or the exit with what Pi reported before its session started,
+   * once stderr has delivered its last line.
+   */
   private async exitError(child: HeadlessPiProcess, exitMessage: string): Promise<Error> {
     this.stderrDrain ??= child.stderrDrained(STDERR_DRAIN_MS);
     await this.stderrDrain;
-    return new Error(this.modelError ?? exitMessage);
+    return new Error(this.modelError ?? `${exitMessage}${this.startupReason()}`);
+  }
+
+  private startupReason(): string {
+    const reason = stripAnsi((this.startupStderr ?? []).join("\n")).trim();
+    return reason === "" ? "" : ` before its session started. Pi reported:\n${reason}`;
+  }
+
+  /** Pi's session started, so later stderr is not why startup failed. */
+  private endStartupWindow(): void {
+    this.startupStderr = null;
   }
 
   private acceptStderrLine(line: string): void {
+    if (line === RPC_SESSION_STARTED_LINE) {
+      this.endStartupWindow();
+      return;
+    }
     const modelError = decodeRpcModelError(line);
     if (modelError !== undefined) {
       this.modelError ??= modelError;
@@ -140,7 +172,10 @@ export class RpcStepExecutor implements AgentStepExecutor {
   }
 
   private acceptSubmissionLine(line: string): void {
-    if (!line.startsWith(RPC_SUBMISSION_PREFIX)) return;
+    if (!line.startsWith(RPC_SUBMISSION_PREFIX)) {
+      this.startupStderr?.push(line);
+      return;
+    }
     try {
       const parsed = JSON.parse(line.slice(RPC_SUBMISSION_PREFIX.length)) as StepAction;
       if (

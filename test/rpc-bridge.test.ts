@@ -1,12 +1,18 @@
+import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
+import piWorkflowsRpcBridge, {
   registerRpcBridge,
   type RpcBridgeApi,
   type RpcBridgeSessionContext,
 } from "../src/server/rpc-bridge.js";
-import { RPC_SUBMISSION_PREFIX } from "../src/server/rpc-protocol.js";
+import {
+  RPC_MODEL_ERROR_PREFIX,
+  RPC_SESSION_STARTED_LINE,
+  RPC_SUBMISSION_PREFIX,
+} from "../src/server/rpc-protocol.js";
 import { makeTempDir } from "./helpers.js";
 
 type Model = { provider: string; id: string };
@@ -59,8 +65,11 @@ function startSession(options: {
   scoped?: Model[];
   argv?: string[];
   projectTrusted?: boolean;
-}): { stops: string[]; tools: Tool[] } {
+  /** Load the bridge's default export, which reports on fd 2 and exits, instead. */
+  defaultExport?: boolean;
+}): { stops: string[]; starts: number; tools: Tool[] } {
   const stops: string[] = [];
+  let starts = 0;
   const tools: Tool[] = [];
   let sessionStart: ((event: unknown, ctx: RpcBridgeSessionContext) => void) | undefined;
   const api = {
@@ -74,11 +83,18 @@ function startSession(options: {
       return () => {};
     },
   } as unknown as RpcBridgeApi;
-  registerRpcBridge(api, {
-    argv: options.argv ?? PI_ARGS,
-    agentDir,
-    stop: (error) => stops.push(error),
-  });
+  if (options.defaultExport) {
+    piWorkflowsRpcBridge(api as unknown as ExtensionAPI);
+  } else {
+    registerRpcBridge(api, {
+      argv: options.argv ?? PI_ARGS,
+      agentDir,
+      stop: (error) => stops.push(error),
+      started: () => {
+        starts += 1;
+      },
+    });
+  }
   const models = options.models ?? [FALLBACK];
   const registry = {
     find: (provider: string, id: string) =>
@@ -93,7 +109,7 @@ function startSession(options: {
     modelRegistry: registry,
     isProjectTrusted: () => options.projectTrusted ?? false,
   } as unknown as RpcBridgeSessionContext);
-  return { stops, tools };
+  return { stops, starts, tools };
 }
 
 describe("rpc-bridge workflow tool", () => {
@@ -158,6 +174,12 @@ describe("rpc-bridge default model check", () => {
     }
   });
 
+  it("reports that the session started only when the model check passes", () => {
+    expect(startSession({ settings: {} }).starts).toBe(1);
+    const settings = { defaultProvider: "custom", defaultModel: "custom-model" };
+    expect(startSession({ settings }).starts).toBe(0);
+  });
+
   it("lets Pi choose its first available model when no default is set", () => {
     expect(startSession({ settings: {} }).stops).toEqual([]);
   });
@@ -203,5 +225,49 @@ describe("rpc-bridge default model check", () => {
     expect(stops[0]).toContain(
       'inside the model scope "custom/*", "other" from `--models` in the server\'s extra Pi arguments:',
     );
+  });
+});
+
+describe("rpc-bridge default export", () => {
+  let fd2Writes: string[];
+  let exits: Array<number | string | null | undefined>;
+  let argv: string[];
+
+  beforeEach(() => {
+    fd2Writes = [];
+    exits = [];
+    argv = process.argv;
+    // The bridge reads Pi's own arguments from process.argv; vitest's would not parse as Pi's.
+    process.argv = ["node", "pi", ...PI_ARGS];
+    vi.spyOn(syncFs, "writeSync").mockImplementation((fd, chunk) => {
+      if (fd === 2) fd2Writes.push(String(chunk));
+      return String(chunk).length;
+    });
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      exits.push(code);
+      return undefined as never;
+    });
+  });
+
+  afterEach(() => {
+    process.argv = argv;
+    vi.restoreAllMocks();
+  });
+
+  it("writes the session-started line to fd 2 after the model check passes", () => {
+    startSession({ settings: {}, defaultExport: true });
+    expect(fd2Writes).toEqual([`\n${RPC_SESSION_STARTED_LINE}\n`]);
+    expect(exits).toEqual([]);
+  });
+
+  it("writes only the model error and exits when the model check fails", () => {
+    startSession({
+      settings: { defaultProvider: "custom", defaultModel: "custom-model" },
+      defaultExport: true,
+    });
+    expect(fd2Writes).toHaveLength(1);
+    expect(fd2Writes[0]?.startsWith(`\n${RPC_MODEL_ERROR_PREFIX}`)).toBe(true);
+    expect(fd2Writes.join("")).not.toContain(RPC_SESSION_STARTED_LINE);
+    expect(exits).toEqual([1]);
   });
 });

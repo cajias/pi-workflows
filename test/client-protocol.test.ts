@@ -188,6 +188,8 @@ describe("client protocol fixtures", () => {
     "decision.answer",
     "run.restart",
     "run.start",
+    "followUp.queue",
+    "run.changeSettings",
   ] as const)(
     "%s fingerprints durable response identity, not the connection epoch",
     (operation) => {

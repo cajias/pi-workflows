@@ -47,6 +47,8 @@ export type HeadlessPiHandlers = {
   /** Every raw stderr chunk, before line splitting. */
   onStderrChunk?: (chunk: Buffer) => void;
   onStdoutLine?: (line: string) => void;
+  /** Every raw stdout chunk, before line splitting. */
+  onStdoutChunk?: (chunk: Buffer) => void;
   onExit?: (exit: HeadlessPiExit) => void;
 };
 
@@ -262,7 +264,10 @@ export class HeadlessPiProcess {
     // stdout carries the RPC event stream. It is drained even without a reader
     // so the pipe never blocks the child.
     const stdout = new LineSplitter(this.handlers.onStdoutLine);
-    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stdout?.on("data", (chunk: Buffer) => {
+      this.handlers.onStdoutChunk?.(chunk);
+      stdout.push(chunk);
+    });
     child.stdout?.on("end", () => stdout.end());
     await this.register(child);
   }
